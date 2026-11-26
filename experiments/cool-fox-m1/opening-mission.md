@@ -81,3 +81,26 @@ The optimized executable passed profile selection and presented loading artwork 
 | Draws per frame | 2,795.5 | 3,147 |
 
 The baseline interval was 11:44:08–11:46:43 UTC and the optimized interval was 12:02:12–12:04:45 UTC. Each used the same M1 Max, CrossOver Preview, D3DMetal, Series S configuration and sRGB compositor. The optimized run started from a verified copy of the baseline profile. These are independent intro runs with different draw counts and cache state. The builds also differ in debug symbols and the extra capture setting. The measured 36.2% lower median frame time describes those two runs. The same-executable hardware fixture above isolates the copy change. The optimized game still takes about five seconds per frame and has incomplete lighting.
+
+
+## Locating the loss of HDR scene color
+
+The opt-in `VICTORY_TRACE_WORLD_COLOR=1` diagnostic copies the native 1280×720 RGBA16_FLOAT target immediately before and after each selected dispatch on its producing command list. It restores the incoming resource state, waits for submission completion before reading, and excludes row padding from the BLAKE3 hash. It samples the first, sixth and twenty-first occurrences. The executable was built from the five patches on this branch. The resulting source tree is `5add3a416733a44bbd45b5c17e7c2354e501d234` and the executable SHA-256 is `d15c99847d9ed15e0757220ca5653d0512c6a02b5ad776c4695e41baffae37a1`. The D3DMetal fixture changed three known pixels in the lower half of a six-pixel FP16 texture. Both readbacks counted exactly the expected pixels and had distinct hashes. The sparse-copy and two compositor tests also passed.
+
+The M1 Max test used a verified copy of the optimized save, Series S, serialized submission, aligned vector copies and the experimental radiance presenter. The table counts pixels with at least one positive finite RGB channel. Each full frame has 921,600 pixels and each lower half has 460,800. No sample contained nonfinite RGB channels.
+
+| Frame | Occurrence | Compute pass | Whole image, before → after | Lower half, before → after |
+| ---: | ---: | --- | ---: | ---: |
+| 2974 | 1 | tiled lighting | 0 → 0 | 0 → 0 |
+| 2974 | 1 | sky | 5,920 → 772,357 | 482 → 422,298 |
+| 2974 | 1 | scattering | 772,357 → 0 | 422,298 → 0 |
+| 2978 | 6 | tiled lighting | 0 → 0 | 0 → 0 |
+| 2978 | 6 | sky | 17,045 → 622,689 | 0 → 247,457 |
+| 2978 | 6 | scattering | 622,689 → 0 | 247,457 → 0 |
+| 2993 | 21 | tiled lighting | 0 → 0 | 0 → 0 |
+| 2993 | 21 | sky | 19,561 → 279,731 | 16,455 → 147,027 |
+| 2993 | 21 | scattering | 279,731 → 0 | 147,027 → 0 |
+
+On all three frames the sky pass populated the native HDR target. Immediately before atmospheric scattering, hundreds of thousands of pixels carried positive RGB. Immediately after, every byte of all four channels matched an independently generated zero texture. The tiled lighting dispatch also entered and left this target at zero. Its conditional zero store is consistent with this observation. The sky and scattering hashes were taken independently around each dispatch. Other work may occur between the two.
+
+The captured display still showed a dark silhouette with a few lights on frame 2994. It was presenting the separate radiance texture. This test establishes the location of a complete loss of scene color in the title's HDR path. It leaves open whether the atmosphere shader loads the wrong value or receives invalid fog inputs. A previous frame capture showed the 480×272 R10G10B10A2 input at table 1 offset 24 as black in the exported RGB image. It lists two indirect compute writers for that input, both with successfully created host pipelines. The capture did not measure their output alpha or the number of workgroups each actually ran.

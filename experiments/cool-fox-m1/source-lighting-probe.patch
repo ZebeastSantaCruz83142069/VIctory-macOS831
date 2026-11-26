@@ -1,0 +1,337 @@
+From 1ca219012c7f2bbe8ad98a311a82ceffa33b3c7e Mon Sep 17 00:00:00 2001
+From: ZebeastSantaCruz83142069
+ <361184274+ZebeastSantaCruz83142069@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 04:12:46 -0800
+Subject: [PATCH] Probe HDR world color before and after lighting on the GPU
+ timeline
+
+---
+ crates/victory-gpu/src/capture.rs          |   2 +
+ crates/victory-gpu/src/capture/lighting.rs | 209 +++++++++++++++++++++
+ crates/victory-gpu/src/draw.rs             |  18 ++
+ crates/victory-gpu/src/host.rs             |  35 ++++
+ 4 files changed, 264 insertions(+)
+ create mode 100644 crates/victory-gpu/src/capture/lighting.rs
+
+diff --git a/crates/victory-gpu/src/capture.rs b/crates/victory-gpu/src/capture.rs
+index e0d47d0..f08f737 100644
+--- a/crates/victory-gpu/src/capture.rs
++++ b/crates/victory-gpu/src/capture.rs
+@@ -3,6 +3,8 @@
+ //! two (the frames the log reports) is saved as `frame-<n>.png`, at half
+ //! size. Only in builds with diagnostics.
+ 
++pub(crate) mod lighting;
++
+ use std::path::PathBuf;
+ 
+ use windows::Win32::Graphics::Direct3D12::*;
+diff --git a/crates/victory-gpu/src/capture/lighting.rs b/crates/victory-gpu/src/capture/lighting.rs
+new file mode 100644
+index 0000000..1d63e1c
+--- /dev/null
++++ b/crates/victory-gpu/src/capture/lighting.rs
+@@ -0,0 +1,209 @@
++//! Bounded readbacks of the opening scene's HDR target at the dispatch itself.
++use super::*;
++use std::sync::OnceLock;
++use std::sync::atomic::{AtomicU32, Ordering};
++
++#[derive(Clone, Copy)]
++pub(crate) struct Probe {
++    pub pass: &'static str,
++    pub word: u32,
++    pub occurrence: u32,
++    pub frame: u64,
++}
++
++pub(crate) fn enabled() -> bool {
++    static ENABLED: OnceLock<bool> = OnceLock::new();
++    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_TRACE_WORLD_COLOR").is_some_and(|v| v == "1"))
++}
++
++pub(crate) fn select(hash: &str) -> Option<Probe> {
++    static HITS: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
++    if !enabled() {
++        return None;
++    }
++    // Table 1 offsets (dwords) observed in the Series S command lists.
++    let (i, pass, word) = match hash {
++        "f0c91b4d2578f5bf" => (0, "tiled_lighting", 56),
++        "348e1e8c414c7eca" => (1, "sky", 72),
++        "577248728544d74b" => (2, "scattering", 48),
++        _ => return None,
++    };
++    let occurrence = HITS[i].fetch_add(1, Ordering::Relaxed) + 1;
++    matches!(occurrence, 1 | 6 | 21).then(|| Probe {
++        pass,
++        word,
++        occurrence,
++        frame: crate::queue::presented() + 1,
++    })
++}
++
++pub(crate) struct Sample {
++    pub(crate) buffer: ID3D12Resource,
++    footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
++}
++
++#[derive(Debug)]
++pub(crate) struct Counts {
++    positive_rgb: usize,
++    bottom_positive_rgb: usize,
++    nonfinite_rgb: usize,
++    rgba_hash: blake3::Hash,
++}
++
++// Only called on a recording list. Return the texture to its incoming state.
++pub(crate) fn record(
++    device: &ID3D12Device,
++    list: &ID3D12GraphicsCommandList,
++    texture: &ID3D12Resource,
++    original: D3D12_RESOURCE_STATES,
++) -> Option<Sample> {
++    let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
++    // SAFETY: a live texture on this list; the caller retains both resources.
++    unsafe {
++        let d = texture.GetDesc();
++        if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
++            || d.Format != DXGI_FORMAT_R16G16B16A16_FLOAT
++            || d.MipLevels != 1
++            || d.DepthOrArraySize != 1
++            || d.SampleDesc.Count != 1
++        {
++            return None;
++        }
++        if original != copy {
++            list.ResourceBarrier(&[crate::host::transition(texture, original, copy)]);
++        }
++        let back = super::read_back(device, list, texture);
++        if original != copy {
++            list.ResourceBarrier(&[crate::host::transition(texture, copy, original)]);
++        }
++        back.map(|(buffer, footprint)| Sample { buffer, footprint })
++    }
++}
++
++impl Sample {
++    // The submission fence has completed when the caller maps the buffer.
++    pub(crate) fn counts(&self) -> Option<Counts> {
++        let f = self.footprint.Footprint;
++        let mut data = std::ptr::null_mut();
++        unsafe {
++            self.buffer.Map(0, None, Some(&mut data)).ok()?;
++            if data.is_null() {
++                self.buffer.Unmap(0, None);
++                return None;
++            }
++            let mut hasher = blake3::Hasher::new();
++            let (mut positive_rgb, mut bottom_positive_rgb, mut nonfinite_rgb) = (0, 0, 0);
++            for y in 0..f.Height as usize {
++                let offset = self.footprint.Offset as usize + y * f.RowPitch as usize;
++                let row =
++                    std::slice::from_raw_parts(data.cast::<u8>().add(offset), f.Width as usize * 8);
++                hasher.update(row);
++                for pixel in row.chunks_exact(8) {
++                    let rgb = [0, 2, 4].map(|i| u16::from_le_bytes([pixel[i], pixel[i + 1]]));
++                    if rgb.iter().any(|h| h & 0x7c00 == 0x7c00) {
++                        nonfinite_rgb += 1;
++                    }
++                    if rgb.iter().any(|&h| h > 0 && h < 0x7c00) {
++                        positive_rgb += 1;
++                        if y >= f.Height as usize / 2 {
++                            bottom_positive_rgb += 1;
++                        }
++                    }
++                }
++            }
++            let untouched = D3D12_RANGE { Begin: 0, End: 0 };
++            self.buffer.Unmap(0, Some(&untouched));
++            Some(Counts {
++                positive_rgb,
++                bottom_positive_rgb,
++                nonfinite_rgb,
++                rgba_hash: hasher.finalize(),
++            })
++        }
++    }
++
++    pub(crate) fn report(&self, probe: Probe, side: &'static str) {
++        if let Some(c) = self.counts() {
++            let f = self.footprint.Footprint;
++            tracing::info!(pass=probe.pass, occurrence=probe.occurrence, frame=probe.frame, side,
++                width=f.Width, height=f.Height, positive_rgb=c.positive_rgb,
++                bottom_positive_rgb=c.bottom_positive_rgb, nonfinite_rgb=c.nonfinite_rgb,
++                rgba_hash=%c.rgba_hash, "lighting dispatch HDR readback");
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn captures_hdr_before_and_after_a_gpu_write() {
++        let host = crate::host::host().expect("D3D12 device");
++        let list = host.new_list().expect("command list");
++        let state = D3D12_RESOURCE_STATE_RENDER_TARGET;
++        let desc = D3D12_RESOURCE_DESC {
++            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
++            Width: 3,
++            Height: 2,
++            DepthOrArraySize: 1,
++            MipLevels: 1,
++            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
++            SampleDesc: DXGI_SAMPLE_DESC {
++                Count: 1,
++                Quality: 0,
++            },
++            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
++            ..Default::default()
++        };
++        let heap = D3D12_HEAP_PROPERTIES {
++            Type: D3D12_HEAP_TYPE_DEFAULT,
++            CreationNodeMask: 1,
++            VisibleNodeMask: 1,
++            ..Default::default()
++        };
++        let mut surface: Option<ID3D12Resource> = None;
++        unsafe {
++            host.device.CreateCommittedResource(
++                &heap,
++                D3D12_HEAP_FLAG_NONE,
++                &desc,
++                state,
++                None,
++                &mut surface,
++            )
++        }
++        .unwrap();
++        let surface = surface.unwrap();
++        let rtv = host.rtv(Some(&surface), None);
++        unsafe {
++            list.list
++                .ClearRenderTargetView(rtv, &[0., 0., 0., 1.], None)
++        };
++        let before = record(&host.device, &list.list, &surface, state).expect("before readback");
++        let bottom = windows::Win32::Foundation::RECT {
++            left: 0,
++            top: 1,
++            right: 3,
++            bottom: 2,
++        };
++        unsafe {
++            list.list
++                .ClearRenderTargetView(rtv, &[0.5, 0., 0., 1.], Some(&[bottom]))
++        };
++        let after = record(&host.device, &list.list, &surface, state).expect("after readback");
++        list.close();
++        host.execute(&[&list]);
++        let a = before.counts().unwrap();
++        let b = after.counts().unwrap();
++        assert_eq!(
++            (a.positive_rgb, a.bottom_positive_rgb, a.nonfinite_rgb),
++            (0, 0, 0)
++        );
++        assert_eq!(
++            (b.positive_rgb, b.bottom_positive_rgb, b.nonfinite_rgb),
++            (3, 3, 0)
++        );
++        assert_ne!(a.rgba_hash, b.rgba_hash);
++    }
++}
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index a76c8ff..8ee719c 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -3153,8 +3153,26 @@ impl State {
+                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
+             }
+         }
++        #[cfg(feature = "diagnostics")]
++        let world_color = p.stages.first()
++            .and_then(|stage| crate::capture::lighting::select(&stage.shader.hash))
++            .and_then(|probe| {
++                let Root::Table(table) = self.roots_ref(true).get(1)? else { return None };
++                match crate::descriptor::view(table + u64::from(probe.word) * 4) {
++                    Some(View::Unordered(resource, ..)) => Some((resource as This, probe)),
++                    _ => None,
++                }
++            });
++        #[cfg(feature = "diagnostics")]
++        if let Some((resource, probe)) = world_color {
++            list.probe_world_color(resource, probe, "before");
++        }
+         // SAFETY: an open list with everything set.
+         unsafe { list.list.Dispatch(x, y, z) };
++        #[cfg(feature = "diagnostics")]
++        if let Some((resource, probe)) = world_color {
++            list.probe_world_color(resource, probe, "after");
++        }
+         self.buffers_written();
+         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+         if crate::compose::scene_color_enabled()
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 05917f0..e778906 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -2161,6 +2161,8 @@ enum Step {
+ #[derive(Default)]
+ struct Deferred {
+     scene_color: Option<ID3D12Resource>,
++    #[cfg(feature = "diagnostics")]
++    lighting: Vec<(crate::capture::lighting::Probe, &'static str, crate::capture::lighting::Sample)>,
+     /// Destination, source, bytes.
+     copies: Vec<Step>,
+     uploads: Vec<ID3D12Resource>,
+@@ -3758,6 +3760,13 @@ pub(crate) fn walls_trace() -> bool {
+ /// without it, so the title read a buffer nobody wrote, as before read-backs
+ /// were made (the exposure metering's two small float targets, every frame).
+ fn read_backs(list: &HostList) {
++    #[cfg(feature = "diagnostics")]
++    if crate::capture::lighting::enabled() {
++        let samples = std::mem::take(&mut list.deferred().lighting);
++        for (probe, side, pixels) in samples {
++            pixels.report(probe, side);
++        }
++    }
+     if crate::compose::scene_color_enabled()
+         && let Some(texture) = list.deferred().scene_color.clone()
+     {
+@@ -7135,6 +7144,32 @@ impl HostList {
+         self.deferred().indirect_readable = scratch.as_raw() as usize;
+     }
+ 
++
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn probe_world_color(
++        &self,
++        resource: crate::object::This,
++        probe: crate::capture::lighting::Probe,
++        side: &'static str,
++    ) {
++        let Some(source) = crate::resource::host_copy(resource) else { return };
++        let key = std::sync::Arc::as_ptr(&source) as usize;
++        let state = self.states.lock().unwrap_or_else(|e| e.into_inner())
++            .get(&key).map(|entry| entry.1);
++        // A UAV binding requires the unordered-access state. If this is the
++        // list's first tracked use, the submission prelude establishes it.
++        let state = state.unwrap_or(D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32);
++        self.transition(resource, state);
++        let Some(host) = host() else { return };
++        if let Some(sample) = crate::capture::lighting::record(
++            &host.device, &self.list, &source.texture, D3D12_RESOURCE_STATES(state as i32),
++        ) {
++            // Lists may be submitted again after the first fence was read.
++            self.keep(&sample.buffer);
++            self.deferred().lighting.push((probe, side, sample));
++        }
++    }
++
+     /// Snapshot the shaded scene on the producing command list, after the title's
+     /// radiance dispatch. The presenter only receives it when this list finishes.
+     pub(crate) fn copy_scene_color(&self, source: &crate::resource::HostTexture) {
+-- 
+2.50.1 (Apple Git-155)
+
