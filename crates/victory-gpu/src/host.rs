@@ -3881,6 +3881,7 @@ impl Meter {
                 crate::copystat::log(report_frames);
                 crate::bindless::log(report_frames);
                 crate::shadow::log_views(report_frames);
+                crate::shadow::log_lookups(report_frames);
                 let [n, bytes] = [0, 1].map(|i| crate::list::READ_BACKS[i].swap(0, Ordering::Relaxed));
                 if n > 0 {
                     tracing::info!(
@@ -4152,8 +4153,12 @@ impl Host {
     ) -> Result<Presenter, (&'static str, windows::core::Error)> {
         let hwnd = match shown.or_else(title_window) {
             Some(hwnd) => hwnd,
-            None if std::env::var_os("VICTORY_WINDOW_SECONDARY").as_deref()
-                == Some(std::ffi::OsStr::new("1")) =>
+            None if std::env::var("VICTORY_WINDOW_SECONDARY").is_ok_and(|v| {
+                v == "1"
+                    || v.split_once(',').is_some_and(|(x, y)| {
+                        x.trim().parse::<i32>().is_ok() && y.trim().parse::<i32>().is_ok()
+                    })
+            }) =>
             {
                 return Err(("secondary title window unavailable", windows::core::Error::empty()));
             }
