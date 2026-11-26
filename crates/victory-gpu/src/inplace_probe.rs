@@ -918,6 +918,7 @@ fn reserved_xmem_shadow_rebinds_for_a_recorded_list() {
     use std::sync::{Arc, Mutex, OnceLock};
 
     const BASE: usize = 0x1_9460_0000;
+    const ALIAS: usize = BASE + 8 * K64;
     const BYTES: usize = 4 * K64;
     static HEAP: OnceLock<Arc<crate::alias::PhysicalHeap>> = OnceLock::new();
     static ORDER: Mutex<[Option<u32>; 4]> = Mutex::new([Some(0), Some(1), Some(2), Some(3)]);
@@ -925,7 +926,7 @@ fn reserved_xmem_shadow_rebinds_for_a_recorded_list() {
     let rig = Rig::new(&host.device).unwrap();
     let heap = HEAP.get_or_init(|| Arc::new(crate::alias::PhysicalHeap::new(&host.device, BYTES).unwrap()));
     crate::physical::use_physical_layout(|base, len| {
-        if (base, len) != (BASE, BYTES) {
+        if !matches!(base, BASE | ALIAS) || len != BYTES {
             return None;
         }
         Some(ORDER.lock().unwrap().iter().enumerate().filter_map(|(first, &tile)| {
@@ -944,6 +945,9 @@ fn reserved_xmem_shadow_rebinds_for_a_recorded_list() {
     crate::shadow::register(BASE, BASE as u64, BYTES as u64);
     let shadow = crate::shadow::find(BASE as u64, BYTES as u64).unwrap();
     assert!(shadow.is_aliased());
+    crate::shadow::register(ALIAS, ALIAS as u64, BYTES as u64);
+    let overlapping = crate::shadow::find(ALIAS as u64, BYTES as u64).unwrap();
+    assert!(!overlapping.is_aliased(), "a second resource sharing these tiles keeps a copy");
     let readback = rig.committed(
         D3D12_HEAP_TYPE_READBACK,
         BYTES as u64,
@@ -972,4 +976,5 @@ fn reserved_xmem_shadow_rebinds_for_a_recorded_list() {
     // SAFETY: this test previously mapped the readback buffer.
     unsafe { readback.Unmap(0, None) };
     crate::shadow::unregister(BASE, BASE as u64);
+    crate::shadow::unregister(ALIAS, ALIAS as u64);
 }

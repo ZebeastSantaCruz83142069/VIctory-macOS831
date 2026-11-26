@@ -24,6 +24,43 @@ static CHANGED: AtomicBool = AtomicBool::new(false);
 static QUEUE: AtomicUsize = AtomicUsize::new(0);
 static BUFFERS: Mutex<Vec<Weak<ReservedBuffer>>> = Mutex::new(Vec::new());
 
+/// An ExecuteCommandLists call can contain several lists. Keep its
+/// reserved buffers physically disjoint so none needs a barrier between
+/// accesses to two different resources inside that call.
+fn overlapping_owners<'a>(layouts: impl IntoIterator<Item = &'a [PhysicalTiles]>) -> bool {
+    let mut spans: Vec<_> = layouts
+        .into_iter()
+        .enumerate()
+        .flat_map(|(owner, runs)| {
+            runs.iter().map(move |run| {
+                (
+                    Arc::as_ptr(&run.heap) as usize,
+                    run.heap_tile,
+                    run.heap_tile + run.count,
+                    owner,
+                )
+            })
+        })
+        .collect();
+    spans.sort_unstable();
+    let mut rightmost: Option<(usize, u32, usize)> = None;
+    for (heap, from, to, owner) in spans {
+        if let Some((last_heap, last_end, last_owner)) = rightmost
+            && heap == last_heap
+            && from < last_end
+        {
+            if owner != last_owner {
+                return true;
+            }
+            if to <= last_end {
+                continue;
+            }
+        }
+        rightmost = Some((heap, to, owner));
+    }
+    false
+}
+
 /// Sets the runtime callback that snapshots mappings of an XMem buffer.
 pub fn use_physical_layout(layout: Layout) {
     if crate::alias::physical_heaps_enabled() {
@@ -50,8 +87,20 @@ impl ReservedBuffer {
             return None;
         }
         let count = u32::try_from(len / PAGE).ok()?;
-        let layout = LAYOUT.get()?(base, len)?;
+        let snapshot = LAYOUT.get()?;
+        let layout = snapshot(base, len)?;
         if layout.iter().map(|run| run.count).sum::<u32>() != count {
+            return None;
+        }
+        let mut registry = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+        let others = registry
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|other| snapshot(other.base, other.len))
+            .collect::<Option<Vec<_>>>()?;
+        if overlapping_owners(
+            std::iter::once(layout.as_slice()).chain(others.iter().map(Vec::as_slice)),
+        ) {
             return None;
         }
         let host = crate::host::host()?;
@@ -75,10 +124,7 @@ impl ReservedBuffer {
             count,
             mapped: Mutex::new(Vec::new()),
         });
-        BUFFERS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(Arc::downgrade(&buffer));
+        registry.push(Arc::downgrade(&buffer));
         physical_layout_changed();
         if len >= 16 << 20 {
             tracing::info!(
@@ -92,16 +138,12 @@ impl ReservedBuffer {
 
     /// Under the host submission lock. Keeps the old heaps until mapping
     /// updates and the lists that follow them have completed.
-    fn bind(&self, queue: &ID3D12CommandQueue, new_queue: bool) -> Vec<PhysicalTiles> {
-        let layout = LAYOUT
-            .get()
-            .and_then(|layout| layout(self.base, self.len))
-            .unwrap_or_else(|| {
-                crate::host::fail(format_args!(
-                    "XMem lost the layout for GPU buffer {:#x}",
-                    self.base
-                ));
-            });
+    fn bind(
+        &self,
+        queue: &ID3D12CommandQueue,
+        layout: Vec<PhysicalTiles>,
+        new_queue: bool,
+    ) -> Vec<PhysicalTiles> {
         let mut mapped = self.mapped.lock().unwrap_or_else(|e| e.into_inner());
         if !new_queue
             && mapped.len() == layout.len()
@@ -171,7 +213,7 @@ pub(crate) struct InFlightTiles {
 
 /// Updates mappings on the very queue that is about to use the buffers.
 pub(crate) fn prepare(queue: &ID3D12CommandQueue) -> Option<InFlightTiles> {
-    LAYOUT.get()?;
+    let snapshot = LAYOUT.get()?;
     let address = queue.as_raw() as usize;
     let new_queue = QUEUE.swap(address, Ordering::Relaxed) != address;
     if !CHANGED.swap(false, Ordering::AcqRel) && !new_queue {
@@ -189,9 +231,26 @@ pub(crate) fn prepare(queue: &ID3D12CommandQueue) -> Option<InFlightTiles> {
         });
         live
     };
+    let layouts: Vec<_> = buffers
+        .iter()
+        .map(|buffer| {
+            snapshot(buffer.base, buffer.len).unwrap_or_else(|| {
+                crate::host::fail(format_args!(
+                    "XMem lost the layout for GPU buffer {:#x}",
+                    buffer.base
+                ))
+            })
+        })
+        .collect();
+    if overlapping_owners(layouts.iter().map(Vec::as_slice)) {
+        crate::host::fail(format_args!(
+            "XMem remapped two reserved GPU buffers onto the same tiles"
+        ));
+    }
     let prior = buffers
         .iter()
-        .flat_map(|buffer| buffer.bind(queue, new_queue))
+        .zip(layouts)
+        .flat_map(|(buffer, layout)| buffer.bind(queue, layout, new_queue))
         .collect();
     Some(InFlightTiles {
         _buffers: buffers,
