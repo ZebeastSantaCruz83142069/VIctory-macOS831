@@ -667,6 +667,8 @@ extern "system" fn present(
     let shown = shown_plane(&found);
     #[cfg(windows)]
     log_planes(frame, planes, &found, shown);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let candidate = crate::capture::take_1440p_target();
     #[cfg(windows)]
     if let Some(&resource) = found.get(shown).and_then(|p| p.first())
         && let Some(texture) = crate::resource::host_resource(resource)
@@ -676,24 +678,48 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
+        let (picture, picture_state, picture_resource) = (&texture, state, resource);
+        #[cfg(feature = "diagnostics")]
+        let candidate = candidate.filter(|_| {
+            // SAFETY: a live primary texture.
+            let desc = unsafe { texture.GetDesc() };
+            (desc.Width, desc.Height) == (3840, 2160)
+        });
+        #[cfg(feature = "diagnostics")]
+        let (picture, picture_state, picture_resource) =
+            candidate
+                .as_ref()
+                .map_or((picture, picture_state, picture_resource), |target| {
+                    tracing::info!(
+                        frame,
+                        primary = resource as usize,
+                        preview = target.resource,
+                        "showing a completed 1440p target for the 4K primary"
+                    );
+                    (
+                        &target.copy.texture,
+                        target.copy.state.load(Ordering::Relaxed),
+                        target.resource as This,
+                    )
+                });
         // The other plane's first resource, blended over the picture when
         // `VICTORY_PRESENT_COMPOSITE=1` (#15: a 1080p overlay on Series S).
         let other = (found.len() == 2)
             .then(|| found[1 - shown].first().copied())
             .flatten()
-            .filter(|&o| o != resource && crate::composite::wanted())
+            .filter(|&o| o != picture_resource && crate::composite::wanted())
             .and_then(|o| Some((o, crate::resource::host_resource(o)?)));
         let overlay_state = other.as_ref().map(|(o, _)| {
             crate::resource::host_transition(*o, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before)
         });
         let overlay = other.as_ref().zip(overlay_state).map(|((_, t), s)| (t, s));
-        let shown = host.present(&texture, state, overlay, frame);
+        let shown = host.present(picture, picture_state, overlay, frame);
         if let Some(((o, _), s)) = other.as_ref().zip(overlay_state) {
             crate::resource::host_transition(*o, s);
         }
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
+        blinks(frame, picture_resource, picture_state, shown);
         #[cfg(not(feature = "diagnostics"))]
         let _ = shown;
     }

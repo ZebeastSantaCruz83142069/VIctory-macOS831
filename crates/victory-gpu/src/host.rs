@@ -1001,6 +1001,9 @@ pub(crate) struct HostList {
     /// or writes, and the pipeline that first wrote each (diagnostics).
     #[cfg(feature = "diagnostics")]
     targets: Mutex<Vec<(usize, String)>>,
+    /// The last color target this list nominated for the 1440p preview.
+    #[cfg(feature = "diagnostics")]
+    present_1440p: Mutex<Option<crate::capture::PresentCandidate>>,
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
@@ -1343,6 +1346,8 @@ impl Host {
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 targets: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
+                present_1440p: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
             })
@@ -1723,6 +1728,19 @@ impl Host {
                 last_notes(runs),
                 removed_during(runs, removed_in)
             ));
+        }
+        #[cfg(feature = "diagnostics")]
+        if crate::capture::present_1440p_on()
+            // SAFETY: a live fence of the host queue.
+            && unsafe { self.fence.GetCompletedValue() } >= *submitted
+            && let Some(candidate) = runs.iter().rev().find_map(|list| {
+                list.present_1440p
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+            })
+        {
+            crate::capture::publish_1440p_target(candidate);
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
@@ -2211,6 +2229,10 @@ impl HostList {
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        {
+            *self.present_1440p.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -2617,6 +2639,25 @@ impl HostList {
         let mut targets = self.targets.lock().unwrap_or_else(|e| e.into_inner());
         if !targets.iter().any(|t| t.0 == resource) {
             targets.push((resource, by.to_owned()));
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_1440p_target(&self, resource: crate::object::This) {
+        if !crate::capture::present_1440p_on() {
+            return;
+        }
+        let Some(copy) = crate::resource::host_copy(resource) else {
+            return;
+        };
+        // SAFETY: the candidate owns a live host texture.
+        let desc = unsafe { copy.texture.GetDesc() };
+        if crate::capture::is_1440p_candidate(&desc) {
+            *self.present_1440p.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(crate::capture::PresentCandidate {
+                    resource: resource as usize,
+                    copy,
+                });
         }
     }
 
