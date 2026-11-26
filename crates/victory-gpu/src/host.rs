@@ -499,6 +499,25 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn mesh_support_requires_both_feature_queries_to_confirm_support() {
+        use super::MeshSupport;
+
+        for (mesh_shaders, shader_model_6_6, supported) in [
+            (Some(true), Some(true), true),
+            (Some(false), Some(true), false),
+            (Some(true), Some(false), false),
+            (None, Some(true), false),
+            (Some(true), None, false),
+        ] {
+            let features = MeshSupport {
+                mesh_shaders,
+                shader_model_6_6,
+            };
+            assert_eq!(features.supported(), supported);
+        }
+    }
+
     /// Run in isolation with VICTORY_PRESENT_MAX=1280x720. Exercise the
     /// real swap chain and its resize path without opening a visible window.
     #[test]
@@ -1203,39 +1222,58 @@ struct Deferred {
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
 }
 
+/// Features reported by the D3D12 device used for rendering. A failed
+/// feature query leaves its result unknown.
+#[derive(Clone, Copy)]
+pub struct MeshSupport {
+    pub mesh_shaders: Option<bool>,
+    pub shader_model_6_6: Option<bool>,
+}
+
+impl MeshSupport {
+    /// Translated mesh shaders need both features.
+    pub fn supported(self) -> bool {
+        self.mesh_shaders == Some(true) && self.shader_model_6_6 == Some(true)
+    }
+}
+
+/// Checks the active host without loading a title. Returns `None` if
+/// VIctory could not initialise its D3D12 host.
+pub fn host_mesh_support() -> Option<MeshSupport> {
+    Some(host()?.mesh_support())
+}
+
 impl Host {
-    /// Whether the host runs mesh shaders at shader model 6.6 (translated
-    /// mesh shaders need both); logged once.
-    pub(crate) fn mesh_shaders(&self) -> bool {
-        static MESH: OnceLock<bool> = OnceLock::new();
+    pub(crate) fn mesh_support(&self) -> MeshSupport {
+        static MESH: OnceLock<MeshSupport> = OnceLock::new();
         *MESH.get_or_init(|| {
             let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
             let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
             };
             // SAFETY: each query writes its own structure of the given size.
-            let ok = unsafe {
-                self.device
-                    .CheckFeatureSupport(
-                        D3D12_FEATURE_D3D12_OPTIONS7,
-                        (&raw mut options).cast(),
-                        size_of_val(&options) as u32,
-                    )
-                    .is_ok()
-                    && self
-                        .device
-                        .CheckFeatureSupport(
-                            D3D12_FEATURE_SHADER_MODEL,
-                            (&raw mut model).cast(),
-                            size_of_val(&model) as u32,
-                        )
-                        .is_ok()
+            let support = unsafe {
+                let mesh_shaders = self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS7,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                );
+                let shader_model = self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_SHADER_MODEL,
+                    (&raw mut model).cast(),
+                    size_of_val(&model) as u32,
+                );
+                MeshSupport {
+                    mesh_shaders: mesh_shaders
+                        .ok()
+                        .map(|()| options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED),
+                    shader_model_6_6: shader_model
+                        .ok()
+                        .map(|()| model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0),
+                }
             };
-            let mesh = ok
-                && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
-                && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
-            tracing::info!(mesh, "host mesh shader support");
-            mesh
+            tracing::info!(mesh = support.supported(), "host mesh shader support");
+            support
         })
     }
 
