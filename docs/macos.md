@@ -194,6 +194,10 @@ On an M1 Max with CrossOver Wine 11.17 and D3DMetal 4.0 beta 3, a reserved buffe
 
 Run the probe under the D3DMetal Wine runner with `tools/macos/test-wine.sh -p victory-gpu --lib inplace_probe_6_remap_cpu_visible_tiles -- --ignored --test-threads=1`.
 
+The diagnostics switch `VICTORY_PHYSICAL_TILES=1` lets XMem use CPU-visible D3D12 heaps for physical page allocations on Rosetta. Wine supplies its usual placeholder views, and the mapped view and DirectStorage share the heap's bytes. The XMem test checks page aliases, remapping, unmapping, and DirectStorage writes. The GPU probe also checks both directions of a copy through an aliased Windows view, including after that view is unmapped.
+
+A separate 6.10 GiB heap and reserved buffer worked on the same M1 Max. Readback matched data from four sampled tiles, including the last two in the heap. A GPU write reached the final tile's CPU mapping.
+
 ## Host presentation size
 
 Set `VICTORY_PRESENT_MAX=1280x720` to cap the host presentation pass and DXGI swap chain at 720p. Smaller pictures keep their native size. The cap preserves the picture’s aspect ratio and applies after the game’s rendering and upscaling.
