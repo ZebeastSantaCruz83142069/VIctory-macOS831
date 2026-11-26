@@ -310,6 +310,8 @@ struct Lower<'a> {
     halves: bool,
     /// Why such a program cannot run in halves.
     halves_refused: Option<Why>,
+    /// Group-shared words used by fixed lane reads, in addition to guest LDS.
+    lane_scratch_dwords: u32,
     /// [`Lower::relabelled_flat`], once made.
     relabelled: Option<V>,
     /// In halves: VGPR values the same in every lane of the console wave
@@ -841,6 +843,7 @@ impl<'a> Lower<'a> {
             console_lanes,
             halves,
             halves_refused,
+            lane_scratch_dwords: 0,
             relabelled: None,
             alike: if halves {
                 halves::lane_uniform(x)
@@ -1536,7 +1539,7 @@ impl<'a> Lower<'a> {
                     self.has_discard = true;
                 }
                 if self.split_barriers.contains(&(b, i)) {
-                    self.group_barrier();
+                    self.group_barrier(self.writes_uavs);
                 }
                 self.inst(b, i)?;
                 self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
@@ -1550,7 +1553,7 @@ impl<'a> Lower<'a> {
                 i += 1;
             }
             if self.split_barriers.contains(&(b, p.blocks[b].insts.len())) {
-                self.group_barrier();
+                self.group_barrier(self.writes_uavs);
             }
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
@@ -3767,11 +3770,10 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Thread-group sync with a shared-memory fence, and a UAV fence when
-    /// the program writes UAVs (the waits before an s_barrier make those
-    /// writes visible on the console).
-    fn group_barrier(&mut self) {
-        let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
+    /// Thread-group sync with a shared-memory fence. Guest barriers also
+    /// fence UAV writes, which the waits before an s_barrier make visible.
+    fn group_barrier(&mut self, fence_uavs: bool) {
+        let mode = if fence_uavs { 1 | 2 | 8 } else { 1 | 8 };
         let mode = self.s.m.i32(mode);
         let void = self.s.t.void;
         self.s
@@ -3810,7 +3812,7 @@ impl<'a> Lower<'a> {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
             Fields::Sopp { .. } if name == "s_barrier" => {
-                self.group_barrier();
+                self.group_barrier(self.writes_uavs);
                 Ok(())
             }
             Fields::Sopp { .. } => Ok(()),
@@ -7282,6 +7284,23 @@ impl<'a> Lower<'a> {
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
+                // If the named lane exists and every console lane holds the
+                // same VGPR value, either host half already has the answer.
+                if self.halves
+                    && let Some(index) = v.src.get(1).copied().and_then(crate::resource::lane_of)
+                    && self.every_wave_has_lane(index)
+                {
+                    if matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
+                        if inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)))
+                    {
+                        return int(self, a);
+                    }
+                    // All threads enter this block together, exactly once.
+                    if self.cur_ir == 0 && self.x.p.blocks[0].preds.is_empty() {
+                        let r = self.read_entry_lane(inst.machine.offset, a, lane)?;
+                        return int(self, r);
+                    }
+                }
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
                 if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {

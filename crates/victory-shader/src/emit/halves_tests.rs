@@ -344,9 +344,9 @@ fn reads_across_32_lane_halves_are_refused_with_their_reason() {
     ]
     .concat();
     assert!(
-        refusal(&readlane, 64, 0).contains("a lane read that may cross 32-lane halves"),
+        refusal(&readlane, 32, 0).contains("a lane read that may cross 32-lane halves"),
         "{}",
-        refusal(&readlane, 64, 0)
+        refusal(&readlane, 32, 0)
     );
     assert!(lowered(&native(&readlane, true, 64, 0), false).is_ok());
 
@@ -665,6 +665,68 @@ fn first_lanes_kept_in_halves_match_the_console_on_every_gpu() {
     let mut failed = differences(&first_lane_of_the_thread_id(), 32, 1, &[0; 32]);
     let want: Vec<u32> = (0..128).flat_map(|l| [l >> 6, l & 63]).collect();
     failed.extend(differences(&first_lane_alike(), 128, 2, &want));
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+#[test]
+fn entry_lane_reads_cross_halves_and_keep_console_waves_separate() {
+    let mut words = PROLOGUE.to_vec();
+    words.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xD760_000C,
+        0x0001_5100, // v_readlane_b32 s12, v0, 40
+        0x7E02_020C, // v_mov_b32 v1, s12
+        0xD760_000D,
+        0x0001_0900, // v_readlane_b32 s13, v0, 4
+        0x7E04_020D, // v_mov_b32 v2, s13
+    ]);
+    words.extend(store(1, 0));
+    words.extend(store(2, 4));
+    words.push(S_ENDPGM);
+    let want: Vec<_> = (0..128)
+        .flat_map(|i| [i / 64 * 64 + 40, i / 64 * 64 + 4])
+        .collect();
+    assert_eq!(refusal(&words, 128, 0), "translated");
+    let failed = differences(&words, 128, 2, &want);
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+    assert!(refusal(&words, 96, 0).contains("a lane read that may cross"));
+    assert!(refusal(&words, 128, 32768).contains("exceeds thread-group shared memory"));
+}
+
+#[test]
+fn varying_lane_reads_under_a_branch_do_not_insert_a_group_barrier() {
+    let mut words = PROLOGUE.to_vec();
+    words.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xBE80_047E, // s_mov_b64 s[0:1], exec
+        0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+        0xBF88_0005, // s_cbranch_execz over read, move and store
+        0xD760_000C,
+        0x0001_5100, // v_readlane_b32 s12, v0, 40
+        0x7E02_020C, // v_mov_b32 v1, s12
+    ]);
+    words.extend(store(1, 0));
+    words.extend([0xBEFE_0400, S_ENDPGM]); // s_mov_b64 exec, s[0:1]
+    assert!(refusal(&words, 64, 0).contains("a lane read that may cross"));
+}
+
+#[test]
+fn named_lane_of_a_wave_uniform_value_matches_on_every_gpu() {
+    let mut words = PROLOGUE.to_vec();
+    words.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x2C04_0086, // v_lshrrev_b32 v2, 6, v0 (console wave number)
+        0xD760_000C,
+        0x0001_5102, // v_readlane_b32 s12, v2, 40
+        0x7E02_020C, // v_mov_b32 v1, s12
+    ]);
+    words.extend(store(1, 0));
+    words.push(S_ENDPGM);
+    assert_eq!(refusal(&words, 128, 0), "translated");
+    // The second wave of a 96-thread group has no lane 40.
+    assert!(refusal(&words, 96, 0).contains("a lane read that may cross"));
+    let want: Vec<_> = (0..128).map(|thread| thread / 64).collect();
+    let failed = differences(&words, 128, 1, &want);
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
