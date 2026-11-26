@@ -3296,46 +3296,51 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
     #[cfg(feature = "diagnostics")]
     let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FallbackUs);
-    // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read. A piece that fails on an
-    // unreadable page skips that page's whole region: each failed read is a
-    // fault, about 30 us under Wine on Rosetta, where copies are not tracked
-    // and so taken whole, and the world's met 160 MB of unmapped pages per
-    // frame, 40 000 failed 4 KiB reads that took seconds.
+    // The whole copy failed. Copy each readable region in one call and
+    // zero the holes. In particular, a hole that starts inside a 64 KiB
+    // block does not require a faulting read of each remaining 4 KiB page.
     let (start, end) = (src as usize, src as usize + len);
     let mut at = start;
     while at < end {
-        let next = ((at >> 16) + 1).saturating_mul(1 << 16).min(end);
+        let (region_end, readable) = source_region(at);
+        let next = region_end.min(end);
         let to = dst.wrapping_add(at - start);
-        if read(at as *const u8, to, next - at) {
-            at = next;
-            continue;
-        }
-        if let Some(gap) = unreadable_until(at) {
-            let gap = gap.min(end);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::Unmapped, (gap - at) as u64);
-            // SAFETY: inside the destination, which is mapped.
-            unsafe { to.write_bytes(0, gap - at) };
-            at = gap;
-            continue;
-        }
-        for_pieces(at, next - at, 4 << 10, |at, n| {
-            let to = dst.wrapping_add(at - start);
-            if !read(at as *const u8, to, n) {
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                // SAFETY: inside the destination, which is mapped.
-                unsafe { to.write_bytes(0, n) };
+        if !readable {
+            // Wine's view of memory can omit host mappings. Keep trying
+            // the initial 64 KiB piece before treating the region as a hole.
+            let piece = ((at >> 16) + 1).saturating_mul(1 << 16).min(end);
+            if read(at as *const u8, to, piece - at) {
+                at = piece;
+                continue;
             }
-        });
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, (next - at) as u64);
+            // SAFETY: inside the destination, which is mapped.
+            unsafe { to.write_bytes(0, next - at) };
+        } else if !read(at as *const u8, to, next - at) {
+            // Protection can change after the query. Keep trying smaller
+            // pieces and zero only the pages the kernel cannot read.
+            for_pieces(at, next - at, 64 << 10, |block, len| {
+                let to = dst.wrapping_add(block - start);
+                if !read(block as *const u8, to, len) {
+                    for_pieces(block, len, 4 << 10, |page, len| {
+                        let to = dst.wrapping_add(page - start);
+                        if !read(page as *const u8, to, len) {
+                            #[cfg(feature = "diagnostics")]
+                            crate::copystat::add(crate::copystat::C::Unmapped, len as u64);
+                            // SAFETY: inside the mapped destination.
+                            unsafe { to.write_bytes(0, len) };
+                        }
+                    });
+                }
+            });
+        }
         at = next;
     }
 }
 
-/// Where the unreadable region holding `at` ends (none: the page at `at` is
-/// readable); at least the end of its page.
-fn unreadable_until(at: usize) -> Option<usize> {
+/// The end and readability of the region containing `at`.
+fn source_region(at: usize) -> (usize, bool) {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
     };
@@ -3344,16 +3349,15 @@ fn unreadable_until(at: usize) -> Option<usize> {
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
-        return Some(page_end);
+        return (page_end, false);
     }
     let readable = info.State == MEM_COMMIT
         && info.Protect != 0
         && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0;
-    (!readable).then(|| {
-        (info.BaseAddress as usize)
-            .saturating_add(info.RegionSize)
-            .max(page_end)
-    })
+    let end = (info.BaseAddress as usize)
+        .saturating_add(info.RegionSize)
+        .max(page_end);
+    (end, readable)
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
@@ -3506,6 +3510,36 @@ mod title_copies {
         assert!(to[..hole].iter().all(|&b| b == 7));
         assert!(to[hole..last].iter().all(|&b| b == 0));
         assert!(to[last..].iter().all(|&b| b == 9));
+        release(base);
+    }
+
+    #[test]
+    fn protected_holes_inside_a_copy_preserve_the_readable_bytes() {
+        const PAGE: usize = 4 << 10;
+        // SAFETY: a fresh allocation, filled and protected by this test.
+        let base = unsafe {
+            VirtualAlloc(std::ptr::null(), 4 * BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+                .cast::<u8>()
+        };
+        assert!(!base.is_null());
+        let mut old = 0;
+        // SAFETY: these are pages of the allocation above.
+        unsafe {
+            base.write_bytes(7, 4 * BLOCK);
+            for offset in [3 * PAGE, BLOCK + PAGE] {
+                assert_ne!(
+                    VirtualProtect(base.add(offset).cast(), PAGE, PAGE_NOACCESS, &mut old),
+                    0
+                );
+            }
+        }
+        let mut to = vec![0xee; 4 * BLOCK - 200];
+        copy_mapped(to.as_mut_ptr(), base.wrapping_add(100), to.len(), false);
+        for (i, byte) in to.into_iter().enumerate() {
+            let page = (i + 100) / PAGE;
+            let expected = if [3, BLOCK / PAGE + 1].contains(&page) { 0 } else { 7 };
+            assert_eq!(byte, expected, "byte {i:#x}");
+        }
         release(base);
     }
 
