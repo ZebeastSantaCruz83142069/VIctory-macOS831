@@ -1,8 +1,8 @@
 diff --git a/crates/victory-gpu/src/compose.rs b/crates/victory-gpu/src/compose.rs
-index be473764dffb3b4ccfd0cf1da7fb448f0cb0a99c..2168f87b409464c9134970bae70b09632fda99d1 100644
+index be473764dffb3b4ccfd0cf1da7fb448f0cb0a99c..46a6aad726ad1f4d7938bfafcfd03011590295d9 100644
 --- a/crates/victory-gpu/src/compose.rs
 +++ b/crates/victory-gpu/src/compose.rs
-@@ -10,6 +10,30 @@ use windows::core::{PCSTR, s};
+@@ -10,10 +10,41 @@ use windows::core::{PCSTR, s};
  
  use crate::host::Host;
  
@@ -33,6 +33,228 @@ index be473764dffb3b4ccfd0cf1da7fb448f0cb0a99c..2168f87b409464c9134970bae70b0963
  const SOURCE: &str = r#"
  Texture2D<float4> scene : register(t0);
  Texture2D<float4> over : register(t1);
+ SamplerState smooth_ : register(s0);
++cbuffer Display : register(b0) { uint linear_scene; };
++
++float to_srgb(float value) {
++    float x = saturate(value);
++    if (x <= 0.0031308) return 12.92 * x;
++    return 1.055 * pow(x, 1.0 / 2.4) - 0.055;
++}
+ struct V { float4 at : SV_Position; float2 uv : TEXCOORD0; };
+ V vs(uint id : SV_VertexID) {
+     V v;
+@@ -23,6 +54,9 @@ V vs(uint id : SV_VertexID) {
+ }
+ float4 ps(V v) : SV_Target {
+     float4 s = scene.SampleLevel(smooth_, v.uv, 0);
++    if (linear_scene != 0) {
++        s.rgb = float3(to_srgb(s.r), to_srgb(s.g), to_srgb(s.b));
++    }
+     float4 o = over.SampleLevel(smooth_, v.uv, 0);
+     return float4(saturate(o.rgb + s.rgb * (1 - saturate(o.a))), 1);
+ }
+@@ -41,6 +75,7 @@ unsafe impl Sync for Composer {}
+ 
+ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
+     let mut code: Option<ID3DBlob> = None;
++    let mut errors: Option<ID3DBlob> = None;
+     // SAFETY: the source and names live through the call; the out pointer is
+     // ours.
+     unsafe {
+@@ -55,8 +90,14 @@ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
+             0,
+             0,
+             &mut code,
+-            None,
+-        )?;
++            Some(&mut errors),
++        ).map_err(|error| {
++            if let Some(messages) = errors {
++                let bytes = std::slice::from_raw_parts(messages.GetBufferPointer().cast::<u8>(), messages.GetBufferSize());
++                return windows::core::Error::new(error.code(), String::from_utf8_lossy(bytes).trim_end_matches('\0'));
++            }
++            error
++        })?;
+     }
+     code.ok_or_else(windows::core::Error::empty)
+ }
+@@ -78,6 +119,14 @@ impl Composer {
+             },
+             ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+         };
++        let mode = D3D12_ROOT_PARAMETER {
++            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
++            Anonymous: D3D12_ROOT_PARAMETER_0 {
++                Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 1 },
++            },
++            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
++        };
++        let parameters = [table, mode];
+         let sampler = D3D12_STATIC_SAMPLER_DESC {
+             Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+             AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+@@ -90,7 +139,7 @@ impl Composer {
+             ..Default::default()
+         };
+         let desc = D3D12_ROOT_SIGNATURE_DESC {
+-            NumParameters: 1, pParameters: &table,
++            NumParameters: parameters.len() as u32, pParameters: parameters.as_ptr(),
+             NumStaticSamplers: 1, pStaticSamplers: &sampler,
+             Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+         };
+@@ -160,6 +209,7 @@ impl Composer {
+         slot: usize,
+         list: &ID3D12GraphicsCommandList,
+         planes: [(&ID3D12Resource, DXGI_FORMAT); 2],
++        linear_scene: bool,
+         back: &ID3D12Resource,
+         (width, height): (u32, u32),
+     ) -> windows::core::Result<()> {
+@@ -207,6 +257,7 @@ impl Composer {
+             list.SetGraphicsRootSignature(&self.root);
+             list.SetPipelineState(&self.pso);
+             list.SetGraphicsRootDescriptorTable(0, gpu);
++            list.SetGraphicsRoot32BitConstant(1, u32::from(linear_scene), 0);
+             list.IASetPrimitiveTopology(
+                 windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+             );
+@@ -252,20 +303,15 @@ pub(crate) fn view(d: &D3D12_RESOURCE_DESC) -> Option<DXGI_FORMAT> {
+ mod tests {
+     use super::*;
+ 
+-    #[test]
+-    fn composes_scaled_premultiplied_plane_on_gpu() {
+-        let Some(host) = crate::host::host() else {
+-            eprintln!("skipping display-plane readback: no D3D12 device");
+-            return;
+-        };
++    fn composite(host: &Host, scene_format: DXGI_FORMAT, colors: &[[f32; 4]], ui: &[[f32; 4]], linear_scene: bool) -> Vec<u8> {
+         let format = DXGI_FORMAT_R8G8B8A8_UNORM;
+         let mut compositor = Composer::new(host, format).unwrap();
+         let list = host.new_list().unwrap();
+-        let texture = |width: u64| -> ID3D12Resource {
++        let texture = |width: usize, format: DXGI_FORMAT| -> ID3D12Resource {
+             let mut resource = None;
+             let desc = D3D12_RESOURCE_DESC {
+                 Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+-                Width: width,
++                Width: width as u64,
+                 Height: 1,
+                 DepthOrArraySize: 1,
+                 MipLevels: 1,
+@@ -294,30 +340,21 @@ mod tests {
+             };
+             resource.unwrap()
+         };
+-        // A half-red base at one resolution. The overlay at output resolution
+-        // contains transparent, half-opaque green and fully opaque blue pixels.
+-        let base = texture(1);
+-        let overlay = texture(3);
+-        let output = texture(3);
++        let base = texture(colors.len(), scene_format);
++        let overlay = texture(ui.len(), format);
++        let output = texture(ui.len(), format);
+         let target = D3D12_RESOURCE_STATE_RENDER_TARGET;
+         let read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+         let cmds = &list.list;
+         unsafe {
+-            cmds.ClearRenderTargetView(host.rtv(Some(&base), None), &[0.5, 0.0, 0.0, 1.0], None);
+-            let overlay_rtv = host.rtv(Some(&overlay), None);
+-            let colors = [
+-                [0.0, 0.0, 0.0, 0.0],
+-                [0.0, 0.5, 0.0, 0.5],
+-                [0.0, 0.0, 1.0, 1.0],
+-            ];
+-            for (i, color) in colors.iter().enumerate() {
+-                let rect = windows::Win32::Foundation::RECT {
+-                    left: i as i32,
+-                    right: i as i32 + 1,
+-                    top: 0,
+-                    bottom: 1,
+-                };
+-                cmds.ClearRenderTargetView(overlay_rtv, color, Some(&[rect]));
++            for (surface, values) in [(&base, colors), (&overlay, ui)] {
++                let rtv = host.rtv(Some(surface), None);
++                for (i, color) in values.iter().enumerate() {
++                    let rect = windows::Win32::Foundation::RECT {
++                        left: i as i32, right: i as i32 + 1, top: 0, bottom: 1,
++                    };
++                    cmds.ClearRenderTargetView(rtv, color, Some(&[rect]));
++                }
+             }
+             cmds.ResourceBarrier(&[
+                 crate::host::transition(&base, target, read),
+@@ -328,9 +365,10 @@ mod tests {
+                     host,
+                     0,
+                     cmds,
+-                    [(&base, format), (&overlay, format)],
++                    [(&base, scene_format), (&overlay, format)],
++                    linear_scene,
+                     &output,
+-                    (3, 1),
++                    (ui.len() as u32, 1),
+                 )
+                 .unwrap();
+             cmds.ResourceBarrier(&[crate::host::transition(
+@@ -346,18 +384,46 @@ mod tests {
+             let mut mapped = std::ptr::null_mut();
+             buffer.Map(0, None, Some(&mut mapped)).unwrap();
+             let start = mapped.cast::<u8>().add(footprint.Offset as usize);
+-            let pixels: [u8; 12] = std::slice::from_raw_parts(start, 12).try_into().unwrap();
++            let pixels = std::slice::from_raw_parts(start, ui.len() * 4).to_vec();
+             buffer.Unmap(0, None);
+-            for (actual, expected) in pixels
+-                .iter()
+-                .zip([128, 0, 0, 255, 64, 128, 0, 255, 0, 0, 255, 255])
+-            {
+-                assert!(
+-                    actual.abs_diff(expected) <= 1,
+-                    "unexpected composite {pixels:?}"
+-                );
++            pixels
++        }
++    }
++
++    #[test]
++    fn composes_scaled_premultiplied_plane_on_gpu() {
++        let Some(host) = crate::host::host() else {
++            eprintln!("skipping display-plane readback: no D3D12 device");
++            return;
++        };
++        let ui = [[0.0; 4], [0.0, 0.5, 0.0, 0.5], [0.0, 0.0, 1.0, 1.0]];
++        let pixels = composite(host, DXGI_FORMAT_R8G8B8A8_UNORM, &[[0.5, 0.0, 0.0, 1.0]], &ui, false);
++        for (actual, expected) in pixels.iter().zip([128, 0, 0, 255, 64, 128, 0, 255, 0, 0, 255, 255]) {
++            assert!(actual.abs_diff(expected) <= 1, "unexpected composite {pixels:?}");
++        }
++        eprintln!("D3D12 display-plane readback RGBA: {pixels:?}");
++    }
++
++    #[test]
++    fn encodes_linear_scene_before_blending_sdr_ui_on_gpu() {
++        let Some(host) = crate::host::host() else {
++            eprintln!("skipping linear-scene ramp: no D3D12 device");
++            return;
++        };
++        let levels = [0.0, 1.0/512.0, 1.0/256.0, 1.0/64.0, 0.18, 0.5, 1.0, 4.0, 0.5, 0.5];
++        let colors = levels.map(|v| [v, v, v, 1.0]);
++        let mut ui = [[0.0; 4]; 10];
++        ui[8] = [0.25, 0.0, 0.0, 0.5];
++        ui[9] = [0.25, 0.5, 0.75, 1.0];
++        let pixels = composite(host, DXGI_FORMAT_R11G11B10_FLOAT, &colors, &ui, true);
++        let mut expected = [0u8, 6, 13, 34, 118, 188, 255, 255, 0, 0].map(|v| [v, v, v, 255]);
++        expected[8] = [158, 94, 94, 255];
++        expected[9] = [64, 128, 191, 255];
++        for (actual, reference) in pixels.chunks_exact(4).zip(expected) {
++            for (v, r) in actual.iter().zip(reference) {
++                assert!(v.abs_diff(r) <= 2, "unexpected SDR ramp {pixels:?}");
+             }
+-            eprintln!("D3D12 display-plane readback RGBA: {pixels:?}");
+         }
++        eprintln!("D3D12 radiance ramp and HUD readback RGBA: {pixels:?}");
+     }
+ }
 diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
 index e05304c85d76f70cf761dec3e2966ca6108c2107..a76c8ff58d3a70923bc09d9ba83aeea30e48076b 100644
 --- a/crates/victory-gpu/src/draw.rs
@@ -56,7 +278,7 @@ index e05304c85d76f70cf761dec3e2966ca6108c2107..a76c8ff58d3a70923bc09d9ba83aeea3
              && crate::ambient::on()
              && self.ambient(list, p, role)
 diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
-index 3e1ba92d00b9b4706c93cdb578c1acd523831124..34dfac19f42e228cf7d767e102f85da922544e38 100644
+index 3e1ba92d00b9b4706c93cdb578c1acd523831124..05917f0cb060528f4f11c17240148fb9410fc90d 100644
 --- a/crates/victory-gpu/src/host.rs
 +++ b/crates/victory-gpu/src/host.rs
 @@ -2160,6 +2160,7 @@ enum Step {
@@ -143,7 +365,7 @@ index 3e1ba92d00b9b4706c93cdb578c1acd523831124..34dfac19f42e228cf7d767e102f85da9
 +                let early = crate::compose::scene_color_enabled().then(|| crate::compose::scene_color(frame)).flatten();
 +                let (texture, state, base_fmt) = if let Some(ref scene) = early {
 +                    static LOGGED: std::sync::Once = std::sync::Once::new();
-+                    LOGGED.call_once(|| tracing::info!(frame, "presenting the title's completed scene radiance under its UI"));
++                    LOGGED.call_once(|| tracing::info!(frame, "presenting the title's scene radiance with sRGB encoding under its UI"));
 +                    copy.keep(scene);
 +                    (scene, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, DXGI_FORMAT_R11G11B10_FLOAT)
 +                } else {
@@ -152,7 +374,15 @@ index 3e1ba92d00b9b4706c93cdb578c1acd523831124..34dfac19f42e228cf7d767e102f85da9
                  copy.keep(over);
                  if let Some(composer) = p.composer.as_mut() {
                      let mut pre = Vec::with_capacity(3);
-@@ -9026,7 +9081,7 @@ impl Host {
+@@ -9019,6 +9074,7 @@ impl Host {
+                         compose_slot,
+                         list,
+                         [(texture, base_fmt), (over, over_fmt)],
++                        early.is_some(),
+                         &back,
+                         (width, height),
+                     ) {
+@@ -9026,7 +9082,7 @@ impl Host {
                          drop(back);
                          drop(presenter);
                          tracing::warn!(%err, "could not record display composite; presenting the base plane");
