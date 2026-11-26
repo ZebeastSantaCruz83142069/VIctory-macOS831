@@ -774,3 +774,142 @@ fn inplace_probe_5_timing() {
     let Some(device) = host_device() else { return };
     timing(&device);
 }
+
+#[test]
+#[ignore = "hardware probe: requires D3D12 tiled buffers"]
+fn inplace_probe_6_remap_cpu_visible_tiles() {
+    const TILES: usize = 4;
+    const BYTES: usize = TILES * K64;
+    let device = host_device().expect("a D3D12 host");
+    let mut rig = Rig::new(&device).unwrap();
+    let mut reserved: Option<ID3D12Resource> = None;
+    let mut heap: Option<ID3D12Heap> = None;
+    let mut backing: Option<ID3D12Resource> = None;
+    let mut data = std::ptr::null_mut();
+    let desc = D3D12_HEAP_DESC {
+        SizeInBytes: BYTES as u64,
+        Properties: D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            CreationNodeMask: 1,
+            VisibleNodeMask: 1,
+        },
+        Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+        ..Default::default()
+    };
+    // SAFETY: each output is our own and both buffers span exactly four tiles.
+    unsafe {
+        device
+            .CreateReservedResource(
+                &buffer_desc(BYTES as u64, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut reserved,
+            )
+            .expect("a reserved UAV buffer");
+        device
+            .CreateHeap(&desc, &mut heap)
+            .expect("CPU-visible tile heap");
+        device
+            .CreatePlacedResource(
+                heap.as_ref().unwrap(),
+                0,
+                &buffer_desc(BYTES as u64, D3D12_RESOURCE_FLAG_NONE),
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut backing,
+            )
+            .expect("a buffer over the tile heap");
+        backing
+            .as_ref()
+            .unwrap()
+            .Map(0, None, Some(&mut data))
+            .unwrap();
+    }
+    let (reserved, backing, heap) = (reserved.unwrap(), backing.unwrap(), heap.unwrap());
+    let data = data.cast::<u8>();
+    assert!(!data.is_null());
+    // SAFETY: a live reserved buffer.
+    let address = unsafe { reserved.GetGPUVirtualAddress() };
+    assert_ne!(address, 0);
+
+    let queue = rig.queue.clone();
+    let map = |offsets: [u32; TILES]| {
+        let start = D3D12_TILED_RESOURCE_COORDINATE::default();
+        let size = D3D12_TILE_REGION_SIZE {
+            NumTiles: TILES as u32,
+            ..Default::default()
+        };
+        let flags = [D3D12_TILE_RANGE_FLAG_NONE; TILES];
+        let counts = [1; TILES];
+        // SAFETY: each range maps one tile of the live CPU-visible heap.
+        unsafe {
+            queue.UpdateTileMappings(
+                &reserved,
+                1,
+                Some(&start),
+                Some(&size),
+                &heap,
+                TILES as u32,
+                Some(flags.as_ptr()),
+                Some(offsets.as_ptr()),
+                Some(counts.as_ptr()),
+                D3D12_TILE_MAPPING_FLAG_NONE,
+            );
+        }
+    };
+    let mut expect = |values: [u8; TILES]| {
+        let bytes = rig.fetch(&reserved, 0, BYTES).unwrap();
+        for (i, (page, value)) in bytes.as_chunks::<K64>().0.iter().zip(values).enumerate() {
+            assert!(page.iter().all(|&actual| actual == value), "GPU tile {i}");
+        }
+    };
+    for (tile, value) in [0x11, 0x22, 0x33, 0x44].into_iter().enumerate() {
+        // SAFETY: each tile is inside the CPU mapping; the GPU has yet to use it.
+        unsafe { data.add(tile * K64).write_bytes(value, K64) };
+    }
+    map([2, 0, 3, 1]);
+    expect([0x33, 0x11, 0x44, 0x22]);
+
+    // SAFETY: the previous GPU read finished.
+    unsafe { data.write_bytes(0x77, K64) };
+    map([0, 3, 2, 1]);
+    expect([0x77, 0x44, 0x33, 0x22]);
+    // SAFETY: still the same reserved resource after changing its tile mappings.
+    assert_eq!(unsafe { reserved.GetGPUVirtualAddress() }, address);
+
+    rig.store(&reserved, K64 as u64, &vec![0x99; K64]).unwrap();
+    // SAFETY: the GPU write finished, and the backing buffer remains mapped.
+    unsafe {
+        let written = std::slice::from_raw_parts(data.add(3 * K64), K64);
+        assert!(written.iter().all(|&byte| byte == 0x99));
+        assert_eq!(data.add(K64).read(), 0x22);
+        assert_eq!(data.add(2 * K64).read(), 0x33);
+    }
+    let start = D3D12_TILED_RESOURCE_COORDINATE::default();
+    let hole = D3D12_TILE_RANGE_FLAG_NULL;
+    // SAFETY: null-mapping tile zero of our own reserved buffer. The
+    // coordinate describes one tile when the region size is omitted.
+    unsafe {
+        queue.UpdateTileMappings(
+            &reserved,
+            1,
+            Some(&start),
+            None,
+            None::<&ID3D12Heap>,
+            1,
+            Some(&hole),
+            None,
+            Some(&1),
+            D3D12_TILE_MAPPING_FLAG_NONE,
+        );
+    }
+    let bytes = rig.fetch(&reserved, 0, K64).unwrap();
+    assert!(bytes.iter().all(|&byte| byte == 0), "null tile reads as zeros");
+    // SAFETY: null-mapping the GPU view leaves the CPU heap tile alive.
+    unsafe {
+        assert_eq!(data.read(), 0x77);
+        backing.Unmap(0, None);
+    }
+}

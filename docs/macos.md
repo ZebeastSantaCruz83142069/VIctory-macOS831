@@ -188,6 +188,12 @@ The game's executable holds 1130 masked stores (789 `vpmaskmovd`, 160 `vpmaskmov
 
 With every masked store patched and fault tracking on, #144 then stopped on a plain 256-bit store, `vmovups [r8+0x34], ymm0` at RVA 0x1E09B31, with the same Rosetta error. Plain stores like that are far more common than masked ones, so the scan does not look for them. Instead, an RVA in the list that the scan did not find is decoded as an unaligned 256-bit store (`vmovups`, `vmovupd` or `vmovdqu`) and redone the same way, into the stack and out with plain `mov`s. `all` and RVAs can be given together, as in `VICTORY_PATCH_MASKED=all,1e09b31,1e09b37`. A listed RVA that is neither kind is left alone with a warning, and so is a store shorter than the 5-byte jump.
 
+## CPU-visible tiles in reserved buffers
+
+On an M1 Max with CrossOver Wine 11.17 and D3DMetal 4.0 beta 3, a reserved buffer stayed at one GPU address as its four 64 KiB tiles were mapped and remapped. The probe reads all four CPU-written tiles on the GPU, checks that a GPU write reaches the remapped tile's CPU memory, and verifies that a tile mapped to NULL reads as zeros. The host reported tiled resources tier 2. Its file-mapping heap API returned `E_NOTIMPL` at 64 KiB, 4 MiB and 256 MiB. [Direct3D 12 tile mapping](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12commandqueue-updatetilemappings)
+
+Run the probe under the D3DMetal Wine runner with `tools/macos/test-wine.sh -p victory-gpu --lib inplace_probe_6_remap_cpu_visible_tiles -- --ignored --test-threads=1`.
+
 ## Host presentation size
 
 Set `VICTORY_PRESENT_MAX=1280x720` to cap the host presentation pass and DXGI swap chain at 720p. Smaller pictures keep their native size. The cap preserves the picture’s aspect ratio and applies after the game’s rendering and upscaling.
@@ -232,5 +238,7 @@ None of these changes the default. Each is read from the environment when the ga
 | `VICTORY_SPILL_SHADERS=1` | Keeps shader containers on disk until they are translated. The title passes tens of thousands of containers and draws with a few hundred, and holding them all took about 700 MB of an 8 GB Mac (#135). |
 | `VICTORY_READ_STATS=1` | Logs the requests and bytes read from each file, every 30 seconds, for the 30 most read. It shows which files a slow share serves most, so you can copy those to fast local storage. |
 | `VICTORY_GPU_BUDGET_MB=<MB>` | Sets the budget that host textures are kept under, in place of the device's. |
+| `VICTORY_STEP_OVER=pool` | Steps over the title's "no free element" traps: an `int3` followed by `xor r, r`, the shape of a full fixed-size pool's allocator, whose caller then gets the NULL it already checks for. Series 1.0.2.1 hits one at `+0x5149aec` (the instance lists' pool, Marvisak/VIctory#698) about 20 minutes into the opening when frames take seconds. A list of hex offsets also works. |
 | `VICTORY_ALIAS_BUFFERS=1` | Under Rosetta with D3DMetal, points title buffers at the pages of a D3DMetal buffer with `mach_vm_remap`, so they need no host copies (#204). A probe at start-up falls back to the copies if the remap does not work. It has only synthetic tests so far, so it needs a run in the game. |
 | `VICTORY_WINDOW_SECONDARY=1` | Opens the game window on the only non-primary display. |
+| `VICTORY_WINDOW_SECONDARY=x,y` | Opens the game window on the display that holds the desktop point `x,y`, for layouts with more than one extra display (a Sidecar iPad beside two monitors, say). |
