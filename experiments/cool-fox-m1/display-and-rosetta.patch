@@ -1,0 +1,162 @@
+diff --git a/crates/victory-gpu/src/compose.rs b/crates/victory-gpu/src/compose.rs
+index dfcf50b..be47376 100644
+--- a/crates/victory-gpu/src/compose.rs
++++ b/crates/victory-gpu/src/compose.rs
+@@ -11,19 +11,16 @@ use windows::core::{PCSTR, s};
+ use crate::host::Host;
+ 
+ const SOURCE: &str = r#"
+-#define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
+ Texture2D<float4> scene : register(t0);
+ Texture2D<float4> over : register(t1);
+ SamplerState smooth_ : register(s0);
+ struct V { float4 at : SV_Position; float2 uv : TEXCOORD0; };
+-[RootSignature(RS)]
+ V vs(uint id : SV_VertexID) {
+     V v;
+     v.uv = float2((id << 1) & 2, id & 2);
+     v.at = float4(v.uv * float2(2, -2) + float2(-1, 1), 0, 1);
+     return v;
+ }
+-[RootSignature(RS)]
+ float4 ps(V v) : SV_Target {
+     float4 s = scene.SampleLevel(smooth_, v.uv, 0);
+     float4 o = over.SampleLevel(smooth_, v.uv, 0);
+@@ -65,6 +62,50 @@ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
+ }
+ 
+ impl Composer {
++    fn root(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
++        let range = D3D12_DESCRIPTOR_RANGE {
++            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
++            NumDescriptors: 2,
++            ..Default::default()
++        };
++        let table = D3D12_ROOT_PARAMETER {
++            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
++            Anonymous: D3D12_ROOT_PARAMETER_0 {
++                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
++                    NumDescriptorRanges: 1,
++                    pDescriptorRanges: &range,
++                },
++            },
++            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
++        };
++        let sampler = D3D12_STATIC_SAMPLER_DESC {
++            Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
++            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
++            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
++            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
++            MaxAnisotropy: 1,
++            ComparisonFunc: D3D12_COMPARISON_FUNC_ALWAYS,
++            MaxLOD: f32::MAX,
++            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
++            ..Default::default()
++        };
++        let desc = D3D12_ROOT_SIGNATURE_DESC {
++            NumParameters: 1, pParameters: &table,
++            NumStaticSamplers: 1, pStaticSamplers: &sampler,
++            Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
++        };
++        // Wine's compiler does not embed root signatures. Serialize the
++        // bindings explicitly for both native D3D12 and D3DMetal.
++        let mut blob = None;
++        // SAFETY: the descriptor arrays and the blob outlive both API calls.
++        unsafe {
++            D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)?;
++            let blob = blob.ok_or_else(windows::core::Error::empty)?;
++            let bytes = std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
++            device.CreateRootSignature(0, bytes)
++        }
++    }
++
+     pub(crate) fn new(host: &Host, format: DXGI_FORMAT) -> windows::core::Result<Self> {
+         let (vs, ps) = (
+             compile(s!("vs"), s!("vs_5_1"))?,
+@@ -72,11 +113,8 @@ impl Composer {
+         );
+         // SAFETY: the blobs' own bytes, alive through the calls.
+         unsafe {
+-            let bytes = |b: &ID3DBlob| {
+-                std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
+-            };
+             let device = &host.device;
+-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes(&vs))?;
++            let root = Self::root(device)?;
+             let code = |b: &ID3DBlob| D3D12_SHADER_BYTECODE {
+                 pShaderBytecode: b.GetBufferPointer(),
+                 BytecodeLength: b.GetBufferSize(),
+diff --git a/crates/victory-gpu/src/lib.rs b/crates/victory-gpu/src/lib.rs
+index 2843d0c..5983f53 100644
+--- a/crates/victory-gpu/src/lib.rs
++++ b/crates/victory-gpu/src/lib.rs
+@@ -113,7 +113,7 @@ pub fn frame_phase() -> u32 {
+ pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
+ #[cfg(windows)]
+ pub use watch::{
+-    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
++    fault_tracking, kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
+     title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
+     writing as kernel_will_write,
+ };
+diff --git a/crates/victory-gpu/src/watch.rs b/crates/victory-gpu/src/watch.rs
+index 736ac6e..d8691af 100644
+--- a/crates/victory-gpu/src/watch.rs
++++ b/crates/victory-gpu/src/watch.rs
+@@ -30,6 +30,14 @@ use std::collections::{BTreeMap, BTreeSet};
+ use std::ops::{Bound, RangeBounds};
+ use std::sync::{Condvar, Mutex, RwLock};
+ 
++/// Wine implements Windows write-watch with memory faults. On M1 Max,
++/// Rosetta can stop on an ordinary vector store before the first frame.
++/// Use the existing unwatched-copy path on hosts that request it.
++pub fn fault_tracking() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_FAULT_TRACKING").is_none_or(|v| v != "0"))
++}
++
+ /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
+ /// 4 KiB pages fold into it). Finer units made the checks of the world's
+ /// big buffers cost more than the copies they saved.
+@@ -313,6 +321,9 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
+ /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
+ /// left to `writes`.
+ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
++    if !fault_tracking() {
++        return;
++    }
+     let mut pieces: Vec<(usize, usize)> = ranges
+         .iter()
+         // Not view memory known by its bits: the kernel would refuse the
+@@ -528,7 +539,7 @@ pub(crate) fn once() -> bool {
+ /// refresh) as [`ask_ahead`] does, and lets that asking stand until
+ /// [`ask_once_end`].
+ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
+-    if !once() {
++    if !fault_tracking() || !once() {
+         return;
+     }
+     ask_once_end();
+@@ -659,6 +670,9 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
+ /// kernel just reported. `None` if the memory is not write-watched (nor,
+ /// with `guarded`, view memory, which is then guarded).
+ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
++    if !fault_tracking() {
++        return None;
++    }
+     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+     let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
+     // Asked ahead with the submission's other ranges: the journal has it.
+diff --git a/crates/victory-hle/src/modules/xmem.rs b/crates/victory-hle/src/modules/xmem.rs
+index e074582..5db6b90 100644
+--- a/crates/victory-hle/src/modules/xmem.rs
++++ b/crates/victory-hle/src/modules/xmem.rs
+@@ -133,7 +133,7 @@ pub extern "system" fn XMemVirtualAlloc(
+         // The GPU side copies only the pages the title wrote since its last
+         // copy (`victory_gpu`, decision 0007); placeholders cannot be
+         // watched (their physical-page views are copied whole).
+-        if kind & MEM_RESERVE_PLACEHOLDER == 0 {
++        if kind & MEM_RESERVE_PLACEHOLDER == 0 && victory_gpu::fault_tracking() {
+             kind |= MEM_WRITE_WATCH;
+         }
+     }
