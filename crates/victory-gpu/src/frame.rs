@@ -39,6 +39,14 @@ fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
     CLOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+#[cfg(any(feature = "diagnostics", test))]
+fn test_interval(requested: Duration, hz: Option<&str>) -> Duration {
+    hz.and_then(|hz| hz.parse::<u32>().ok())
+        .and_then(|hz| Duration::from_secs(1).checked_div(hz))
+        .filter(|interval| !interval.is_zero())
+        .unwrap_or(requested)
+}
+
 /// Device method: a frame every `length` microseconds. The period is how
 /// many intervals a frame may take to reach the display (pipeline depth),
 /// not part of the rate.
@@ -49,11 +57,19 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
-    let interval = match length {
+    let requested = match length {
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    tracing::info!(?interval, "frame interval");
+    #[cfg(feature = "diagnostics")]
+    let interval = test_interval(requested, std::env::var("VICTORY_FRAME_HZ").ok().as_deref());
+    #[cfg(not(feature = "diagnostics"))]
+    let interval = requested;
+    if interval != requested {
+        tracing::info!(?interval, ?requested, "frame interval override");
+    } else {
+        tracing::info!(?interval, "frame interval");
+    }
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
@@ -216,6 +232,18 @@ pub(crate) extern "system" fn statistics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_test_frame_rate_changes_the_interval_only_when_valid() {
+        let requested = Duration::from_micros(33_333);
+        assert_eq!(
+            test_interval(requested, Some("60")),
+            Duration::from_nanos(16_666_666)
+        );
+        for value in [None, Some("0"), Some("invalid"), Some("1000000001")] {
+            assert_eq!(test_interval(requested, value), requested);
+        }
+    }
 
     #[test]
     fn waits_end_on_ticks_and_count_frames() {
