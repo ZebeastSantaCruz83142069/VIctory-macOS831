@@ -3061,9 +3061,8 @@ impl HostList {
 /// A copy's ranges brought up to date are not copied again in the
 /// submission until a step writes them: every list of a world submission
 /// using title memory asks for every copy whole, and the title copies into
-/// buffers ~80 times in between. A step that may write anywhere
-/// ([`Batch::title_written`]) makes all of them due again, a title copy
-/// ([`Batch::title_copied`]) only what it writes. What the title's threads
+/// buffers ~80 times in between. A title copy ([`Batch::title_copied`])
+/// makes the bytes it writes due again. What the title's threads
 /// write meanwhile is for later submissions (on the console it would race
 /// the GPU).
 #[derive(Default)]
@@ -3118,14 +3117,6 @@ impl Batch {
         for (from, to) in todo {
             self.refreshes[i].1.insert(from, to, JOIN);
         }
-    }
-
-    /// Before a step that may write any title memory: pending refreshes are
-    /// done first, and copies are checked again after it.
-    fn title_written(&mut self) {
-        self.flush();
-        self.current.clear();
-        self.extents.clear();
     }
 
     /// Before a copy into title memory: pending refreshes are done first,
@@ -4648,9 +4639,9 @@ mod batch {
         unsafe { (p as *mut u8).write_volatile(1) };
         batch.add(&copy, p, len);
         assert_eq!(batch.flush(), 0, "nothing again in the submission");
-        batch.title_written();
+        let mut batch = Batch::default();
         batch.add(&copy, p, len);
-        assert_eq!(batch.flush(), changed, "refreshed after a title write");
+        assert_eq!(batch.flush(), changed, "refreshed in the following submission");
         crate::shadow::unregister(p, p as u64);
         drop(copy);
         crate::watch::tests::free(p);
@@ -4766,11 +4757,6 @@ mod batch {
         batch.add(&a, pa, la);
         batch.add(&b, pb, lb);
         assert_eq!(batch.flush(), 0);
-        // A step that may write anywhere makes everything due again.
-        batch.title_written();
-        batch.add(&a, pa, la);
-        batch.add(&b, pb, lb);
-        assert_eq!(batch.flush(), la + lb);
         done(pa, Some(a));
         done(pb, Some(b));
     }
