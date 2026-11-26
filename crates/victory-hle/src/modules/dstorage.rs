@@ -864,8 +864,9 @@ extern "system" fn close(this: QueueRef) {
 /// Reads, inflates and/or unpacks, and writes one request.
 fn execute(request: &Request) -> Result<(), HRESULT> {
     let options = request.options;
-    let fail = |hr: HRESULT, why: &str| {
+    let fail_request = |hr: HRESULT, why: &str, file: Option<&str>| {
         tracing::warn!(
+            file,
             options = format_args!("{options:#x}"),
             offset = request.offset,
             source_size = request.source_size,
@@ -879,11 +880,12 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         hr
     };
     if options & !(ZLIB | BCPACK | PAGE_DESTINATION | MEMORY_SOURCE) != 0 {
-        return Err(fail(E_NOTIMPL, "unsupported options"));
+        return Err(fail_request(E_NOTIMPL, "unsupported options", None));
     }
     if request.source.is_null() || request.destination.is_null() {
-        return Err(fail(E_INVALIDARG, "no source or destination"));
+        return Err(fail_request(E_INVALIDARG, "no source or destination", None));
     }
+    let fail = |hr, why: &str| fail_request(hr, why, Some(source_name(request)));
     let bc = ((options & BCPACK) >> 1) as u8;
     let size = request.destination_size as usize;
     if options & (ZLIB | BCPACK) == 0 {
