@@ -120,3 +120,23 @@ The sky pass left 185,191, 638,085 and 918,065 out of 921,600 pixels with positi
 | 3199 | 1 | 0 | 0 |
 
 A separate synthetic compute test on the same M1 Max and D3DMetal queried RGBA16_FLOAT typed UAV load/store support and exercised a 16×16 texture using two DXC-compiled shaders. The first wrote known RGBA values, then a UAV barrier preceded an in-place componentwise multiply-add. All 1,024 FP16 channel readbacks matched exactly. This confirms the basic typed read/write operation on this device. It leaves the translated atmosphere shader, bindings, inputs and downstream passes to be distinguished.
+
+
+## Presenting the native HDR texture before atmospheric scattering
+
+The additional `source-pre-scattering.patch` introduces `VICTORY_PRESENT_SCENE_COLOR=before-scattering`. It snapshots the original 1280×720 RGBA16_FLOAT scene immediately before the atmosphere dispatch. The title executes that dispatch and the rest of its frame normally. For display, the presenter reads the completed snapshot in its native format, applies the existing linear-to-sRGB conversion and blends the title’s SDR HUD. The snapshot path omits the later atmospheric, exposure, upscaling and other post-processing effects from the displayed world. The original display-plane setting and the earlier radiance option are still available. All six patches applied in order reconstruct the source tree `fd24fbcd02dcb7205c225be2b76c048dee5a59ab`. The tested executable's SHA-256 is `a200e679d3c040addc1c0114113630528c8f04df37c17386984c8059dfb99f33`.
+
+The hardware fixture overwrote the original FP16 texture after taking the snapshot. The saved snapshot retained all four channels byte-for-byte, and the original read back black. Both the FP16 and packed-float scene formats passed the SDR ramp and HUD composition test on the M1 Max. The sparse-copy fixture passed. A fifth sampled image from the preceding normal-plane run, frame 3239, also contained only levels 0 and 1 in every RGB channel.
+
+The first full-resolution launch exited during title startup before recording a scene. A new, verified copy of the last save that reached the world was used to retry the same executable. This run retained Series S, vector copies and serialized submission. The atmosphere dispatch was enabled. The 960×540 samples below are readbacks from the submitted image. The lower half contains 259,200 pixels and the full image contains 518,400.
+
+| Frame | Offset from first heavy frame | Pixels at or above 8/255 luminance | Lower half at or above 8/255 | Pixels at or above 248/255 |
+| ---: | ---: | ---: | ---: | ---: |
+| 3239 | 0 | 0 | 0 | 0 |
+| 3240 | 1 | 518,400 | 259,200 | 0 |
+| 3244 | 5 | 3,723 | 167 | 0 |
+| 3259 | 20 | 9,757 | 414 | 36 |
+
+Frame 3239 was black and frame 3240 showed the dark loading background. Frame 3244 showed lit building windows on a dark street. Frame 3259 showed additional buildings with distinct purple, yellow and green lights. Most of the street foreground was still black. In frame 3259 only 414 of 259,200 lower-half pixels (0.16%) reached 8/255 luminance.
+
+Across the first 20 reports with at least 100 draws per frame, median frame time was 6,066.75 ms (0.165 FPS), GPU time was 865.95 ms, and copy preparation took 4,661.4 ms for 15,569.1 MB per frame. These are timings from the diagnostic run. The image now shows a city before atmosphere, with incomplete foreground lighting. Player control and real-time gameplay remain unverified.
