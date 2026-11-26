@@ -1,0 +1,160 @@
+From 5ce9f06faea09a7f2e651dab74f343e9de6a52d8 Mon Sep 17 00:00:00 2001
+From: ZebeastSantaCruz83142069
+ <361184274+ZebeastSantaCruz83142069@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 04:57:07 -0800
+Subject: [PATCH] Read the resolved HDR scene at its upscaler binding on the
+ producing list
+
+---
+ crates/victory-gpu/src/capture/lighting.rs | 20 +++++++++++++++++
+ crates/victory-gpu/src/compose.rs          |  2 ++
+ crates/victory-gpu/src/draw.rs             | 26 ++++++++++++++++++----
+ crates/victory-gpu/src/host.rs             | 10 ++++-----
+ 4 files changed, 49 insertions(+), 9 deletions(-)
+
+diff --git a/crates/victory-gpu/src/capture/lighting.rs b/crates/victory-gpu/src/capture/lighting.rs
+index 6e46459..19a0275 100644
+--- a/crates/victory-gpu/src/capture/lighting.rs
++++ b/crates/victory-gpu/src/capture/lighting.rs
+@@ -228,5 +228,25 @@ mod tests {
+         assert_ne!(a.rgba_hash, b.rgba_hash);
+         assert_eq!(preserved.counts().unwrap().rgba_hash, b.rgba_hash);
+         assert_eq!(cleared.counts().unwrap().positive_rgb, 0);
++
++        // The upscaler reads the scene as an SRV. Snapshot in that state,
++        // restore the state, then reuse the original as a render target.
++        let list = host.new_list().unwrap();
++        let sampled = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++        unsafe {
++            list.list.ClearRenderTargetView(rtv, &[0.25, 0., 0., 1.], None);
++            list.list.ResourceBarrier(&[crate::host::transition(&surface, state, sampled)]);
++        }
++        let copy = list.snapshot_scene_texture(&host.device, &surface, DXGI_FORMAT_R16G16B16A16_FLOAT, sampled).unwrap();
++        unsafe {
++            list.list.ResourceBarrier(&[crate::host::transition(&surface, sampled, state)]);
++            list.list.ClearRenderTargetView(rtv, &[0.; 4], None);
++        }
++        let result = record(&host.device, &list.list, &copy, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE).unwrap();
++        let original = record(&host.device, &list.list, &surface, state).unwrap();
++        list.close();
++        host.execute(&[&list]);
++        assert_eq!(result.counts().unwrap().positive_rgb, 6);
++        assert_eq!(original.counts().unwrap().positive_rgb, 0);
+     }
+ }
+diff --git a/crates/victory-gpu/src/compose.rs b/crates/victory-gpu/src/compose.rs
+index c85907e..34db193 100644
+--- a/crates/victory-gpu/src/compose.rs
++++ b/crates/victory-gpu/src/compose.rs
+@@ -19,6 +19,7 @@ pub(crate) enum SceneSource {
+     DisplayPlane,
+     Radiance,
+     BeforeScattering,
++    UpscalerInput,
+ }
+ 
+ pub(crate) fn scene_source() -> SceneSource {
+@@ -26,6 +27,7 @@ pub(crate) fn scene_source() -> SceneSource {
+     *SOURCE.get_or_init(|| match std::env::var("VICTORY_PRESENT_SCENE_COLOR").as_deref() {
+         Ok("1") => SceneSource::Radiance,
+         Ok("before-scattering") => SceneSource::BeforeScattering,
++        Ok("upscaler-input") => SceneSource::UpscalerInput,
+         _ => SceneSource::DisplayPlane,
+     })
+ }
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index 0ac9b8c..2eadf87 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -3160,7 +3160,22 @@ impl State {
+             && let Some(Root::Table(table)) = self.roots_ref(true).get(1)
+             && let Some(View::Unordered(resource, ..)) = crate::descriptor::view(table + 48 * 4)
+         {
+-            list.copy_scene_color(resource as This, DXGI_FORMAT_R16G16B16A16_FLOAT);
++            list.copy_scene_color(resource as This, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++        }
++        // This dispatch samples the title's resolved scene. Its command list
++        // establishes the sampling order, including work on earlier lists.
++        let upscale_input = || {
++            let Root::Table(table) = self.roots_ref(true).get(1)? else { return None };
++            match crate::descriptor::view(table + 24 * 4) {
++                Some(View::Shader(resource, _)) => Some(resource as This),
++                _ => None,
++            }
++        };
++        if crate::compose::scene_source() == crate::compose::SceneSource::UpscalerInput
++            && p.stages.first().is_some_and(|s| s.shader.hash == "6a6c7b7fde59134f")
++            && let Some(resource) = upscale_input()
++        {
++            list.copy_scene_color(resource, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+         }
+         #[cfg(feature = "diagnostics")]
+         let world_color = p.stages.first()
+@@ -3174,13 +3189,16 @@ impl State {
+             });
+         #[cfg(feature = "diagnostics")]
+         if let Some((resource, probe)) = world_color {
+-            list.probe_world_color(resource, probe, "before");
++            if probe.table == 0 && let Some(input) = upscale_input() {
++                list.probe_world_color(input, probe, "input", D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++            }
++            list.probe_world_color(resource, probe, "before", D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+         }
+         // SAFETY: an open list with everything set.
+         unsafe { list.list.Dispatch(x, y, z) };
+         #[cfg(feature = "diagnostics")]
+         if let Some((resource, probe)) = world_color {
+-            list.probe_world_color(resource, probe, "after");
++            list.probe_world_color(resource, probe, "after", D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+         }
+         self.buffers_written();
+         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+@@ -3191,7 +3209,7 @@ impl State {
+             if let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot))
+                 && let Some(View::Unordered(resource, ..)) = crate::descriptor::view(table + u64::from(offset) * 4)
+             {
+-                list.copy_scene_color(resource as This, DXGI_FORMAT_R11G11B10_FLOAT);
++                list.copy_scene_color(resource as This, DXGI_FORMAT_R11G11B10_FLOAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+             }
+         }
+         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 19fc428..36c8448 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -7193,14 +7193,14 @@ impl HostList {
+         resource: crate::object::This,
+         probe: crate::capture::lighting::Probe,
+         side: &'static str,
++        binding_state: D3D12_RESOURCE_STATES,
+     ) {
+         let Some(source) = crate::resource::host_copy(resource) else { return };
+         let key = std::sync::Arc::as_ptr(&source) as usize;
+         let state = self.states.lock().unwrap_or_else(|e| e.into_inner())
+             .get(&key).map(|entry| entry.1);
+-        // A UAV binding requires the unordered-access state. If this is the
+-        // list's first tracked use, the submission prelude establishes it.
+-        let state = state.unwrap_or(D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32);
++        // On first use the submission prelude establishes the binding state.
++        let state = state.unwrap_or(binding_state.0 as u32);
+         self.transition(resource, state);
+         let Some(host) = host() else { return };
+         if let Some(sample) = crate::capture::lighting::record(
+@@ -7214,12 +7214,12 @@ impl HostList {
+ 
+     /// Snapshot a bound scene UAV at its place in the producing list.
+     /// The presenter receives the copy after the submission fence completes.
+-    pub(crate) fn copy_scene_color(&self, resource: crate::object::This, format: DXGI_FORMAT) {
++    pub(crate) fn copy_scene_color(&self, resource: crate::object::This, format: DXGI_FORMAT, binding_state: D3D12_RESOURCE_STATES) {
+         let Some(source) = crate::resource::host_copy(resource) else { return };
+         let Some(host) = host() else { return };
+         let key = std::sync::Arc::as_ptr(&source) as usize;
+         let state = self.states.lock().unwrap_or_else(|e| e.into_inner())
+-            .get(&key).map_or(D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32, |entry| entry.1);
++            .get(&key).map_or(binding_state.0 as u32, |entry| entry.1);
+         self.transition(resource, state);
+         if let Some(copy) = self.snapshot_scene_texture(
+             &host.device, &source.texture, format, D3D12_RESOURCE_STATES(state as i32),
+-- 
+2.50.1 (Apple Git-155)
+

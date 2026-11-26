@@ -160,3 +160,26 @@ The following medians cover the first 20 renderer reports with at least 100 draw
 The HDR preview multiplies the scene's linear RGB by 16 before SDR encoding. Tests on the physical GPU checked a dim red surface, exact black and an opaque HUD pixel. The game still displayed black street geometry below the horizon. At scene +5 and +20, 898 and 609 of the 259,200 lower-half pixels met the 8/255 luminance threshold. Frame 3302 shows illuminated building windows around a silhouetted character. Raising exposure did not recover the missing light.
 
 At the first scattering sample, 113170 pixels in the lower half of the native 1280×720 HDR surface had positive RGB. Both 1920×1080 RGBA16F upscaler targets (`6a6c7b7fde59134f`, `fdce2a0a9fb1521a`) had zero positive RGB after their dispatch at that occurrence. This run kept the atmosphere pass enabled. Player control and sustained gameplay at 60 FPS remain unverified.
+
+## Color at the game upscaler on M1 Max
+
+The Series S trial used source commit `5ce9f06`, CrossOver Preview and D3DMetal on the M1 Max. Executable SHA-256 was `fd5d87ccee93f7d8bce673a81730e2c738c0968cef7a7c2909f697b9a1d911ed`. A GPU test checked an SRV-state snapshot against the original texture after a clear. The game run used a copied save, excluded the scattering dispatch `577248728544d74b`, and selected the existing constant indirect-light estimate at 0.8. It also disabled the memory-map census and the experimental sparse refresh hint.
+
+| Pass hash prefix | Frame | Readback | Positive RGB pixels | Positive RGB pixels in lower half |
+| --- | ---: | --- | ---: | ---: |
+| `6a6c` | 2669 | input | 180,808 | 112,979 |
+| `6a6c` | 2669 | after | 431,587 | 262,314 |
+| `fdce` | 2669 | input | 181,855 | 113,119 |
+| `fdce` | 2669 | after | 450,575 | 269,364 |
+| `6a6c` | 2673 | input | 804,249 | 360,178 |
+| `6a6c` | 2673 | after | 1,827,405 | 822,887 |
+| `fdce` | 2674 | input | 807,056 | 362,084 |
+| `fdce` | 2674 | after | 1,869,493 | 849,643 |
+| `6a6c` | 2688 | input | 921,600 | 460,800 |
+| `6a6c` | 2688 | after | 2,073,600 | 1,036,800 |
+| `fdce` | 2689 | input | 921,600 | 460,800 |
+| `fdce` | 2689 | after | 2,073,600 | 1,036,800 |
+
+The input is 1280×720 RGBA16F. Each output is 1920×1080 RGBA16F. On frame 2689 the second output had 76,052 lower-half pixels with at least one channel at or above 0.25. The input for that same dispatch had 1,925. These are samples of the individual surfaces, which have different resolutions and may have different encodings.
+
+Presenting the upscaler input in the game window still left the foreground mostly black. At +5 and +20 from the first busy frame, 222 and 2,012 of 259,200 lower-half SDR pixels reached 8/255 luminance. The two measured atmosphere-bypass runs used different display and ambient settings. The earlier normal-display run stayed black. The new readbacks establish that the dispatches can produce color and leave open what the later post-processing and display stages do with it. The first 20 reports at 100 or more draws had medians of 4,628.45 ms/frame and 3,458.3 ms in copy preparation. Changed settings and host activity prevent attributing those figures to a single change.
