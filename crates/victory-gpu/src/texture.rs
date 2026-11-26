@@ -22,8 +22,9 @@
 //! 0 is uploaded (every mip and array slice), depth and stencil planes are
 //! not.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::host::{HostList, host};
@@ -503,29 +504,35 @@ fn copies(
 pub(crate) type Upload = (ID3D12Resource, u64, Vec<u32>);
 
 /// Runs `f(i)` for each `i` below `n` on up to a quarter of the CPUs (four
-/// at most: the title's own threads need the rest), here when that is
-/// fewer than two.
+/// at most: the title's own threads need the rest). Reuse the workers and
+/// their thread-local scratch across submissions.
 pub(crate) fn in_parallel(n: usize, f: impl Fn(usize) + Sync) {
-    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(1, 4).min(n);
-    if threads < 2 {
-        (0..n).for_each(f);
-        return;
-    }
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
-                loop {
-                    let i = next.fetch_add(1, Relaxed);
-                    if i >= n {
-                        break;
-                    }
-                    f(i);
+    static WORKERS: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    if n > 1
+        && let Some(pool) = WORKERS.get_or_init(|| {
+            let threads = std::thread::available_parallelism()
+                .map_or(4, |n| n.get() / 4)
+                .clamp(1, 4);
+            if threads < 2 {
+                return None;
+            }
+            match rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|i| format!("texture worker {i}"))
+                .build()
+            {
+                Ok(pool) => Some(pool),
+                Err(error) => {
+                    tracing::warn!(%error, "could not start texture workers");
+                    None
                 }
-            });
-        }
-    });
+            }
+        })
+    {
+        pool.install(|| (0..n).into_par_iter().for_each(&f));
+    } else {
+        (0..n).for_each(f);
+    }
 }
 
 /// [`Staging::refresh`] of each of `work`, those whose memory may have
@@ -954,6 +961,23 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_texture_work_reuses_workers_and_finishes_before_returning() {
+        use std::collections::HashSet;
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+        let workers = Mutex::new(HashSet::new());
+        let visits = [const { AtomicUsize::new(0) }; 16];
+        for pass in 1..=8 {
+            in_parallel(visits.len(), |i| {
+                let _ = workers.lock().unwrap().insert(std::thread::current().id());
+                visits[i].fetch_add(1, Relaxed);
+            });
+            assert!(visits.iter().all(|count| count.load(Relaxed) == pass));
+        }
+        assert!(workers.into_inner().unwrap().len() <= 4);
+    }
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {
