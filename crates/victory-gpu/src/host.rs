@@ -586,6 +586,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn frame_report_includes_the_frames_before_the_last_caption() {
+        use super::FrameWindow;
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let sample = |seconds, frames, drawn| FrameWindow {
+            since: start + Duration::from_secs(seconds),
+            frames,
+            drawn,
+        };
+        let mut caption = sample(0, 0, 10);
+        let mut report = caption;
+        let second = Duration::from_secs(1);
+        let period = Duration::from_secs(5);
+        let early = sample(4, 120, 370);
+        assert_eq!(caption.sample(early, second).unwrap().fps, 30.0);
+        assert!(report.sample(early, period).is_none());
+
+        let end = sample(5, 125, 510);
+        let short = caption.sample(end, second).unwrap();
+        let full = report.sample(end, period).unwrap();
+        assert_eq!((short.fps, short.ms, short.draws), (5.0, 200.0, 28.0));
+        assert_eq!((full.frames, full.fps, full.ms, full.draws), (125.0, 25.0, 40.0, 4.0));
+        assert!(report.sample(end, period).is_none());
+        let following = report.sample(sample(10, 135, 530), period).unwrap();
+        assert_eq!((following.frames, following.fps, following.draws), (10.0, 2.0, 2.0));
+    }
+
+    #[test]
     fn swap_chain_failures_retry_once_per_second_and_success_clears_the_wait() {
         use super::{Duration, Instant, SwapChainRetry};
 
@@ -3657,27 +3686,61 @@ struct Presenter {
     blended: Option<ID3D12Resource>,
 }
 
+#[derive(Clone, Copy)]
+struct FrameWindow {
+    since: Instant,
+    frames: u64,
+    drawn: u64,
+}
+
+struct FrameRates {
+    frames: f64,
+    fps: f64,
+    ms: f64,
+    draws: f64,
+}
+
+impl FrameWindow {
+    /// Advances this window once its own interval has elapsed.
+    fn sample(&mut self, next: Self, interval: Duration) -> Option<FrameRates> {
+        let elapsed = next.since.duration_since(self.since);
+        if elapsed < interval {
+            return None;
+        }
+        let seconds = elapsed.as_secs_f64();
+        let frames = (next.frames - self.frames) as f64;
+        let draws = (next.drawn - self.drawn) as f64 / frames;
+        *self = next;
+        Some(FrameRates {
+            frames,
+            fps: frames / seconds,
+            ms: seconds * 1000.0 / frames,
+            draws,
+        })
+    }
+}
+
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
 struct Meter {
-    since: std::time::Instant,
-    frames: u32,
-    report_frames: u64,
-    drawn: u64,
-    logged: std::time::Instant,
+    frames: u64,
+    caption_window: FrameWindow,
+    report_window: FrameWindow,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
 }
 
 impl Meter {
     fn new() -> Self {
-        let now = std::time::Instant::now();
-        Meter {
-            since: now,
+        let start = FrameWindow {
+            since: Instant::now(),
             frames: 0,
-            report_frames: 0,
             drawn: crate::draw::drawn(),
-            logged: now,
+        };
+        Meter {
+            frames: 0,
+            caption_window: start,
+            report_window: start,
             caption: None,
         }
     }
@@ -3690,30 +3753,26 @@ impl Meter {
         crate::memory::log_frame();
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
-        self.report_frames += 1;
-        let elapsed = self.since.elapsed();
-        if elapsed < std::time::Duration::from_secs(1) {
+        let next = FrameWindow {
+            since: Instant::now(),
+            frames: self.frames,
+            drawn: crate::draw::drawn(),
+        };
+        let Some(caption_rates) = self.caption_window.sample(next, Duration::from_secs(1)) else {
             return;
-        }
-        let drawn = crate::draw::drawn();
-        let frames = f64::from(self.frames);
-        let fps = frames / elapsed.as_secs_f64();
-        let ms = elapsed.as_secs_f64() * 1000.0 / frames;
-        let draws = (drawn - self.drawn) as f64 / frames;
-        (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
-        // Of a frame, ms preparing submissions and ms waiting for the GPU.
-        let [cpu, gpu] =
-            [0, 1].map(|i| SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
-        let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
-            let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
-            PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
-        });
-        let [back_ms, back_mb] = [0, 1].map(|i| {
-            COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
-        });
-        if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
-            self.logged = std::time::Instant::now();
-            let report_frames = std::mem::take(&mut self.report_frames) as f64;
+        };
+        if let Some(report) = self.report_window.sample(next, Duration::from_secs(5)) {
+            let FrameRates { frames: report_frames, fps, ms, draws } = report;
+            let [cpu, gpu] = SUBMISSION_US.each_ref().map(|counter| {
+                counter.swap(0, Ordering::Relaxed) as f64 / 1000.0 / report_frames
+            });
+            let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
+                let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
+                PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / report_frames
+            });
+            let [back_ms, back_mb] = [0, 1].map(|i| {
+                COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / report_frames
+            });
             let dropped = crate::draw::take_dropped() as f64 / report_frames;
             let indirect = crate::list::take_indirect() as f64 / report_frames;
             let root_views = crate::draw::take_root_view_slots() as f64 / report_frames;
@@ -3803,6 +3862,7 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
+        let FrameRates { fps, ms, draws, .. } = caption_rates;
         let text = format!("{fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
         let mut text: Vec<u16> = crate::caption::with_stats(caption, &text);
         text.push(0);
