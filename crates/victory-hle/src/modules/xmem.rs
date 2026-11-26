@@ -435,6 +435,36 @@ impl Drop for Section {
     }
 }
 
+/// Joins a GPU refresh to the section behind a single mapped title view.
+/// Wine commits these sections whole. The section's own view stays alive
+/// through the copy, even if the title unmaps its view in the meantime.
+#[cfg(any(test, feature = "diagnostics"))]
+pub(crate) fn read_physical_view(at: usize, dst: &mut [u8]) -> bool {
+    if !on_wine() {
+        return false;
+    }
+    let (section, offset) = {
+        let physical = physical();
+        let Some((&base, (size, slice))) = physical.views.range(..=at).next_back() else {
+            return false;
+        };
+        let offset = at - base;
+        if offset > *size || dst.len() > size - offset {
+            return false;
+        }
+        (slice.section.clone(), slice.index * PAGE + offset)
+    };
+    let Some(whole) = section.whole() else {
+        return false;
+    };
+    // SAFETY: these bytes are in the section's committed view. Holding
+    // the section keeps it mapped, and the destination is ours alone.
+    unsafe {
+        std::ptr::copy_nonoverlapping((whole + offset) as *const u8, dst.as_mut_ptr(), dst.len())
+    };
+    true
+}
+
 /// Where a page lives, or what a view starts with: a section and a page
 /// index in it.
 #[derive(Clone)]
@@ -1478,6 +1508,13 @@ mod tests {
         assert!(write_physical(&pages[2..], 1, &[9]));
         // SAFETY: mapped read-write.
         assert_eq!(unsafe { at(b, 1).cast::<u8>().add(1).read() }, 9);
+        if on_wine() {
+            let mut bytes = [0xCC; 2];
+            assert!(read_physical_view(at(b, 1) as usize, &mut bytes));
+            assert_eq!(bytes, [7, 9], "the view starts on the third section page");
+            assert!(!read_physical_view(at(b, 2) as usize - 1, &mut bytes));
+            assert_eq!(bytes, [7, 9], "a range crossing a hole falls back");
+        }
 
         // Unmapping the middle page keeps its neighbours.
         assert_eq!(

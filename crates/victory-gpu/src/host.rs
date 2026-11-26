@@ -3237,6 +3237,19 @@ fn taken(from: usize, to: usize, memory: (usize, usize)) -> (usize, usize) {
     }
 }
 
+/// Reads through the runtime's own view of a mapped physical section.
+/// Returns false if the range is not covered by such a view.
+#[cfg(feature = "diagnostics")]
+type MappedReader = fn(usize, &mut [u8]) -> bool;
+#[cfg(feature = "diagnostics")]
+static MAPPED_READER: OnceLock<MappedReader> = OnceLock::new();
+
+/// Registers the runtime's physical-memory reader before device creation.
+#[cfg(feature = "diagnostics")]
+pub fn use_mapped_reader(read: MappedReader) {
+    let _ = MAPPED_READER.set(read);
+}
+
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
 /// them (tiled memory, page mappings), which read as zeros here; a title
@@ -3263,6 +3276,23 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     if len == 0 {
         return;
+    }
+    #[cfg(feature = "diagnostics")]
+    if !title_dst && len >= crate::watch::PAGE {
+        static DIRECT: OnceLock<bool> = OnceLock::new();
+        if *DIRECT.get_or_init(|| crate::watch::rosetta() && crate::switch::on("VICTORY_PHYSICAL_READ"))
+            && let Some(read) = MAPPED_READER.get()
+        {
+            let started = std::time::Instant::now();
+            // SAFETY: the caller gives us `len` writable bytes in its own
+            // host buffer. The runtime's section is independent of it.
+            if read(src as usize, unsafe { std::slice::from_raw_parts_mut(dst, len) }) {
+                use crate::copystat::{C, add};
+                add(C::PhysicalReadBytes, len as u64);
+                add(C::PhysicalReadUs, started.elapsed().as_micros() as u64);
+                return;
+            }
+        }
     }
     // The kernel writes the destination: it must not be guarded meanwhile.
     let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
