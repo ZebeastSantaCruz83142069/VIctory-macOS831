@@ -2,7 +2,7 @@
 //!
 //! The title can present a scene and a UI plane at different resolutions.
 //! VIctory blends the other plane over the selected picture when
-//! `VICTORY_PRESENT_COMPOSITE=1`. The overlay uses straight alpha and
+//! `VICTORY_PRESENT_COMPOSITE=1`. The overlay uses premultiplied alpha and
 //! nearest-texel sampling in picture coordinates. `VICTORY_PRESENT_MAX`
 //! fits the final picture into the requested size, with or without an overlay.
 
