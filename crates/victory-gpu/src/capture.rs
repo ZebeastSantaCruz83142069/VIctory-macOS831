@@ -8,6 +8,163 @@ use std::path::PathBuf;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+/// A color target recorded by a host list. Keep its host texture alive if
+/// the title releases its resource before the next present.
+#[derive(Clone)]
+pub(crate) struct PresentCandidate {
+    pub(crate) resource: usize,
+    pub(crate) copy: std::sync::Arc<crate::resource::HostTexture>,
+}
+
+static PREVIEW_TARGET: std::sync::Mutex<Option<PresentCandidate>> = std::sync::Mutex::new(None);
+
+pub(crate) fn present_1440p_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_PRESENT_1440P"))
+}
+
+pub(crate) fn is_1440p_candidate(desc: &D3D12_RESOURCE_DESC) -> bool {
+    desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && (desc.Width, desc.Height) == (2560, 1440)
+        && desc.DepthOrArraySize == 1
+        && desc.MipLevels == 1
+        && desc.SampleDesc.Count == 1
+        && matches!(
+            desc.Format,
+            DXGI_FORMAT_R8G8B8A8_UNORM
+                | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+                | DXGI_FORMAT_B8G8R8A8_UNORM
+                | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+        )
+        && !desc
+            .Flags
+            .contains(D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
+}
+
+pub(crate) fn publish_1440p_target(candidate: PresentCandidate) {
+    *PREVIEW_TARGET.lock().unwrap_or_else(|e| e.into_inner()) = Some(candidate);
+}
+
+pub(crate) fn take_1440p_target() -> Option<PresentCandidate> {
+    if !present_1440p_on() {
+        return None;
+    }
+    PREVIEW_TARGET
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+
+    #[test]
+    fn the_1440p_preview_accepts_only_single_sample_color_surfaces() {
+        let mut desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 2560,
+            Height: 1440,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        assert!(is_1440p_candidate(&desc));
+        desc.Format = DXGI_FORMAT_D32_FLOAT;
+        assert!(!is_1440p_candidate(&desc));
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        assert!(is_1440p_candidate(&desc));
+        desc.SampleDesc.Count = 4;
+        assert!(!is_1440p_candidate(&desc));
+        desc.SampleDesc.Count = 1;
+        desc.Width = 3840;
+        assert!(!is_1440p_candidate(&desc));
+        desc.Width = 2560;
+        desc.Flags = D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+        assert!(!is_1440p_candidate(&desc));
+    }
+
+    #[test]
+    #[ignore = "requires a D3D12 device and VICTORY_PRESENT_1440P=1"]
+    fn the_preview_consumes_a_completed_target_once() {
+        use crate::object::{guid, release_ref};
+
+        assert!(present_1440p_on());
+        let host = crate::host::host().expect("D3D12 host");
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            CreationNodeMask: 1,
+            VisibleNodeMask: 1,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 2560,
+            Height: 1440,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let iid = guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 4, 15, 0xad],
+        );
+        let mut resource = std::ptr::null();
+        assert_eq!(
+            crate::resource::create_committed(
+                std::ptr::null(),
+                (&raw const heap).cast(),
+                0,
+                (&raw const desc).cast(),
+                0,
+                std::ptr::null(),
+                &iid,
+                &mut resource,
+            ),
+            crate::object::S_OK
+        );
+        let list = host.new_list().expect("command list");
+        let record = || {
+            let texture = crate::resource::host_resource(resource).expect("host texture");
+            crate::list::ensure_state(&list, resource, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
+            let rtv = host.rtv(&texture, None);
+            // SAFETY: the list transitions this live view to render-target state before the clear.
+            unsafe { list.list.ClearRenderTargetView(rtv, &[1.0, 0.0, 0.0, 1.0], None) };
+            list.note_1440p_target(resource);
+            list.close();
+        };
+        record();
+        assert!(take_1440p_target().is_none());
+        list.reset();
+        list.close();
+        host.execute(&[&list]);
+        assert!(take_1440p_target().is_none());
+        list.reset();
+        record();
+        host.execute(&[&list]);
+        assert_eq!(
+            take_1440p_target().expect("completed target").resource,
+            resource as usize
+        );
+        assert!(take_1440p_target().is_none());
+        drop(list);
+        release_ref(resource);
+    }
+}
+
 /// The folder frames go to, if capturing.
 pub(crate) fn folder() -> Option<&'static PathBuf> {
     static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
