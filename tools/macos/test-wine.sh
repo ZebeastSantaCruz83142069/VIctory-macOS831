@@ -16,7 +16,9 @@ TARGET=x86_64-pc-windows-gnullvm
 mkdir -p target/macos
 # A wrapper rather than a symlink: some Wine builds find their loader next
 # to the path they were started from.
-LINK="$(mktemp -d /tmp/victory-wine.XXXXXX)/wine"
+RUNNER_DIR="$(mktemp -d /tmp/victory-wine.XXXXXX)"
+LINK="$RUNNER_DIR/wine"
+trap 'rm -f "$LINK" && rmdir "$RUNNER_DIR" || true' EXIT
 printf '#!/bin/sh\nexec "%s" "$@"\n' "$WINE" > "$LINK"
 chmod +x "$LINK"
 export WINEPREFIX="${WINEPREFIX:-$ROOT/target/wineprefix}"

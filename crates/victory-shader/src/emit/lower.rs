@@ -9165,14 +9165,35 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if store {
-            if name != "image_store" {
-                return Err("an image store to a mip level");
+            if name == "image_store_mip" {
+                // The level (the address after the coordinates) counts from
+                // the descriptor's base level. shortcut: a host UAV views a
+                // single level, taken to be that base level (the one the
+                // title made the view for). Level 0 is the view's own;
+                // another would need a view per level, which the title's
+                // heap does not hold, so it stops the program, as does a
+                // level known only when the program runs.
+                let r = *regs
+                    .get(if *a16 { coords / 2 } else { coords })
+                    .ok_or("an image address")?;
+                let v = inst.read(Reg::V(r)).ok_or("an image address")?;
+                let x = self.i32_of(v)?;
+                let level = self.s.m.int_value(x).map(|w| {
+                    let w = w as u32;
+                    if *a16 {
+                        w >> (16 * (coords as u32 % 2)) & 0xFFFF
+                    } else {
+                        w
+                    }
+                });
+                if level != Some(0) {
+                    return Err("an image store to a mip level other than 0 or unknown");
+                }
+            } else if name != "image_store" {
+                return Err(name);
             }
-            // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            if *dmask != 0xF {
-                return Err("an image store of some channels");
-            }
+            // shortcut: stores are taken to be to a float format (the
+            // console converts by the view's format).
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -9181,12 +9202,20 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image store data");
             };
-            let mut vals = Vec::new();
-            for k in 0..4u8 {
+            // The data VGPRs hold the enabled channels only, in channel
+            // order. The console writes the others as 0 (the ISA guides'
+            // DMASK: "missing components get 0"; LLVM trims zero channels
+            // from image stores on the same grounds), so the host's store
+            // writes all four: DXIL's validator wants typed UAV stores to
+            // write every channel (with a 0xF mask) anyway.
+            let zero = self.s.m.f32(0);
+            let mut vals = vec![zero; 4];
+            for (k, ch) in (0..4u8).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
+                let k = k as u8;
                 // d16: two f16 channels per VGPR, low half first.
                 let r = if *d16 { k / 2 } else { k };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
-                vals.push(if *d16 {
+                vals[usize::from(ch)] = if *d16 {
                     let mut x = self.i32_of(v)?;
                     if k % 2 == 1 {
                         let k16 = self.s.m.i32(16);
@@ -9197,7 +9226,7 @@ impl<'a> Lower<'a> {
                         .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
                 } else {
                     self.float_of(v)?
-                });
+                };
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
