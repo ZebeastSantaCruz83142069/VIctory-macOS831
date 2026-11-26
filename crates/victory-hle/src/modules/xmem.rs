@@ -17,8 +17,8 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
-    MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
+    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT,
+    MEM_EXTENDED_PARAMETER, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
     SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
@@ -376,6 +376,7 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 // mapping is a view of consecutive slices in place of a host placeholder.
 
 const PAGE: usize = 64 << 10;
+const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
 
 struct Section {
     handle: HANDLE,
@@ -856,28 +857,51 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// in place of what `to` shows; `from` 0 unmaps. The GPU's page-mapping
 /// copies (`victory_gpu`, queue `CopyPageMappingsBatchX`): Grand Theft Auto
 /// VI maps pages into a pool view, then has the GPU map them into its tiled
-/// heap. Page by page; false if a source page is not mapped physical memory.
+/// heap. Consecutive slices of a section take one view. Take a snapshot
+/// of the source before changing destination pages that may overlap it.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
-    let mut physical = physical();
-    if from != 0
-        && (0..len).step_by(PAGE).all(|k| {
-            slice_at(&physical, from + k).is_some_and(|slice| shows(&physical, to + k, &slice))
-        })
-    {
+    if len == 0 {
         return true;
     }
-    unmap(&mut physical, to, len);
+    if to == 0
+        || ![to, from, len].iter().all(|n| n.is_multiple_of(PAGE))
+        || to.checked_add(len).is_none()
+        || from.checked_add(len).is_none()
+    {
+        return false;
+    }
+    let mut physical = physical();
+    if from == 0 {
+        unmap(&mut physical, to, len);
+        return true;
+    }
+    if (0..len).step_by(PAGE).all(|k| {
+        slice_at(&physical, from + k).is_some_and(|slice| shows(&physical, to + k, &slice))
+    }) {
+        return true;
+    }
+    let mut runs: Vec<(usize, Slice)> = Vec::new();
     for k in (0..len).step_by(PAGE) {
-        if from == 0 {
-            break;
-        }
         let Some(slice) = slice_at(&physical, from + k) else {
             return false;
         };
-        if !map(&mut physical, to + k, PAGE, slice) {
+        if let Some((len, first)) = runs.last_mut()
+            && Arc::ptr_eq(&slice.section, &first.section)
+            && slice.index == first.index + *len / PAGE
+        {
+            *len += PAGE;
+        } else {
+            runs.push((PAGE, slice));
+        }
+    }
+    unmap(&mut physical, to, len);
+    let mut at = to;
+    for (len, slice) in runs {
+        if !map(&mut physical, at, len, slice) {
             return false;
         }
+        at += len;
     }
     true
 }
@@ -904,32 +928,51 @@ fn shows(physical: &Physical, at: usize, slice: &Slice) -> bool {
     slice_at(physical, at).is_some_and(|s| s.key(0) == slice.key(0))
 }
 
-/// Maps `slice` and the slices after it over `[base, base + len)`, which
-/// must lie in one placeholder.
+/// Maps `slice` and the slices after it over `[base, base + len)`. If
+/// earlier mappings fragmented the placeholders, try merging them first.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     #[cfg(test)]
     tests::MAPS.with(|m| m.set(m.get() + 1));
-    // SAFETY: splits the placeholder around the range (failing harmlessly
-    // when the range is the whole placeholder), then maps the section
-    // there; both act only on placeholders.
-    let view = unsafe {
-        VirtualFree(
-            base as *mut c_void,
-            len,
-            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
-        );
-        MapViewOfFile3(
-            slice.section.handle,
-            GetCurrentProcess(),
-            base as *const c_void,
-            (slice.index * PAGE) as u64,
-            len,
-            MEM_REPLACE_PLACEHOLDER,
-            PAGE_READWRITE,
-            std::ptr::null_mut(),
-            0,
-        )
+    // SAFETY: a pseudo-handle for the current process.
+    let (process, address) = (unsafe { GetCurrentProcess() }, base as *mut c_void);
+    let attach = || {
+        // SAFETY: an owned section and a range passed as a placeholder.
+        unsafe {
+            MapViewOfFile3(
+                slice.section.handle,
+                process,
+                address,
+                (slice.index * PAGE) as u64,
+                len,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        }
     };
+    // SAFETY: only splits a placeholder, failing when the range already
+    // covers it exactly or extends across more than one.
+    unsafe { VirtualFree(address, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) };
+    let mut view = attach();
+    if view.Value.is_null() && len > PAGE {
+        // SAFETY: coalesces only when the range covers whole placeholders.
+        if unsafe { VirtualFree(address, len, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) } != 0 {
+            view = attach();
+        }
+        if view.Value.is_null() {
+            // A range ending inside a neighboring placeholder, or a Wine
+            // host without coalescing, can still take one page at a time.
+            return (0..len / PAGE).all(|k| {
+                map(
+                    physical,
+                    base + k * PAGE,
+                    PAGE,
+                    Slice { section: slice.section.clone(), index: slice.index + k },
+                )
+            });
+        }
+    }
     if view.Value as usize != base {
         tracing::warn!(
             address = format_args!("{base:#x}"),
@@ -1346,14 +1389,14 @@ mod tests {
         assert_eq!(maps(), before);
         // The GPU's page-mapping copy, made twice: the second maps nothing.
         assert!(map_alias(b as u64, a as u64, 2 * PAGE as u64));
-        assert_eq!(maps(), before + 2);
+        assert_eq!(maps(), before + 1, "one view for consecutive slices");
         assert!(map_alias(b as u64, a as u64, 2 * PAGE as u64));
         assert!(map_alias(
             b.wrapping_byte_add(PAGE) as u64,
             a.wrapping_byte_add(PAGE) as u64,
             PAGE as u64
         ));
-        assert_eq!(maps(), before + 2);
+        assert_eq!(maps(), before + 1);
         // Another page, or one page of the range changed, maps again.
         assert!(map_alias(
             b as u64,
@@ -1376,6 +1419,43 @@ mod tests {
             assert_eq!(XMemMapPhysicalPages(at, 2, std::ptr::null()), at);
         }
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn page_mapping_copy_snapshots_an_overlapping_source() {
+        let mut pages = [0usize; 4];
+        let mut n = pages.len();
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let base = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            5 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!base.is_null());
+        assert_eq!(XMemMapPhysicalPages(base, n, pages.as_ptr()), base);
+        let at = |page: usize| base.cast::<u8>().wrapping_add(page * PAGE);
+        for (page, value) in [0x11, 0x22, 0x33, 0x44].into_iter().enumerate() {
+            // SAFETY: the first four pages are mapped read-write.
+            unsafe { at(page).write(value) };
+        }
+        assert!(map_alias(at(1) as u64, base as u64, 3 * PAGE as u64));
+        // SAFETY: the source's first page and the three destinations are mapped.
+        let values = || unsafe { [at(0).read(), at(1).read(), at(2).read(), at(3).read()] };
+        assert_eq!(values(), [0x11, 0x11, 0x22, 0x33]);
+        assert!(!map_alias(base as u64, at(3) as u64, 2 * PAGE as u64));
+        assert_eq!(
+            values(),
+            [0x11, 0x11, 0x22, 0x33],
+            "the source hole leaves the destination intact"
+        );
+        // The overlapping copy split the destination into two views.
+        // Restoring a contiguous allocation crosses that boundary.
+        assert_eq!(XMemMapPhysicalPages(base, n, pages.as_ptr()), base);
+        assert_eq!(values(), [0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(XMemMapPhysicalPages(base, n, std::ptr::null()), base);
+        assert_eq!(XMemFreePhysicalPages(n, pages.as_ptr()), 1);
     }
 
     #[test]
