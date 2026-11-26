@@ -1,0 +1,1660 @@
+diff --git a/crates/victory-gpu/build.rs b/crates/victory-gpu/build.rs
+index 9dcfa610025756d08939d13ee9cc50ce977fb58c..c783b87d62e66e58521f7d2c5613a82e1e9483d3 100644
+--- a/crates/victory-gpu/build.rs
++++ b/crates/victory-gpu/build.rs
+@@ -16,6 +16,49 @@ fn files(dir: &Path, out: &mut Vec<PathBuf>) {
+ }
+ 
+ fn main() {
++    println!("cargo:rustc-check-cfg=cfg(victory_dxc_compare)");
++    println!("cargo:rerun-if-env-changed=VICTORY_HELPER_DXC");
++    println!("cargo:rerun-if-env-changed=DXC_EXE");
++    println!("cargo:rerun-if-changed=src/card-compare.hlsl");
++    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
++        && let Some(compiler) = std::env::var_os("VICTORY_HELPER_DXC")
++    {
++        let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
++        let compile = |source: &Path, name: &str, profile: &str, entry: &str| {
++            let status = std::process::Command::new(&compiler)
++                .args(["-T", profile, "-E", entry, "-Fo"])
++                .arg(out.join(format!("{name}.dxil")))
++                .arg(source)
++                .status()
++                .expect("start DXC to compile GPU helper shaders");
++            assert!(status.success(), "DXC failed to compile {name}");
++        };
++        for (name, profile, entry) in [
++            ("card-compare", "cs_6_0", "main"), ("indirect-clamp", "cs_6_0", "main"),
++            ("indirect-batch", "cs_6_0", "main"), ("plane-corners", "vs_6_0", "corner"),
++            ("plane-steps", "ps_6_0", "plane"), ("plane-floats", "ps_6_0", "plane"),
++        ] {
++            let source = format!("src/{name}.hlsl");
++            println!("cargo:rerun-if-changed={source}");
++            compile(Path::new(&source), name, profile, entry);
++            if matches!(name, "indirect-clamp" | "indirect-batch") {
++                let wide = format!("{name}-wide");
++                let generated = out.join(format!("{wide}.hlsl"));
++                let hlsl = std::fs::read_to_string(source).expect("read indirect shader source");
++                std::fs::write(&generated, format!("#define WIDEST 1048576u\n{hlsl}")).expect("prepare wide indirect shader");
++                compile(&generated, &wide, profile, entry);
++            }
++        }
++        println!("cargo:rerun-if-changed=src/ambient.hlsl");
++        let lighting = std::fs::read_to_string("src/ambient.hlsl").expect("read lighting helpers");
++        for (part, entry) in [("KEEP", "keep"), ("KEEP", "mean"), ("PLACE", "place"), ("GATHER", "gather"), ("RAISE", "raise"), ("AIR", "clear_air")] {
++            let name = format!("ambient-{entry}");
++            let source = out.join(format!("{name}.hlsl"));
++            std::fs::write(&source, format!("#define {part}\n{lighting}")).expect("prepare lighting shader source");
++            compile(&source, &name, "cs_6_0", entry);
++        }
++        println!("cargo:rustc-cfg=victory_dxc_compare");
++    }
+     let here = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_default());
+     let crates = here.join("..");
+     let root = crates.join("..");
+diff --git a/crates/victory-gpu/src/ambient.hlsl b/crates/victory-gpu/src/ambient.hlsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..0580b7012e0561c909b74f4404ab99906de01d36
+--- /dev/null
++++ b/crates/victory-gpu/src/ambient.hlsl
+@@ -0,0 +1,201 @@
++#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
++#define CX 64
++#define CY 36
++#define CELLS (CX * CY)
++#define PX 160
++#define PY 90
++cbuffer Set : register(b0) {
++    float level; float constant; float strength; float radius;
++    float near; float tan_y; uint width; uint height;
++    float follow; float most; float air; float unused;
++};
++Texture2D<float> depth : register(t0);
++// Cells: the light they send out (then, at CELLS, the slow mean), from
++// CELLS + 1 on where they are.
++RWStructuredBuffer<float4> cells : register(u1);
++// Three a point: red, green and blue, each a mean and a direction.
++RWStructuredBuffer<float4> points : register(u2);
++static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
++
++// The point seen at a texel, in metres from the eye (x right, y up, z away).
++float3 seen(int2 p, float2 size) {
++    float d = depth.Load(int3(clamp(p, int2(0, 0), int2(size) - 1), 0));
++    float z = min(near / max(d, 1e-7), 1000.0);
++    float2 ndc = (float2(p) + 0.5) / size * 2.0 - 1.0;
++    return float3(ndc.x * tan_y * size.x / size.y * z, -ndc.y * tan_y * z, z);
++}
++
++#ifdef KEEP
++RWTexture2D<float3> radiance : register(u0);
++[RootSignature(RS)]
++[numthreads(8, 4, 1)]
++void keep(uint3 at : SV_DispatchThreadID) {
++    uint w, h;
++    radiance.GetDimensions(w, h);
++    float3 sum = 0;
++    for (uint y = 0; y < 5; y++) for (uint x = 0; x < 5; x++) {
++        uint2 p = uint2((float2(at.xy) + (float2(x, y) + 0.5) / 5.0) * float2(w, h) / float2(CX, CY));
++        float3 c = max(radiance[p], 0.0);
++        c = any(isnan(c)) || any(isinf(c)) ? 0.0 : c;
++        // Lamps and glints count, but not for everything.
++        sum += c / max(1.0, dot(c, LUMA) / 20.0);
++    }
++    cells[at.y * CX + at.x] = float4(sum / 25.0, 1.0);
++}
++[RootSignature(RS)]
++[numthreads(1, 1, 1)]
++void mean() {
++    float3 sum = 0;
++    for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
++    float4 was = cells[CELLS];
++    float3 now = sum / CELLS;
++    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, follow) : now, 1.0);
++}
++#endif
++
++#ifdef PLACE
++[RootSignature(RS)]
++[numthreads(8, 4, 1)]
++void place(uint3 at : SV_DispatchThreadID) {
++    float2 size = float2(width, height);
++    float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(CX, CY)), size);
++    cells[CELLS + 1 + at.y * CX + at.x] = float4(p, p.z * p.z);
++}
++#endif
++
++#ifdef GATHER
++[RootSignature(RS)]
++[numthreads(8, 2, 1)]
++void gather(uint3 at : SV_DispatchThreadID) {
++    float2 size = float2(width, height);
++    float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(PX, PY)), size);
++    float r2 = 0.25 + 0.0025 * p.z * p.z;
++    float whole = 0;
++    float3 toward = 0, light = 0, red = 0, green = 0, blue = 0;
++    for (uint i = 0; i < CELLS; i++) {
++        float4 c = cells[CELLS + 1 + i];
++        float3 L = cells[i].rgb;
++        float3 d = c.xyz - p;
++        float dd = dot(d, d);
++        float w = c.w / (dd + r2);
++        float3 dir = d / sqrt(dd + 0.25 * r2);
++        whole += w;
++        toward += w * dir;
++        light += w * L;
++        red += w * L.r * dir;
++        green += w * L.g * dir;
++        blue += w * L.b * dir;
++    }
++    whole = max(whole, 1e-6);
++    light /= whole;
++    toward /= whole;
++    uint at0 = (at.y * PX + at.x) * 3;
++    points[at0] = float4(red / whole - light.r * toward, light.r);
++    points[at0 + 1] = float4(green / whole - light.g * toward, light.g);
++    points[at0 + 2] = float4(blue / whole - light.b * toward, light.b);
++}
++#endif
++
++#ifdef AIR
++RWTexture3D<float3> scattered : register(u0);
++// No more than a multiple of the light around: of the room as the last
++// seconds showed it, and of the surface seen in this direction (towards a
++// window the air outside may be as bright as the sky is).
++[RootSignature(RS)]
++[numthreads(8, 8, 2)]
++void clear_air(uint3 at : SV_DispatchThreadID) {
++    uint w, h, d;
++    scattered.GetDimensions(w, h, d);
++    if (at.x >= w || at.y >= h || at.z >= d) return;
++    uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
++    uint at0 = (q.y * PX + q.x) * 3;
++    float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
++    float far = float(at.z) / float(d);
++    float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
++    float3 c = scattered[at];
++    float has = dot(c, LUMA);
++    if (has > cap) scattered[at] = c * (cap / has);
++}
++#endif
++
++#ifdef RAISE
++RWTexture2D<uint> light : register(u0);
++float3 unpack(uint v) {
++    return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
++}
++uint pack(float3 c) {
++    c = clamp(c, 0.0, 65408.0);
++    float top = max(c.r, max(c.g, c.b));
++    int e = clamp(int(floor(log2(max(top, 1e-9)))) + 16, 0, 31);
++    float scale = exp2(float(24 - e));
++    if (top * scale >= 511.5) { e = min(e + 1, 31); scale = exp2(float(24 - e)); }
++    uint3 m = min(uint3(c * scale + 0.5), 511u);
++    return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
++}
++[RootSignature(RS)]
++[numthreads(8, 8, 1)]
++void raise(uint3 at : SV_DispatchThreadID) {
++    float2 size = float2(width, height);
++    if (at.x >= width || at.y >= height) return;
++    int2 p = int2(at.xy);
++    float3 c = seen(p, size);
++    float3 l = seen(p + int2(-1, 0), size), r = seen(p + int2(1, 0), size);
++    float3 u = seen(p + int2(0, -1), size), d = seen(p + int2(0, 1), size);
++    float3 dx = abs(l.z - c.z) < abs(r.z - c.z) ? c - l : r - c;
++    float3 dy = abs(u.z - c.z) < abs(d.z - c.z) ? c - u : d - c;
++    float3 n = normalize(cross(dy, dx) + float3(0, 0, -1e-9));
++    if (dot(n, c) > 0.0) n = -n;
++    // How open it is (as in beloooo's cd9f78ce).
++    float open = 1.0;
++    float px = min(radius * size.y / (2.0 * tan_y * c.z), 128.0);
++    float noise = frac(52.9829189 * frac(dot(float2(p), float2(0.06711056, 0.00583715))));
++    if (strength > 0.0 && px >= 1.5 && c.z < 400.0) {
++        float sum = 0.0;
++        const int N = 12;
++        for (int i = 0; i < N; i++) {
++            float a = i * 2.399963 + noise * 6.2831853;
++            float2 o = float2(cos(a), sin(a)) * (sqrt((i + 0.5) / N) * px);
++            float3 v = seen(p + int2(round(o)), size) - c;
++            float vv = dot(v, v);
++            float over = dot(v, n) - 0.004 * c.z - 0.005;
++            sum += max(over, 0.0) / sqrt(vv + 1e-6) * saturate(1.0 - vv / (radius * radius));
++        }
++        open = saturate(1.0 - strength * 2.0 * sum / N);
++    }
++    float3 found;
++    if (constant > 0.0) {
++        found = float3(1.0, 0.98, 0.94) * constant * open;
++        light[p] = pack(found);
++        return;
++    }
++    // Between the four points around, those at its own depth first; which
++    // four is dithered a little.
++    float2 g = (float2(p) + 0.5) / size * float2(PX, PY) - 0.5 + (noise - 0.5) * 0.5;
++    int2 g0 = int2(floor(g));
++    float2 f = g - float2(g0);
++    float4 sr = 0, sg = 0, sb = 0;
++    float sum = 0;
++    for (int k = 0; k < 4; k++) {
++        int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
++        float z = seen(int2((float2(q) + 0.5) * size / float2(PX, PY)), size).z;
++        float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
++        float w = (b.x * b.y + 1e-3) / (0.02 + abs(z - c.z) / c.z);
++        uint at0 = (q.y * PX + q.x) * 3;
++        sr += w * points[at0];
++        sg += w * points[at0 + 1];
++        sb += w * points[at0 + 2];
++        sum += w;
++    }
++    float3 all = float3(sr.w, sg.w, sb.w) / sum;
++    found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
++    found = clamp(found, 0.2 * all, 2.5 * all);
++    found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
++    float3 was = unpack(light[p]);
++    // What the program left counts as far as it can be true: the sky's light
++    // outdoors, not the blocks of other memory.
++    float top = max(dot(found, LUMA) * most, 1e-6);
++    float has = dot(was, LUMA);
++    was *= min(1.0, top / max(has, 1e-6));
++    light[p] = pack(max(was, found));
++}
++#endif
+diff --git a/crates/victory-gpu/src/ambient.rs b/crates/victory-gpu/src/ambient.rs
+index 8a3d46e1e7267791ad14fd63b555437d317dee18..1194fb674c2c7ead1b5c24543c1f1792f0fe0498 100644
+--- a/crates/victory-gpu/src/ambient.rs
++++ b/crates/victory-gpu/src/ambient.rs
+@@ -127,209 +127,8 @@ fn shade() -> [f32; 2] {
+     })
+ }
+ 
+-const SOURCE: &str = r#"
+-#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+-#define CX 64
+-#define CY 36
+-#define CELLS (CX * CY)
+-#define PX 160
+-#define PY 90
+-cbuffer Set : register(b0) {
+-    float level; float constant; float strength; float radius;
+-    float near; float tan_y; uint width; uint height;
+-    float follow; float most; float air; float unused;
+-};
+-Texture2D<float> depth : register(t0);
+-// Cells: the light they send out (then, at CELLS, the slow mean), from
+-// CELLS + 1 on where they are.
+-RWStructuredBuffer<float4> cells : register(u1);
+-// Three a point: red, green and blue, each a mean and a direction.
+-RWStructuredBuffer<float4> points : register(u2);
+-static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
+-
+-// The point seen at a texel, in metres from the eye (x right, y up, z away).
+-float3 seen(int2 p, float2 size) {
+-    float d = depth.Load(int3(clamp(p, int2(0, 0), int2(size) - 1), 0));
+-    float z = min(near / max(d, 1e-7), 1000.0);
+-    float2 ndc = (float2(p) + 0.5) / size * 2.0 - 1.0;
+-    return float3(ndc.x * tan_y * size.x / size.y * z, -ndc.y * tan_y * z, z);
+-}
+-
+-#ifdef KEEP
+-RWTexture2D<float3> radiance : register(u0);
+-[RootSignature(RS)]
+-[numthreads(8, 4, 1)]
+-void keep(uint3 at : SV_DispatchThreadID) {
+-    uint w, h;
+-    radiance.GetDimensions(w, h);
+-    float3 sum = 0;
+-    for (uint y = 0; y < 5; y++) for (uint x = 0; x < 5; x++) {
+-        uint2 p = uint2((float2(at.xy) + (float2(x, y) + 0.5) / 5.0) * float2(w, h) / float2(CX, CY));
+-        float3 c = max(radiance[p], 0.0);
+-        c = any(isnan(c)) || any(isinf(c)) ? 0.0 : c;
+-        // Lamps and glints count, but not for everything.
+-        sum += c / max(1.0, dot(c, LUMA) / 20.0);
+-    }
+-    cells[at.y * CX + at.x] = float4(sum / 25.0, 1.0);
+-}
+-[RootSignature(RS)]
+-[numthreads(1, 1, 1)]
+-void mean() {
+-    float3 sum = 0;
+-    for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
+-    float4 was = cells[CELLS];
+-    float3 now = sum / CELLS;
+-    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, follow) : now, 1.0);
+-}
+-#endif
+-
+-#ifdef PLACE
+-[RootSignature(RS)]
+-[numthreads(8, 4, 1)]
+-void place(uint3 at : SV_DispatchThreadID) {
+-    float2 size = float2(width, height);
+-    float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(CX, CY)), size);
+-    cells[CELLS + 1 + at.y * CX + at.x] = float4(p, p.z * p.z);
+-}
+-#endif
+-
+-#ifdef GATHER
+-[RootSignature(RS)]
+-[numthreads(8, 2, 1)]
+-void gather(uint3 at : SV_DispatchThreadID) {
+-    float2 size = float2(width, height);
+-    float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(PX, PY)), size);
+-    float r2 = 0.25 + 0.0025 * p.z * p.z;
+-    float whole = 0;
+-    float3 toward = 0, light = 0, red = 0, green = 0, blue = 0;
+-    for (uint i = 0; i < CELLS; i++) {
+-        float4 c = cells[CELLS + 1 + i];
+-        float3 L = cells[i].rgb;
+-        float3 d = c.xyz - p;
+-        float dd = dot(d, d);
+-        float w = c.w / (dd + r2);
+-        float3 dir = d / sqrt(dd + 0.25 * r2);
+-        whole += w;
+-        toward += w * dir;
+-        light += w * L;
+-        red += w * L.r * dir;
+-        green += w * L.g * dir;
+-        blue += w * L.b * dir;
+-    }
+-    whole = max(whole, 1e-6);
+-    light /= whole;
+-    toward /= whole;
+-    uint at0 = (at.y * PX + at.x) * 3;
+-    points[at0] = float4(red / whole - light.r * toward, light.r);
+-    points[at0 + 1] = float4(green / whole - light.g * toward, light.g);
+-    points[at0 + 2] = float4(blue / whole - light.b * toward, light.b);
+-}
+-#endif
+-
+-#ifdef AIR
+-RWTexture3D<float3> scattered : register(u0);
+-// No more than a multiple of the light around: of the room as the last
+-// seconds showed it, and of the surface seen in this direction (towards a
+-// window the air outside may be as bright as the sky is).
+-[RootSignature(RS)]
+-[numthreads(8, 8, 2)]
+-void clear_air(uint3 at : SV_DispatchThreadID) {
+-    uint w, h, d;
+-    scattered.GetDimensions(w, h, d);
+-    if (at.x >= w || at.y >= h || at.z >= d) return;
+-    uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
+-    uint at0 = (q.y * PX + q.x) * 3;
+-    float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+-    float far = float(at.z) / float(d);
+-    float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
+-    float3 c = scattered[at];
+-    float has = dot(c, LUMA);
+-    if (has > cap) scattered[at] = c * (cap / has);
+-}
+-#endif
+-
+-#ifdef RAISE
+-RWTexture2D<uint> light : register(u0);
+-float3 unpack(uint v) {
+-    return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
+-}
+-uint pack(float3 c) {
+-    c = clamp(c, 0.0, 65408.0);
+-    float top = max(c.r, max(c.g, c.b));
+-    int e = clamp(int(floor(log2(max(top, 1e-9)))) + 16, 0, 31);
+-    float scale = exp2(float(24 - e));
+-    if (top * scale >= 511.5) { e = min(e + 1, 31); scale = exp2(float(24 - e)); }
+-    uint3 m = min(uint3(c * scale + 0.5), 511u);
+-    return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
+-}
+-[RootSignature(RS)]
+-[numthreads(8, 8, 1)]
+-void raise(uint3 at : SV_DispatchThreadID) {
+-    float2 size = float2(width, height);
+-    if (at.x >= width || at.y >= height) return;
+-    int2 p = int2(at.xy);
+-    float3 c = seen(p, size);
+-    float3 l = seen(p + int2(-1, 0), size), r = seen(p + int2(1, 0), size);
+-    float3 u = seen(p + int2(0, -1), size), d = seen(p + int2(0, 1), size);
+-    float3 dx = abs(l.z - c.z) < abs(r.z - c.z) ? c - l : r - c;
+-    float3 dy = abs(u.z - c.z) < abs(d.z - c.z) ? c - u : d - c;
+-    float3 n = normalize(cross(dy, dx) + float3(0, 0, -1e-9));
+-    if (dot(n, c) > 0.0) n = -n;
+-    // How open it is (as in beloooo's cd9f78ce).
+-    float open = 1.0;
+-    float px = min(radius * size.y / (2.0 * tan_y * c.z), 128.0);
+-    float noise = frac(52.9829189 * frac(dot(float2(p), float2(0.06711056, 0.00583715))));
+-    if (strength > 0.0 && px >= 1.5 && c.z < 400.0) {
+-        float sum = 0.0;
+-        const int N = 12;
+-        for (int i = 0; i < N; i++) {
+-            float a = i * 2.399963 + noise * 6.2831853;
+-            float2 o = float2(cos(a), sin(a)) * (sqrt((i + 0.5) / N) * px);
+-            float3 v = seen(p + int2(round(o)), size) - c;
+-            float vv = dot(v, v);
+-            float over = dot(v, n) - 0.004 * c.z - 0.005;
+-            sum += max(over, 0.0) / sqrt(vv + 1e-6) * saturate(1.0 - vv / (radius * radius));
+-        }
+-        open = saturate(1.0 - strength * 2.0 * sum / N);
+-    }
+-    float3 found;
+-    if (constant > 0.0) {
+-        found = float3(1.0, 0.98, 0.94) * constant * open;
+-        light[p] = pack(found);
+-        return;
+-    }
+-    // Between the four points around, those at its own depth first; which
+-    // four is dithered a little.
+-    float2 g = (float2(p) + 0.5) / size * float2(PX, PY) - 0.5 + (noise - 0.5) * 0.5;
+-    int2 g0 = int2(floor(g));
+-    float2 f = g - float2(g0);
+-    float4 sr = 0, sg = 0, sb = 0;
+-    float sum = 0;
+-    for (int k = 0; k < 4; k++) {
+-        int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
+-        float z = seen(int2((float2(q) + 0.5) * size / float2(PX, PY)), size).z;
+-        float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
+-        float w = (b.x * b.y + 1e-3) / (0.02 + abs(z - c.z) / c.z);
+-        uint at0 = (q.y * PX + q.x) * 3;
+-        sr += w * points[at0];
+-        sg += w * points[at0 + 1];
+-        sb += w * points[at0 + 2];
+-        sum += w;
+-    }
+-    float3 all = float3(sr.w, sg.w, sb.w) / sum;
+-    found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
+-    found = clamp(found, 0.2 * all, 2.5 * all);
+-    found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+-    float3 was = unpack(light[p]);
+-    // What the program left counts as far as it can be true: the sky's light
+-    // outdoors, not the blocks of other memory.
+-    float top = max(dot(found, LUMA) * most, 1e-6);
+-    float has = dot(was, LUMA);
+-    was *= min(1.0, top / max(has, 1e-6));
+-    light[p] = pack(max(was, found));
+-}
+-#endif
+-"#;
++#[cfg(not(victory_dxc_compare))]
++const SOURCE: &str = include_str!("ambient.hlsl");
+ 
+ /// Bytes of the cells' buffer and of the points'.
+ const CELLS: u64 = 64 * 36;
+@@ -354,8 +153,7 @@ unsafe impl Sync for Pass {}
+ 
+ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -> windows::core::Result<Pass> {
+     let mut root: Option<ID3D12RootSignature> = None;
+-    let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
+-        let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
++    let mut pipeline = |code: &[u8]| -> windows::core::Result<ID3D12PipelineState> {
+         // SAFETY: the root signature is inside the shader; plain creations.
+         unsafe {
+             if root.is_none() {
+@@ -369,12 +167,21 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
+             device.CreateComputePipelineState(&desc)
+         }
+     };
+-    let keep = pipeline("KEEP", s!("keep"))?;
+-    let mean = pipeline("KEEP", s!("mean"))?;
+-    let place = pipeline("PLACE", s!("place"))?;
+-    let gather = pipeline("GATHER", s!("gather"))?;
+-    let raise = pipeline("RAISE", s!("raise"))?;
+-    let air = pipeline("AIR", s!("clear_air"))?;
++    macro_rules! pass {
++        ($part:literal, $entry:literal) => {{
++            #[cfg(victory_dxc_compare)]
++            let code: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ambient-", $entry, ".dxil"));
++            #[cfg(not(victory_dxc_compare))]
++            let code = crate::host::compile(&format!("#define {}\n{SOURCE}", $part), s!($entry), s!("cs_5_1"))?;
++            pipeline(&code)?
++        }};
++    }
++    let keep = pass!("KEEP", "keep");
++    let mean = pass!("KEEP", "mean");
++    let place = pass!("PLACE", "place");
++    let gather = pass!("GATHER", "gather");
++    let raise = pass!("RAISE", "raise");
++    let air = pass!("AIR", "clear_air");
+     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
+     Ok(Pass {
+         root: root.ok_or_else(windows::core::Error::empty)?,
+diff --git a/crates/victory-gpu/src/capture.rs b/crates/victory-gpu/src/capture.rs
+index 937f5600d85c7e93826c002a0e2998b288dc716f..e0d47d0b9fb00b41c346e5bc599a5113c8d12f0a 100644
+--- a/crates/victory-gpu/src/capture.rs
++++ b/crates/victory-gpu/src/capture.rs
+@@ -122,12 +122,24 @@ fn world_on() -> bool {
+ 
+ /// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
+ static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
++// Capture the presented image in a busy scene without recording its hundreds
++// of render targets or stalling the title's loading threads.
++static FIRST_SCENE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+ 
+ /// At the present of `frame`: the draws run on the host so far.
+ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
+     use std::sync::atomic::Ordering::Relaxed;
+     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+     let before = LAST.swap(drawn, Relaxed);
++    static SCENE_IMAGES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    if drawn.saturating_sub(before) >= 100
++        && *SCENE_IMAGES.get_or_init(|| std::env::var_os("VICTORY_SCENE_IMAGES").is_some())
++    {
++        FIRST_SCENE.get_or_init(|| {
++            tracing::info!(frame, "saving presented images from the first scene with 100 draws");
++            frame
++        });
++    }
+     if world_on()
+         && drawn.saturating_sub(before) >= 500
+         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
+@@ -152,7 +164,8 @@ pub(crate) fn wanted(n: u64) -> bool {
+     // run, so single frames cannot be compared between runs).
+     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
+     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
+-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
++    let scene = FIRST_SCENE.get().and_then(|first| n.checked_sub(*first));
++    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world || matches!(scene, Some(0 | 1 | 5 | 20 | 60)))
+ }
+ 
+ /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
+diff --git a/crates/victory-gpu/src/card-compare.hlsl b/crates/victory-gpu/src/card-compare.hlsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..7d6ca5be53d0d40e5fb848e22c171559ee7659f1
+--- /dev/null
++++ b/crates/victory-gpu/src/card-compare.hlsl
+@@ -0,0 +1,79 @@
++#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
++cbuffer Span : register(b0) {
++    uint first;    // the first piece
++    uint skew;     // where the copy starts in its piece 0
++    uint size;     // the copy's buffer, in bytes (a multiple of 64 KiB)
++    uint pieces;
++    uint out_at;   // the first piece's dword in `differs`, in bytes
++    uint compare;  // 0: the hashes are stored; else compared with those stored (2: and then stored)
++};
++ByteAddressBuffer now : register(t0);
++// 16 bytes per piece of the copy: the hash of its bytes when they were
++// last sent up (or hashed whole, the first time).
++RWByteAddressBuffer hashes : register(u0);
++RWByteAddressBuffer differs : register(u1);
++groupshared uint4 parts[64];
++[RootSignature(RS)]
++[numthreads(64, 1, 1)]
++void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
++    uint piece = first + id.x;
++    uint lo = piece * 65536u;
++    lo = lo > skew ? lo - skew : 0u;
++    uint hi = min((piece + 1u) * 65536u - skew, size);
++    lo = lo & ~15u;
++    hi = (hi + 15u) & ~15u;
++    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu) + thread;
++    uint at = lo + thread * 16u;
++    // Eight loads at once: one after the other, each waits for memory.
++    [loop]
++    for (; at + 7168u < hi; at += 8192u) {
++        uint4 v0 = now.Load4(at + 0u);
++        uint4 v1 = now.Load4(at + 1024u);
++        uint4 v2 = now.Load4(at + 2048u);
++        uint4 v3 = now.Load4(at + 3072u);
++        uint4 v4 = now.Load4(at + 4096u);
++        uint4 v5 = now.Load4(at + 5120u);
++        uint4 v6 = now.Load4(at + 6144u);
++        uint4 v7 = now.Load4(at + 7168u);
++        h = (h ^ v0) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
++        h = h.yzwx ^ (h >> 15);
++        h = (h ^ v1) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
++        h = h.yzwx ^ (h >> 15);
++        h = (h ^ v2) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
++        h = h.yzwx ^ (h >> 15);
++        h = (h ^ v3) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
++        h = h.yzwx ^ (h >> 15);
++        h = (h ^ v4) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
++        h = h.yzwx ^ (h >> 15);
++        h = (h ^ v5) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
++        h = h.yzwx ^ (h >> 15);
++        h = (h ^ v6) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
++        h = h.yzwx ^ (h >> 15);
++        h = (h ^ v7) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
++        h = h.yzwx ^ (h >> 15);
++    }
++    [loop]
++    for (; at < hi; at += 1024u) {
++        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
++        h = h.yzwx ^ (h >> 15);
++    }
++    parts[thread] = h;
++    GroupMemoryBarrierWithGroupSync();
++    if (thread != 0u) return;
++    h = parts[0];
++    [loop]
++    for (uint i = 1u; i < 64u; ++i) {
++        h = (h ^ parts[i]) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
++        h = h.yzwx ^ (h >> 15);
++    }
++    if (compare != 0u) {
++        // The flag, and above it 31 bits of the hash (`torn`).
++        uint folded = h.x ^ (h.y * 3u) ^ (h.z * 5u) ^ (h.w * 7u);
++        differs.Store(out_at + id.x * 4u, (folded << 1u) | (any(h != hashes.Load4(piece * 16u)) ? 1u : 0u));
++        // With the copy-back on its own thread: the next compare of the
++        // piece finds what is written from here on.
++        if (compare == 2u) hashes.Store4(piece * 16u, h);
++    } else {
++        hashes.Store4(piece * 16u, h);
++    }
++}
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index d1088cc60909560a04059c07c93d24214a8cb220..3e1ba92d00b9b4706c93cdb578c1acd523831124 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -1274,27 +1274,12 @@ struct TwinUse {
+ /// the host turns the same float into the same 24 bits. The step divided
+ /// by 65535 is another float for 512 of the 65,536 steps (none under 257),
+ /// and lands in another 24-bit step for 127 of them (none under 385).
+-const PLANE_CORNERS: &str = r#"
+-float4 corner(uint i : SV_VertexID) : SV_Position {
+-    return float4(float(i & 1) * 4.0 - 1.0, float(i >> 1) * 4.0 - 1.0, 0.0, 1.0);
+-}
+-"#;
+-const PLANE_STEPS: &str = r#"
+-#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL)"
+-Texture2DArray<uint> twin : register(t0);
+-[RootSignature(RS)]
+-float plane(float4 p : SV_Position) : SV_Depth {
+-    return float(twin.Load(int4(int2(p.xy), 0, 0))) * asfloat(0x37800080);
+-}
+-"#;
+-const PLANE_FLOATS: &str = r#"
+-#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL)"
+-Texture2DArray<float> twin : register(t0);
+-[RootSignature(RS)]
+-float plane(float4 p : SV_Position) : SV_Depth {
+-    return twin.Load(int4(int2(p.xy), 0, 0));
+-}
+-"#;
++#[cfg(not(victory_dxc_compare))]
++const PLANE_CORNERS: &str = include_str!("plane-corners.hlsl");
++#[cfg(not(victory_dxc_compare))]
++const PLANE_STEPS: &str = include_str!("plane-steps.hlsl");
++#[cfg(not(victory_dxc_compare))]
++const PLANE_FLOATS: &str = include_str!("plane-floats.hlsl");
+ 
+ /// Views of twins the pass reads, in a heap of ours used as a ring.
+ /// shortcut: a view must last until its list has run; with one or two
+@@ -1424,11 +1409,18 @@ impl PlanePass {
+     }
+ 
+     fn make(steps: bool, format: DXGI_FORMAT) -> windows::core::Result<PlanePipeline> {
+-        use windows::core::s;
+         let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+-        let vs = compile(PLANE_CORNERS, s!("corner"), s!("vs_5_1"))?;
+-        let source = if steps { PLANE_STEPS } else { PLANE_FLOATS };
+-        let ps = compile(source, s!("plane"), s!("ps_5_1"))?;
++        #[cfg(victory_dxc_compare)]
++        let (vs, ps): (&[u8], &[u8]) = (
++            include_bytes!(concat!(env!("OUT_DIR"), "/plane-corners.dxil")),
++            if steps { include_bytes!(concat!(env!("OUT_DIR"), "/plane-steps.dxil")) } else { include_bytes!(concat!(env!("OUT_DIR"), "/plane-floats.dxil")) },
++        );
++        #[cfg(not(victory_dxc_compare))]
++        let (vs, ps) = {
++            use windows::core::s;
++            (compile(PLANE_CORNERS, s!("corner"), s!("vs_5_1"))?,
++             compile(if steps { PLANE_STEPS } else { PLANE_FLOATS }, s!("plane"), s!("ps_5_1"))?)
++        };
+         let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
+             pShaderBytecode: bytes.as_ptr().cast(),
+             BytecodeLength: bytes.len(),
+@@ -2022,87 +2014,7 @@ static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
+ /// walked the piece before, 4,096 steps; the passes took 24.8 ms of a frame's
+ /// 82 on the card (capture replay1, 405 of them), most of it waiting for
+ /// those steps.
+-pub(crate) const CARD_COMPARE: &str = r#"
+-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+-cbuffer Span : register(b0) {
+-    uint first;    // the first piece
+-    uint skew;     // where the copy starts in its piece 0
+-    uint size;     // the copy's buffer, in bytes (a multiple of 64 KiB)
+-    uint pieces;
+-    uint out_at;   // the first piece's dword in `differs`, in bytes
+-    uint compare;  // 0: the hashes are stored; else compared with those stored (2: and then stored)
+-};
+-ByteAddressBuffer now : register(t0);
+-// 16 bytes per piece of the copy: the hash of its bytes when they were
+-// last sent up (or hashed whole, the first time).
+-RWByteAddressBuffer hashes : register(u0);
+-RWByteAddressBuffer differs : register(u1);
+-groupshared uint4 parts[64];
+-[RootSignature(RS)]
+-[numthreads(64, 1, 1)]
+-void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
+-    uint piece = first + id.x;
+-    uint lo = piece * 65536u;
+-    lo = lo > skew ? lo - skew : 0u;
+-    uint hi = min((piece + 1u) * 65536u - skew, size);
+-    lo = lo & ~15u;
+-    hi = (hi + 15u) & ~15u;
+-    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu) + thread;
+-    uint at = lo + thread * 16u;
+-    // Eight loads at once: one after the other, each waits for memory.
+-    [loop]
+-    for (; at + 7168u < hi; at += 8192u) {
+-        uint4 v0 = now.Load4(at + 0u);
+-        uint4 v1 = now.Load4(at + 1024u);
+-        uint4 v2 = now.Load4(at + 2048u);
+-        uint4 v3 = now.Load4(at + 3072u);
+-        uint4 v4 = now.Load4(at + 4096u);
+-        uint4 v5 = now.Load4(at + 5120u);
+-        uint4 v6 = now.Load4(at + 6144u);
+-        uint4 v7 = now.Load4(at + 7168u);
+-        h = (h ^ v0) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+-        h = h.yzwx ^ (h >> 15);
+-        h = (h ^ v1) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+-        h = h.yzwx ^ (h >> 15);
+-        h = (h ^ v2) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+-        h = h.yzwx ^ (h >> 15);
+-        h = (h ^ v3) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+-        h = h.yzwx ^ (h >> 15);
+-        h = (h ^ v4) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+-        h = h.yzwx ^ (h >> 15);
+-        h = (h ^ v5) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+-        h = h.yzwx ^ (h >> 15);
+-        h = (h ^ v6) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+-        h = h.yzwx ^ (h >> 15);
+-        h = (h ^ v7) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+-        h = h.yzwx ^ (h >> 15);
+-    }
+-    [loop]
+-    for (; at < hi; at += 1024u) {
+-        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+-        h = h.yzwx ^ (h >> 15);
+-    }
+-    parts[thread] = h;
+-    GroupMemoryBarrierWithGroupSync();
+-    if (thread != 0u) return;
+-    h = parts[0];
+-    [loop]
+-    for (uint i = 1u; i < 64u; ++i) {
+-        h = (h ^ parts[i]) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+-        h = h.yzwx ^ (h >> 15);
+-    }
+-    if (compare != 0u) {
+-        // The flag, and above it 31 bits of the hash (`torn`).
+-        uint folded = h.x ^ (h.y * 3u) ^ (h.z * 5u) ^ (h.w * 7u);
+-        differs.Store(out_at + id.x * 4u, (folded << 1u) | (any(h != hashes.Load4(piece * 16u)) ? 1u : 0u));
+-        // With the copy-back on its own thread: the next compare of the
+-        // piece finds what is written from here on.
+-        if (compare == 2u) hashes.Store4(piece * 16u, h);
+-    } else {
+-        hashes.Store4(piece * 16u, h);
+-    }
+-}
+-"#;
++pub(crate) const CARD_COMPARE: &str = include_str!("card-compare.hlsl");
+ 
+ /// The hash [`CARD_COMPARE`] gives of a piece with its flag.
+ #[cfg(test)]
+@@ -4176,27 +4088,12 @@ impl Host {
+     }
+ 
+     fn make_card_work(&self) -> windows::core::Result<CardWork> {
+-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+-        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+-        let mut code: Option<ID3DBlob> = None;
+-        // SAFETY: the source and names live through the call; the out
+-        // pointer is ours.
+-        unsafe {
+-            D3DCompile(
+-                CARD_COMPARE.as_ptr().cast(),
+-                CARD_COMPARE.len(),
+-                windows::core::s!("card compare"),
+-                None,
+-                None,
+-                windows::core::s!("main"),
+-                windows::core::s!("cs_5_1"),
+-                0,
+-                0,
+-                &mut code,
+-                None,
+-            )?;
+-        }
+-        let code = code.ok_or_else(windows::core::Error::empty)?;
++        #[cfg(victory_dxc_compare)]
++        let bytes: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/card-compare.dxil"));
++        #[cfg(not(victory_dxc_compare))]
++        let compiled = compile(CARD_COMPARE, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
++        #[cfg(not(victory_dxc_compare))]
++        let bytes = compiled.as_slice();
+         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
+         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
+         // in one submission.
+@@ -4206,7 +4103,6 @@ impl Host {
+         // SAFETY: the blob's own bytes; the root signature is inside the
+         // shader.
+         unsafe {
+-            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+             let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
+             let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                 pRootSignature: std::mem::transmute_copy(&root),
+diff --git a/crates/victory-gpu/src/indirect-batch.hlsl b/crates/victory-gpu/src/indirect-batch.hlsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..876ab9bb2071e1c5aea2269ca9f6bfbb5c0ce809
+--- /dev/null
++++ b/crates/victory-gpu/src/indirect-batch.hlsl
+@@ -0,0 +1,153 @@
++#ifndef WIDEST
++#define WIDEST 65535u
++#endif
++#ifndef REST
++#define REST 0
++#endif
++#define RS "SRV(t0), SRV(t1), SRV(t2), SRV(t3), SRV(t4), UAV(u0), UAV(u1)"
++ByteAddressBuffer src0 : register(t0);
++ByteAddressBuffer src1 : register(t1);
++ByteAddressBuffer src2 : register(t2);
++ByteAddressBuffer src3 : register(t3);
++// The count, 12 bytes of nothing, then per job: source (bits 0-1), kind
++// (4-7), words (8-11) and the executions that read it (16-31); the
++// record's offset in the source; its place in the scratch buffer; nothing.
++ByteAddressBuffer jobs : register(t4);
++RWByteAddressBuffer dst_args : register(u0);
++RWByteAddressBuffer budget : register(u1);
++static const uint BUDGET = 1u << 27;
++static const uint GROUPS = 1u << 20;
++groupshared uint costs[64];
++groupshared uint fits[64];
++groupshared uint largest_asked;
++groupshared uint all_asked;
++uint load(uint source, uint at) {
++    if (source == 0) return src0.Load(at);
++    if (source == 1) return src1.Load(at);
++    if (source == 2) return src2.Load(at);
++    return src3.Load(at);
++}
++[RootSignature(RS)]
++[numthreads(64, 1, 1)]
++void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
++    uint count = jobs.Load(0);
++    bool active = id.x < count;
++    uint4 job = uint4(0, 0, 0, 0);
++    uint record[5] = {0, 0, 0, 0, 0};
++    uint cost = 0;
++    uint asked = 0;
++    uint kind = 0;
++    uint words = 0;
++    if (gi == 0) {
++        largest_asked = 0;
++        all_asked = 0;
++    }
++    // As the clamp of one execution (`super::SOURCE`) bounds them.
++    if (active) {
++        job = jobs.Load4(16 + id.x * 16);
++        kind = (job.x >> 4) & 15;
++        words = min((job.x >> 8) & 15, 5);
++        for (uint w = 0; w < words; w++) {
++            record[w] = load(job.x & 3, job.y + w * 4);
++        }
++        if (kind <= 1) {
++            if (record[0] >= 1u << 23) {
++                record[0] = 0;
++                record[1] = 0;
++            }
++            record[1] = min(record[1], (1u << 26) / max(record[0], 1u));
++            cost = record[0] * record[1];
++        } else if (kind == 2) {
++            uint3 g = uint3(record[0], record[1], record[2]);
++            g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
++            if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
++                g = uint3(0, 0, 0);
++            }
++            cost = g.x * g.y * g.z * 64u;
++            record[0] = g.x;
++            record[1] = g.y;
++            record[2] = g.z;
++        } else {
++            if (record[0] > 65535u) {
++                record[0] = 0;
++                record[1] = 0;
++                record[2] = 0;
++            }
++            asked = record[0];
++            record[1] = min(record[1], 1u);
++            record[2] = min(record[2], 1u);
++            cost = record[0] * record[1] * record[2] * 128u;
++        }
++        cost *= job.x >> 16;
++    }
++    costs[gi] = cost;
++    GroupMemoryBarrierWithGroupSync();
++    if (active && kind > 2) {
++        uint was;
++        InterlockedMax(largest_asked, asked, was);
++        InterlockedAdd(all_asked, min(asked, 1u << 24), was);
++    }
++    uint first = id.x - gi;
++    uint n = count > first ? min(64u, count - first) : 0u;
++    if (gi == 0 && n > 0) {
++        uint before;
++        budget.InterlockedOr(0, 0, before);
++        [allow_uav_condition]
++        while (before < BUDGET) {
++            uint next = before;
++            for (uint j = 0; j < n; j++) {
++                uint c = costs[j];
++                if (c > 0 && next < BUDGET) {
++                    next = (BUDGET - next < c) ? (REST ? BUDGET : next) : (next + c);
++                }
++            }
++            if (next == before) break;
++            uint prev;
++            budget.InterlockedCompareExchange(0, before, next, prev);
++            if (prev == before) break;
++            before = prev;
++        }
++        uint at = before;
++        uint refused = 0;
++        uint biggest = 0;
++        for (uint k = 0; k < n; k++) {
++            uint c = costs[k];
++            uint fit = 1;
++            if (c > 0) {
++                fit = (at < BUDGET && BUDGET - at >= c) ? 1u : 0u;
++                at = (at >= BUDGET || BUDGET - at < c) ? (REST ? BUDGET : at) : (at + c);
++                refused += 1 - fit;
++                biggest = max(biggest, c);
++            }
++            fits[k] = fit;
++        }
++        // Diagnostics: the records that run empty for want of budget, and
++        // the largest cost there was (small ones are not told).
++        uint told;
++        if (refused > 0) {
++            budget.InterlockedAdd(12, refused, told);
++        }
++        if (biggest >= (1u << 22)) {
++            budget.InterlockedMax(16, biggest, told);
++        }
++    }
++    GroupMemoryBarrierWithGroupSync();
++    if (gi == 0 && n > 0 && all_asked > 0) {
++        uint was;
++        budget.InterlockedMax(4, largest_asked, was);
++        budget.InterlockedAdd(8, all_asked, was);
++    }
++    if (!active) {
++        return;
++    }
++    if (fits[gi] == 0) {
++        record[0] = 0;
++        record[1] = 0;
++        if (kind > 1) {
++            record[2] = 0;
++        }
++    }
++    for (uint s = 0; s < words; s++) {
++        dst_args.Store(job.z + s * 4, record[s]);
++    }
++}
+diff --git a/crates/victory-gpu/src/indirect-clamp.hlsl b/crates/victory-gpu/src/indirect-clamp.hlsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..52c240a0f0d8489cdce3e9bc2d41f818057570e9
+--- /dev/null
++++ b/crates/victory-gpu/src/indirect-clamp.hlsl
+@@ -0,0 +1,192 @@
++#ifndef WIDEST
++#define WIDEST 65535u
++#endif
++#ifndef REST
++#define REST 0
++#endif
++#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
++cbuffer Record : register(b0) {
++    uint kind;
++    uint stride;
++    uint records;
++    uint args_offset;
++    // Bit 0: a count buffer bounds the records. Bit 1: the records are a
++    // window clamped ahead of their draws: one that asks for more than can
++    // run is left empty and costs nothing.
++    uint has_count;
++    uint count_offset;
++};
++ByteAddressBuffer src_args : register(t0);
++ByteAddressBuffer count_buf : register(t1);
++RWByteAddressBuffer dst_args : register(u0);
++// The list's work so far (vertex instances, threads): past the budget,
++// records run empty.
++RWByteAddressBuffer budget : register(u1);
++static const uint BUDGET = 1u << 27;
++// The vertices or indices an instance from which a draw record runs empty.
++static const uint MOST_DRAW = 1u << 23;
++// Groups of one dispatch; more run empty.
++static const uint GROUPS = 1u << 20;
++// Each group charges the budget once: the costs of its records go here,
++// one thread charges their sum, saturating as each record would in lane
++// order, and every thread then reads whether its own record fitted. A
++// compare and swap per record, 64 threads racing for one word, cost a
++// round for each record of a window, and in memory the CPU maps (where the
++// budget was, and is with VICTORY_INDIRECT_CARD_BUDGET=0) every atomic
++// crosses the bus on a card of its own.
++groupshared uint costs[64];
++groupshared uint fits[64];
++groupshared uint largest_asked;
++groupshared uint all_asked;
++[RootSignature(RS)]
++[numthreads(64, 1, 1)]
++void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
++    uint eff_count = records;
++    bool ahead = (has_count & 2u) != 0;
++    if ((has_count & 1u) != 0) {
++        eff_count = min(eff_count, count_buf.Load(count_offset));
++    }
++    // Threads past the records take part in the group's charge (cost 0)
++    // and store nothing.
++    bool active = id.x < eff_count;
++    uint src_at = args_offset + id.x * stride;
++    uint dst_at = id.x * stride;
++    uint cost = 0;
++    uint asked = 0;
++    uint2 draw_counts = uint2(0, 0);
++    uint3 groups = uint3(0, 0, 0);
++    if (gi == 0) {
++        largest_asked = 0;
++        all_asked = 0;
++    }
++    if (active && kind <= 1) {
++        // Draws: vertex or index count, then instances.
++        uint2 want = src_args.Load2(src_at);
++        if (ahead && (want.x > (1u << 24) || want.y > (1u << 24))) {
++            want = uint2(0, 0);
++        }
++        // A record of MOST_DRAW vertices or indices an instance, or more, is
++        // no draw of the title's (a slot it has not filled): it runs empty
++        // and charges nothing (victory-fork f85101b6, its window checker
++        // found 90 of 2^24 vertices in one list).
++        if (want.x >= MOST_DRAW) {
++            want = uint2(0, 0);
++        }
++        uint count = want.x;
++        uint instances = min(want.y, (1u << 26) / max(count, 1u));
++        cost = count * instances;
++        draw_counts = uint2(count, instances);
++    } else if (active && kind == 2) {
++        uint3 g = src_args.Load3(src_at);
++        // Up to WIDEST groups in x run as asked (`widest`).
++        g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
++        // x * y fits 32 bits where it is looked at; the whole count may not.
++        if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
++            g = uint3(0, 0, 0);
++        }
++        cost = g.x * g.y * g.z * 64u;
++        groups = g;
++    } else if (active) {
++        // Mesh dispatches: the console's are one-dimensional.
++        uint3 g = src_args.Load3(src_at);
++        // A record over the most a dispatch runs is a slot the title has
++        // not filled (the title leaves all ones there): empty,
++        // and not counted below either. (65,535 groups of meshlets read
++        // through the garbage beside it read past every buffer.)
++        if (g.x > 65535u) {
++            g = uint3(0, 0, 0);
++        }
++        asked = g.x;
++        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
++        cost = g.x * g.y * g.z * 128u;
++        groups = g;
++    }
++    costs[gi] = cost;
++    GroupMemoryBarrierWithGroupSync();
++    if (active && kind > 2) {
++        // Diagnostics, in the budget buffer's next words (below): the
++        // largest group count a mesh record asked for, and the groups
++        // asked in all.
++        uint was;
++        InterlockedMax(largest_asked, asked, was);
++        InterlockedAdd(all_asked, min(asked, 1u << 24), was);
++    }
++    // The group's own records: none for a group past a count buffer's
++    // count (an execution may ask for thousands and count a few), which
++    // touches the budget not at all, as its threads did not before.
++    uint first = id.x - gi;
++    uint n = eff_count > first ? min(64u, eff_count - first) : 0u;
++    if (gi == 0 && n > 0) {
++        // What the records charge, from `before` on, in lane order: a
++        // record that does not fit whole runs empty and takes the rest
++        // (`rest`).
++        // Only the group's own records are walked (one, clamped alone).
++        uint before;
++        budget.InterlockedOr(0, 0, before);
++        [allow_uav_condition]
++        while (before < BUDGET) {
++            uint next = before;
++            for (uint j = 0; j < n; j++) {
++                uint c = costs[j];
++                if (c > 0 && next < BUDGET) {
++                    next = (BUDGET - next < c) ? (REST ? BUDGET : next) : (next + c);
++                }
++            }
++            if (next == before) break;
++            uint prev;
++            budget.InterlockedCompareExchange(0, before, next, prev);
++            if (prev == before) break;
++            before = prev;
++        }
++        uint at = before;
++        uint refused = 0;
++        uint biggest = 0;
++        for (uint k = 0; k < n; k++) {
++            uint c = costs[k];
++            uint fit = 1;
++            if (c > 0) {
++                fit = (at < BUDGET && BUDGET - at >= c) ? 1u : 0u;
++                at = (at >= BUDGET || BUDGET - at < c) ? (REST ? BUDGET : at) : (at + c);
++                refused += 1 - fit;
++                biggest = max(biggest, c);
++            }
++            fits[k] = fit;
++        }
++        // Diagnostics: the records that run empty for want of budget, and
++        // the largest cost there was (small ones are not told).
++        uint told;
++        if (refused > 0) {
++            budget.InterlockedAdd(12, refused, told);
++        }
++        if (biggest >= (1u << 22)) {
++            budget.InterlockedMax(16, biggest, told);
++        }
++    }
++    GroupMemoryBarrierWithGroupSync();
++    if (gi == 0 && kind > 2 && n > 0) {
++        uint was;
++        budget.InterlockedMax(4, largest_asked, was);
++        budget.InterlockedAdd(8, all_asked, was);
++    }
++    if (!active) {
++        return;
++    }
++    bool over = fits[gi] == 0;
++    if (kind <= 1) {
++        if (over) {
++            draw_counts = uint2(0, 0);
++        }
++        dst_args.Store2(dst_at, draw_counts);
++        for (uint off = 8; off < stride; off += 4) {
++            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
++        }
++    } else {
++        if (over) {
++            groups = uint3(0, 0, 0);
++        }
++        dst_args.Store3(dst_at, groups);
++        for (uint off = 12; off < stride; off += 4) {
++            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
++        }
++    }
++}
+diff --git a/crates/victory-gpu/src/indirect.rs b/crates/victory-gpu/src/indirect.rs
+index e50f572ca2980df1d5322f344638662939c0b7c2..164c652c57127e8ca168d3fdc4cd1d54c5681c8d 100644
+--- a/crates/victory-gpu/src/indirect.rs
++++ b/crates/victory-gpu/src/indirect.rs
+@@ -33,7 +33,9 @@
+ //! dispatches, the budget) cut legitimate work beyond them; raise them if
+ //! the title needs more.
+ 
++#[cfg(test)]
+ use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
++#[cfg(test)]
+ use windows::Win32::Graphics::Direct3D::ID3DBlob;
+ use windows::Win32::Graphics::Direct3D12::*;
+ use windows::core::s;
+@@ -42,194 +44,7 @@ use crate::host::{HostList, host, transition};
+ 
+ pub(crate) mod batch;
+ 
+-const SOURCE: &str = r#"
+-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+-cbuffer Record : register(b0) {
+-    uint kind;
+-    uint stride;
+-    uint records;
+-    uint args_offset;
+-    // Bit 0: a count buffer bounds the records. Bit 1: the records are a
+-    // window clamped ahead of their draws: one that asks for more than can
+-    // run is left empty and costs nothing.
+-    uint has_count;
+-    uint count_offset;
+-};
+-ByteAddressBuffer src_args : register(t0);
+-ByteAddressBuffer count_buf : register(t1);
+-RWByteAddressBuffer dst_args : register(u0);
+-// The list's work so far (vertex instances, threads): past the budget,
+-// records run empty.
+-RWByteAddressBuffer budget : register(u1);
+-static const uint BUDGET = 1u << 27;
+-// The vertices or indices an instance from which a draw record runs empty.
+-static const uint MOST_DRAW = 1u << 23;
+-// Groups of one dispatch; more run empty.
+-static const uint GROUPS = 1u << 20;
+-// Each group charges the budget once: the costs of its records go here,
+-// one thread charges their sum, saturating as each record would in lane
+-// order, and every thread then reads whether its own record fitted. A
+-// compare and swap per record, 64 threads racing for one word, cost a
+-// round for each record of a window, and in memory the CPU maps (where the
+-// budget was, and is with VICTORY_INDIRECT_CARD_BUDGET=0) every atomic
+-// crosses the bus on a card of its own.
+-groupshared uint costs[64];
+-groupshared uint fits[64];
+-groupshared uint largest_asked;
+-groupshared uint all_asked;
+-[RootSignature(RS)]
+-[numthreads(64, 1, 1)]
+-void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+-    uint eff_count = records;
+-    bool ahead = (has_count & 2u) != 0;
+-    if ((has_count & 1u) != 0) {
+-        eff_count = min(eff_count, count_buf.Load(count_offset));
+-    }
+-    // Threads past the records take part in the group's charge (cost 0)
+-    // and store nothing.
+-    bool active = id.x < eff_count;
+-    uint src_at = args_offset + id.x * stride;
+-    uint dst_at = id.x * stride;
+-    uint cost = 0;
+-    uint asked = 0;
+-    uint2 draw_counts = uint2(0, 0);
+-    uint3 groups = uint3(0, 0, 0);
+-    if (gi == 0) {
+-        largest_asked = 0;
+-        all_asked = 0;
+-    }
+-    if (active && kind <= 1) {
+-        // Draws: vertex or index count, then instances.
+-        uint2 want = src_args.Load2(src_at);
+-        if (ahead && (want.x > (1u << 24) || want.y > (1u << 24))) {
+-            want = uint2(0, 0);
+-        }
+-        // A record of MOST_DRAW vertices or indices an instance, or more, is
+-        // no draw of the title's (a slot it has not filled): it runs empty
+-        // and charges nothing (victory-fork f85101b6, its window checker
+-        // found 90 of 2^24 vertices in one list).
+-        if (want.x >= MOST_DRAW) {
+-            want = uint2(0, 0);
+-        }
+-        uint count = want.x;
+-        uint instances = min(want.y, (1u << 26) / max(count, 1u));
+-        cost = count * instances;
+-        draw_counts = uint2(count, instances);
+-    } else if (active && kind == 2) {
+-        uint3 g = src_args.Load3(src_at);
+-        // Up to WIDEST groups in x run as asked (`widest`).
+-        g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+-        // x * y fits 32 bits where it is looked at; the whole count may not.
+-        if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
+-            g = uint3(0, 0, 0);
+-        }
+-        cost = g.x * g.y * g.z * 64u;
+-        groups = g;
+-    } else if (active) {
+-        // Mesh dispatches: the console's are one-dimensional.
+-        uint3 g = src_args.Load3(src_at);
+-        // A record over the most a dispatch runs is a slot the title has
+-        // not filled (the title leaves all ones there): empty,
+-        // and not counted below either. (65,535 groups of meshlets read
+-        // through the garbage beside it read past every buffer.)
+-        if (g.x > 65535u) {
+-            g = uint3(0, 0, 0);
+-        }
+-        asked = g.x;
+-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+-        cost = g.x * g.y * g.z * 128u;
+-        groups = g;
+-    }
+-    costs[gi] = cost;
+-    GroupMemoryBarrierWithGroupSync();
+-    if (active && kind > 2) {
+-        // Diagnostics, in the budget buffer's next words (below): the
+-        // largest group count a mesh record asked for, and the groups
+-        // asked in all.
+-        uint was;
+-        InterlockedMax(largest_asked, asked, was);
+-        InterlockedAdd(all_asked, min(asked, 1u << 24), was);
+-    }
+-    // The group's own records: none for a group past a count buffer's
+-    // count (an execution may ask for thousands and count a few), which
+-    // touches the budget not at all, as its threads did not before.
+-    uint first = id.x - gi;
+-    uint n = eff_count > first ? min(64u, eff_count - first) : 0u;
+-    if (gi == 0 && n > 0) {
+-        // What the records charge, from `before` on, in lane order: a
+-        // record that does not fit whole runs empty and takes the rest
+-        // (`rest`).
+-        // Only the group's own records are walked (one, clamped alone).
+-        uint before;
+-        budget.InterlockedOr(0, 0, before);
+-        [allow_uav_condition]
+-        while (before < BUDGET) {
+-            uint next = before;
+-            for (uint j = 0; j < n; j++) {
+-                uint c = costs[j];
+-                if (c > 0 && next < BUDGET) {
+-                    next = (BUDGET - next < c) ? (REST ? BUDGET : next) : (next + c);
+-                }
+-            }
+-            if (next == before) break;
+-            uint prev;
+-            budget.InterlockedCompareExchange(0, before, next, prev);
+-            if (prev == before) break;
+-            before = prev;
+-        }
+-        uint at = before;
+-        uint refused = 0;
+-        uint biggest = 0;
+-        for (uint k = 0; k < n; k++) {
+-            uint c = costs[k];
+-            uint fit = 1;
+-            if (c > 0) {
+-                fit = (at < BUDGET && BUDGET - at >= c) ? 1u : 0u;
+-                at = (at >= BUDGET || BUDGET - at < c) ? (REST ? BUDGET : at) : (at + c);
+-                refused += 1 - fit;
+-                biggest = max(biggest, c);
+-            }
+-            fits[k] = fit;
+-        }
+-        // Diagnostics: the records that run empty for want of budget, and
+-        // the largest cost there was (small ones are not told).
+-        uint told;
+-        if (refused > 0) {
+-            budget.InterlockedAdd(12, refused, told);
+-        }
+-        if (biggest >= (1u << 22)) {
+-            budget.InterlockedMax(16, biggest, told);
+-        }
+-    }
+-    GroupMemoryBarrierWithGroupSync();
+-    if (gi == 0 && kind > 2 && n > 0) {
+-        uint was;
+-        budget.InterlockedMax(4, largest_asked, was);
+-        budget.InterlockedAdd(8, all_asked, was);
+-    }
+-    if (!active) {
+-        return;
+-    }
+-    bool over = fits[gi] == 0;
+-    if (kind <= 1) {
+-        if (over) {
+-            draw_counts = uint2(0, 0);
+-        }
+-        dst_args.Store2(dst_at, draw_counts);
+-        for (uint off = 8; off < stride; off += 4) {
+-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+-        }
+-    } else {
+-        if (over) {
+-            groups = uint3(0, 0, 0);
+-        }
+-        dst_args.Store3(dst_at, groups);
+-        for (uint off = 12; off < stride; off += 4) {
+-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+-        }
+-    }
+-}
+-"#;
++const SOURCE: &str = include_str!("indirect-clamp.hlsl");
+ 
+ struct Clamp {
+     root: ID3D12RootSignature,
+@@ -304,45 +119,30 @@ fn rest() -> u32 {
+ /// The clamp compiled from `source` (ours, or in the benchmark the one it
+ /// replaced).
+ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
+-    #[cfg(feature = "diagnostics")]
+-    let batched = source == batch::SOURCE;
+-    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
+-    let mut code: Option<ID3DBlob> = None;
+-    let mut errors: Option<ID3DBlob> = None;
+-    // SAFETY: the source and names live through the call; out pointers ours.
+-    let compiled = unsafe {
+-        D3DCompile(
+-            source.as_ptr().cast(),
+-            source.len(),
+-            s!("clamp"),
+-            None,
+-            None,
+-            s!("main"),
+-            s!("cs_5_1"),
+-            0,
+-            0,
+-            &mut code,
+-            Some(&mut errors),
+-        )
+-    };
+-    if let Err(e) = compiled {
+-        if let Some(errors) = errors {
+-            // SAFETY: the blob's own bytes.
+-            let text = unsafe {
+-                std::slice::from_raw_parts(
+-                    errors.GetBufferPointer().cast::<u8>(),
+-                    errors.GetBufferSize(),
+-                )
+-            };
+-            tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
+-        }
+-        return Err(e);
++    let width = widest(amd(device));
++    let rest = rest();
++    #[cfg(victory_dxc_compare)]
++    if rest == 0 && (source == SOURCE || source == batch::SOURCE) {
++        let batched = source == batch::SOURCE;
++        let code: &[u8] = match (batched, width > 65_535) {
++            (false, false) => include_bytes!(concat!(env!("OUT_DIR"), "/indirect-clamp.dxil")),
++            (false, true) => include_bytes!(concat!(env!("OUT_DIR"), "/indirect-clamp-wide.dxil")),
++            (true, false) => include_bytes!(concat!(env!("OUT_DIR"), "/indirect-batch.dxil")),
++            (true, true) => include_bytes!(concat!(env!("OUT_DIR"), "/indirect-batch-wide.dxil")),
++        };
++        let clamp = clamp_from_code(device, code)?;
++        tracing::info!(width, batched, "created the indirect argument pipeline from build-time DXC output");
++        return Ok(clamp);
+     }
+-    let code = code.ok_or_else(windows::core::Error::empty)?;
+-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
++    let src = format!("#define WIDEST {width}u\n#define REST {rest}\n{source}");
++    let code = crate::host::compile(&src, s!("main"), s!("cs_5_1"))?;
++    clamp_from_code(device, &code)
++}
++
++fn clamp_from_code(device: &ID3D12Device, bytes: &[u8]) -> windows::core::Result<Clamp> {
++    // SAFETY: both calls consume these bytes while they are alive. The shader
++    // is built from our HLSL and carries its matching root signature.
+     unsafe {
+-        let bytes =
+-            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+             pRootSignature: std::mem::transmute_copy(&root),
+diff --git a/crates/victory-gpu/src/indirect/batch.rs b/crates/victory-gpu/src/indirect/batch.rs
+index d4f192d1e6d4fa8fd462568ec35d31c049b6638e..55c55f3f1669af48fd2ab0d34f733735c6767566 100644
+--- a/crates/victory-gpu/src/indirect/batch.rs
++++ b/crates/victory-gpu/src/indirect/batch.rs
+@@ -29,155 +29,7 @@ pub(crate) const SOURCES: usize = 4;
+ /// as often still fits 32 bits.
+ pub(crate) const TIMES: u32 = 31;
+ 
+-pub(crate) const SOURCE: &str = r#"
+-#define RS "SRV(t0), SRV(t1), SRV(t2), SRV(t3), SRV(t4), UAV(u0), UAV(u1)"
+-ByteAddressBuffer src0 : register(t0);
+-ByteAddressBuffer src1 : register(t1);
+-ByteAddressBuffer src2 : register(t2);
+-ByteAddressBuffer src3 : register(t3);
+-// The count, 12 bytes of nothing, then per job: source (bits 0-1), kind
+-// (4-7), words (8-11) and the executions that read it (16-31); the
+-// record's offset in the source; its place in the scratch buffer; nothing.
+-ByteAddressBuffer jobs : register(t4);
+-RWByteAddressBuffer dst_args : register(u0);
+-RWByteAddressBuffer budget : register(u1);
+-static const uint BUDGET = 1u << 27;
+-static const uint GROUPS = 1u << 20;
+-groupshared uint costs[64];
+-groupshared uint fits[64];
+-groupshared uint largest_asked;
+-groupshared uint all_asked;
+-uint load(uint source, uint at) {
+-    if (source == 0) return src0.Load(at);
+-    if (source == 1) return src1.Load(at);
+-    if (source == 2) return src2.Load(at);
+-    return src3.Load(at);
+-}
+-[RootSignature(RS)]
+-[numthreads(64, 1, 1)]
+-void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+-    uint count = jobs.Load(0);
+-    bool active = id.x < count;
+-    uint4 job = uint4(0, 0, 0, 0);
+-    uint record[5] = {0, 0, 0, 0, 0};
+-    uint cost = 0;
+-    uint asked = 0;
+-    uint kind = 0;
+-    uint words = 0;
+-    if (gi == 0) {
+-        largest_asked = 0;
+-        all_asked = 0;
+-    }
+-    // As the clamp of one execution (`super::SOURCE`) bounds them.
+-    if (active) {
+-        job = jobs.Load4(16 + id.x * 16);
+-        kind = (job.x >> 4) & 15;
+-        words = min((job.x >> 8) & 15, 5);
+-        for (uint w = 0; w < words; w++) {
+-            record[w] = load(job.x & 3, job.y + w * 4);
+-        }
+-        if (kind <= 1) {
+-            if (record[0] >= 1u << 23) {
+-                record[0] = 0;
+-                record[1] = 0;
+-            }
+-            record[1] = min(record[1], (1u << 26) / max(record[0], 1u));
+-            cost = record[0] * record[1];
+-        } else if (kind == 2) {
+-            uint3 g = uint3(record[0], record[1], record[2]);
+-            g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+-            if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
+-                g = uint3(0, 0, 0);
+-            }
+-            cost = g.x * g.y * g.z * 64u;
+-            record[0] = g.x;
+-            record[1] = g.y;
+-            record[2] = g.z;
+-        } else {
+-            if (record[0] > 65535u) {
+-                record[0] = 0;
+-                record[1] = 0;
+-                record[2] = 0;
+-            }
+-            asked = record[0];
+-            record[1] = min(record[1], 1u);
+-            record[2] = min(record[2], 1u);
+-            cost = record[0] * record[1] * record[2] * 128u;
+-        }
+-        cost *= job.x >> 16;
+-    }
+-    costs[gi] = cost;
+-    GroupMemoryBarrierWithGroupSync();
+-    if (active && kind > 2) {
+-        uint was;
+-        InterlockedMax(largest_asked, asked, was);
+-        InterlockedAdd(all_asked, min(asked, 1u << 24), was);
+-    }
+-    uint first = id.x - gi;
+-    uint n = count > first ? min(64u, count - first) : 0u;
+-    if (gi == 0 && n > 0) {
+-        uint before;
+-        budget.InterlockedOr(0, 0, before);
+-        [allow_uav_condition]
+-        while (before < BUDGET) {
+-            uint next = before;
+-            for (uint j = 0; j < n; j++) {
+-                uint c = costs[j];
+-                if (c > 0 && next < BUDGET) {
+-                    next = (BUDGET - next < c) ? (REST ? BUDGET : next) : (next + c);
+-                }
+-            }
+-            if (next == before) break;
+-            uint prev;
+-            budget.InterlockedCompareExchange(0, before, next, prev);
+-            if (prev == before) break;
+-            before = prev;
+-        }
+-        uint at = before;
+-        uint refused = 0;
+-        uint biggest = 0;
+-        for (uint k = 0; k < n; k++) {
+-            uint c = costs[k];
+-            uint fit = 1;
+-            if (c > 0) {
+-                fit = (at < BUDGET && BUDGET - at >= c) ? 1u : 0u;
+-                at = (at >= BUDGET || BUDGET - at < c) ? (REST ? BUDGET : at) : (at + c);
+-                refused += 1 - fit;
+-                biggest = max(biggest, c);
+-            }
+-            fits[k] = fit;
+-        }
+-        // Diagnostics: the records that run empty for want of budget, and
+-        // the largest cost there was (small ones are not told).
+-        uint told;
+-        if (refused > 0) {
+-            budget.InterlockedAdd(12, refused, told);
+-        }
+-        if (biggest >= (1u << 22)) {
+-            budget.InterlockedMax(16, biggest, told);
+-        }
+-    }
+-    GroupMemoryBarrierWithGroupSync();
+-    if (gi == 0 && n > 0 && all_asked > 0) {
+-        uint was;
+-        budget.InterlockedMax(4, largest_asked, was);
+-        budget.InterlockedAdd(8, all_asked, was);
+-    }
+-    if (!active) {
+-        return;
+-    }
+-    if (fits[gi] == 0) {
+-        record[0] = 0;
+-        record[1] = 0;
+-        if (kind > 1) {
+-            record[2] = 0;
+-        }
+-    }
+-    for (uint s = 0; s < words; s++) {
+-        dst_args.Store(job.z + s * 4, record[s]);
+-    }
+-}
+-"#;
++pub(crate) const SOURCE: &str = include_str!("../indirect-batch.hlsl");
+ 
+ /// The words of a record of `kind` (PC argument numbering).
+ pub(crate) fn words(kind: u32) -> Option<u32> {
+diff --git a/crates/victory-gpu/src/plane-corners.hlsl b/crates/victory-gpu/src/plane-corners.hlsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..0d7a087a8fe4999aff2fb08e4bee8d2a35e3c0bd
+--- /dev/null
++++ b/crates/victory-gpu/src/plane-corners.hlsl
+@@ -0,0 +1,3 @@
++float4 corner(uint i : SV_VertexID) : SV_Position {
++    return float4(float(i & 1) * 4.0 - 1.0, float(i >> 1) * 4.0 - 1.0, 0.0, 1.0);
++}
+diff --git a/crates/victory-gpu/src/plane-floats.hlsl b/crates/victory-gpu/src/plane-floats.hlsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..3e24142b00b6666f36bcd16ae4391beb96eb320d
+--- /dev/null
++++ b/crates/victory-gpu/src/plane-floats.hlsl
+@@ -0,0 +1,6 @@
++#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL)"
++Texture2DArray<float> twin : register(t0);
++[RootSignature(RS)]
++float plane(float4 p : SV_Position) : SV_Depth {
++    return twin.Load(int4(int2(p.xy), 0, 0));
++}
+diff --git a/crates/victory-gpu/src/plane-steps.hlsl b/crates/victory-gpu/src/plane-steps.hlsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..784f68d8aa197ea5b39c7c77f8db41d22a3bdd27
+--- /dev/null
++++ b/crates/victory-gpu/src/plane-steps.hlsl
+@@ -0,0 +1,6 @@
++#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL)"
++Texture2DArray<uint> twin : register(t0);
++[RootSignature(RS)]
++float plane(float4 p : SV_Position) : SV_Depth {
++    return float(twin.Load(int4(int2(p.xy), 0, 0))) * asfloat(0x37800080);
++}
