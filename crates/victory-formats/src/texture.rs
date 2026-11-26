@@ -813,7 +813,19 @@ pub fn changed_runs(at: usize, kept: &mut [u8], fresh: &[u8], runs: &mut Vec<(us
         // The usual case: one slice comparison, no byte walk.
         return;
     }
-    walk_changed(at, kept, fresh, runs);
+    // A streamed page can change in an otherwise equal MiB read. Skip
+    // equal blocks at either end before looking for individual runs. Keep
+    // the middle contiguous so a run crossing a block boundary stays one run.
+    const BLOCK: usize = 4096;
+    let mut start = 0;
+    let mut end = fresh.len();
+    while end - start >= BLOCK && kept[start..start + BLOCK] == fresh[start..start + BLOCK] {
+        start += BLOCK;
+    }
+    while end - start >= BLOCK && kept[end - BLOCK..end] == fresh[end - BLOCK..end] {
+        end -= BLOCK;
+    }
+    walk_changed(at + start, &mut kept[start..end], &fresh[start..end], runs);
 }
 
 enum Buffers<'a> {
@@ -1058,6 +1070,32 @@ mod tests {
         walk_changed(40, &mut walked[40..], &fresh[40..], &mut walk_runs);
         assert_eq!(walk_runs, runs);
         assert_eq!(walked, fresh);
+    }
+
+    #[test]
+    fn sparse_changes_match_the_byte_walk_in_an_unaligned_chunk() {
+        let original = vec![0; 32_773];
+        let cases: &[&[(usize, usize)]] = &[
+            &[],
+            &[(0, 1), (32_772, 32_773)],
+            &[(4_095, 4_097), (16_380, 20_481)],
+            &[(12_288, 16_384), (16_385, 16_386)],
+            &[(0, 32_773)],
+        ];
+        for &changes in cases {
+            let mut fresh = original.clone();
+            for &(from, to) in changes {
+                fresh[from..to].fill(1);
+            }
+            let mut kept = original.clone();
+            let mut expected = original.clone();
+            let mut runs = vec![(0, 5)];
+            let mut reference = runs.clone();
+            changed_runs(37, &mut kept, &fresh, &mut runs);
+            walk_changed(37, &mut expected, &fresh, &mut reference);
+            assert_eq!(runs, reference);
+            assert_eq!(kept, fresh);
+        }
     }
 
     /// Active bytes copied per second on synthetic surfaces:
