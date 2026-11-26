@@ -143,3 +143,20 @@ Frame 3239 was black and frame 3240 showed the dark loading background. Frame 32
 Across the first 20 reports with at least 100 draws per frame, median frame time was 6,066.75 ms (0.165 FPS), GPU time was 865.95 ms, and copy preparation took 4,661.4 ms for 15,569.1 MB per frame. These are timings from the diagnostic run. The image now shows a city before atmosphere, with incomplete foreground lighting. Player control and real-time gameplay remain unverified.
 
 At frame 3299, sixty presented frames into the scene, the window showed a blue-purple sky, a line of trees and legible pink opening credits. The ground away from the credits remained almost black. In the lower-right 640×270 area of the 960×540 readback, 660 of 172,800 pixels reached 8/255 luminance. The person at the Mac reported still being in the intro or that it was too dark to judge the opposite camera inputs. The full-resolution run was left open.
+
+## Sparse refreshes and foreground exposure on M1 Max
+
+The source-built Series S variant used CrossOver Preview with D3DMetal on an Apple M1 Max. The optional `source-sparse-exposure.patch` follows `source-pre-scattering.patch`. The tested executable SHA-256 was `43d300ecc914f5ae9d70dcad1da5c13bcce829a3431ac8c0a7749389d9de2566`.
+
+A repeated sparse upload previously copied a committed prefix, encountered a gap and copied the prefix again while walking memory regions. With `VICTORY_SPARSE_HINTS=1` a thread remembers up to 64 exact ranges and walks current regions first for a repeat. It retains neither the bytes nor the memory protections. A CrossOver test checked readable islands, untouched output boundaries, newly written edges and a formerly absent block that became committed. Alternating trials on a 16 MiB buffer with a 64 KiB gap near the end gave medians of 1,642 and 1,393 µs with hints off and 753 and 687 µs with hints on (21 copies per trial).
+
+The following medians cover the first 20 renderer reports with at least 100 draws/frame. Each run started from a separate copy of the same saved profile. The opening shot, shader-cache state and competing Mac activity varied. The exposure run included the extra bounded upscaler readbacks. These measurements compare the overall runs and do not isolate an in-game speedup attributable to the sparse-copy change.
+
+| Run | Frame time (ms) | Preparing copies (ms) | Copy volume (MB) | GPU (ms) | Draws/frame |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Previous HDR preview | 6,066.8 | 4,661.4 | 15,569.1 | 866.0 | 3,125.5 |
+| Hints on, HDR preview +4 EV | 7,498.0 | 4,816.9 | 15,258.5 | 1,541.8 | 3,002.5 |
+
+The HDR preview multiplies the scene's linear RGB by 16 before SDR encoding. Tests on the physical GPU checked a dim red surface, exact black and an opaque HUD pixel. The game still displayed black street geometry below the horizon. At scene +5 and +20, 898 and 609 of the 259,200 lower-half pixels met the 8/255 luminance threshold. Frame 3302 shows illuminated building windows around a silhouetted character. Raising exposure did not recover the missing light.
+
+At the first scattering sample, 113170 pixels in the lower half of the native 1280×720 HDR surface had positive RGB. Both 1920×1080 RGBA16F upscaler targets (`6a6c7b7fde59134f`, `fdce2a0a9fb1521a`) had zero positive RGB after their dispatch at that occurrence. This run kept the atmosphere pass enabled. Player control and sustained gameplay at 60 FPS remain unverified.

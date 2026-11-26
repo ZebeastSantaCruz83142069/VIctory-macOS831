@@ -1,0 +1,379 @@
+From d44f74c491eb03505e04ca238fbf684832edc789 Mon Sep 17 00:00:00 2001
+From: ZebeastSantaCruz83142069
+ <361184274+ZebeastSantaCruz83142069@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 04:48:18 -0800
+Subject: [PATCH] Avoid retrying known sparse prefixes and measure HDR preview
+ exposure
+
+---
+ crates/victory-gpu/src/capture/lighting.rs | 28 ++++++--
+ crates/victory-gpu/src/compose.rs          | 39 ++++++++---
+ crates/victory-gpu/src/draw.rs             |  2 +-
+ crates/victory-gpu/src/host.rs             | 79 ++++++++++++++++++++--
+ 4 files changed, 125 insertions(+), 23 deletions(-)
+
+diff --git a/crates/victory-gpu/src/capture/lighting.rs b/crates/victory-gpu/src/capture/lighting.rs
+index 507983a..6e46459 100644
+--- a/crates/victory-gpu/src/capture/lighting.rs
++++ b/crates/victory-gpu/src/capture/lighting.rs
+@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
+ #[derive(Clone, Copy)]
+ pub(crate) struct Probe {
+     pub pass: &'static str,
++    pub table: usize,
+     pub word: u32,
+     pub occurrence: u32,
+     pub frame: u64,
+@@ -17,20 +18,23 @@ pub(crate) fn enabled() -> bool {
+ }
+ 
+ pub(crate) fn select(hash: &str) -> Option<Probe> {
+-    static HITS: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
++    static HITS: [AtomicU32; 5] = [const { AtomicU32::new(0) }; 5];
+     if !enabled() {
+         return None;
+     }
+-    // Table 1 offsets (dwords) observed in the Series S command lists.
+-    let (i, pass, word) = match hash {
+-        "f0c91b4d2578f5bf" => (0, "tiled_lighting", 56),
+-        "348e1e8c414c7eca" => (1, "sky", 72),
+-        "577248728544d74b" => (2, "scattering", 48),
++    // UAV table and dword offset observed in the Series S command lists.
++    let (i, pass, table, word) = match hash {
++        "f0c91b4d2578f5bf" => (0, "tiled_lighting", 1, 56),
++        "348e1e8c414c7eca" => (1, "sky", 1, 72),
++        "577248728544d74b" => (2, "scattering", 1, 48),
++        "6a6c7b7fde59134f" => (3, "upscale_6a6c", 0, 24),
++        "fdce2a0a9fb1521a" => (4, "upscale_fdce", 0, 8),
+         _ => return None,
+     };
+     let occurrence = HITS[i].fetch_add(1, Ordering::Relaxed) + 1;
+     matches!(occurrence, 1 | 6 | 21).then(|| Probe {
+         pass,
++        table,
+         word,
+         occurrence,
+         frame: crate::queue::presented() + 1,
+@@ -47,6 +51,7 @@ pub(crate) struct Counts {
+     positive_rgb: usize,
+     bottom_positive_rgb: usize,
+     nonfinite_rgb: usize,
++    bottom_above: [usize; 3],
+     rgba_hash: blake3::Hash,
+ }
+ 
+@@ -93,6 +98,7 @@ impl Sample {
+             }
+             let mut hasher = blake3::Hasher::new();
+             let (mut positive_rgb, mut bottom_positive_rgb, mut nonfinite_rgb) = (0, 0, 0);
++            let mut bottom_above = [0; 3];
+             for y in 0..f.Height as usize {
+                 let offset = self.footprint.Offset as usize + y * f.RowPitch as usize;
+                 let row =
+@@ -107,6 +113,11 @@ impl Sample {
+                         positive_rgb += 1;
+                         if y >= f.Height as usize / 2 {
+                             bottom_positive_rgb += 1;
++                            let peak = rgb.iter().copied().filter(|&v| v < 0x7c00).max().unwrap_or(0);
++                            // Positive binary16 encodings are ordered by brightness.
++                            for (count, cutoff) in bottom_above.iter_mut().zip([0x1400, 0x2400, 0x3400]) {
++                                *count += usize::from(peak >= cutoff);
++                            }
+                         }
+                     }
+                 }
+@@ -117,6 +128,7 @@ impl Sample {
+                 positive_rgb,
+                 bottom_positive_rgb,
+                 nonfinite_rgb,
++                bottom_above,
+                 rgba_hash: hasher.finalize(),
+             })
+         }
+@@ -128,7 +140,7 @@ impl Sample {
+             tracing::info!(pass=probe.pass, occurrence=probe.occurrence, frame=probe.frame, side,
+                 width=f.Width, height=f.Height, positive_rgb=c.positive_rgb,
+                 bottom_positive_rgb=c.bottom_positive_rgb, nonfinite_rgb=c.nonfinite_rgb,
+-                rgba_hash=%c.rgba_hash, "lighting dispatch HDR readback");
++                bottom_above=?c.bottom_above, rgba_hash=%c.rgba_hash, "lighting dispatch HDR readback");
+         }
+     }
+ }
+@@ -211,6 +223,8 @@ mod tests {
+             (b.positive_rgb, b.bottom_positive_rgb, b.nonfinite_rgb),
+             (3, 3, 0)
+         );
++        assert_eq!(a.bottom_above, [0; 3]);
++        assert_eq!(b.bottom_above, [3; 3]);
+         assert_ne!(a.rgba_hash, b.rgba_hash);
+         assert_eq!(preserved.counts().unwrap().rgba_hash, b.rgba_hash);
+         assert_eq!(cleared.counts().unwrap().positive_rgb, 0);
+diff --git a/crates/victory-gpu/src/compose.rs b/crates/victory-gpu/src/compose.rs
+index 4c8dc19..c85907e 100644
+--- a/crates/victory-gpu/src/compose.rs
++++ b/crates/victory-gpu/src/compose.rs
+@@ -34,6 +34,17 @@ pub(crate) fn scene_color_enabled() -> bool {
+     scene_source() != SceneSource::DisplayPlane
+ }
+ 
++/// Exposure for the optional HDR preview, in photographic stops.
++pub(crate) fn scene_exposure() -> f32 {
++    static EXPOSURE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
++    *EXPOSURE.get_or_init(|| {
++        std::env::var("VICTORY_SCENE_EXPOSURE_EV").ok()
++            .and_then(|s| s.parse::<f32>().ok())
++            .filter(|v| v.is_finite() && (-12.0..=12.0).contains(v))
++            .unwrap_or(0.0).exp2()
++    })
++}
++
+ pub(crate) fn finish_scene_color(texture: ID3D12Resource) {
+     let mut scene = SCENE_COLOR.lock().unwrap_or_else(|e| e.into_inner());
+     *scene = Some((crate::queue::presented(), texture));
+@@ -53,7 +64,7 @@ const SOURCE: &str = r#"
+ Texture2D<float4> scene : register(t0);
+ Texture2D<float4> over : register(t1);
+ SamplerState smooth_ : register(s0);
+-cbuffer Display : register(b0) { uint linear_scene; };
++cbuffer Display : register(b0) { float exposure; };
+ 
+ float to_srgb(float value) {
+     float x = saturate(value);
+@@ -69,7 +80,8 @@ V vs(uint id : SV_VertexID) {
+ }
+ float4 ps(V v) : SV_Target {
+     float4 s = scene.SampleLevel(smooth_, v.uv, 0);
+-    if (linear_scene != 0) {
++    if (exposure > 0) {
++        s.rgb *= exposure;
+         s.rgb = float3(to_srgb(s.r), to_srgb(s.g), to_srgb(s.b));
+     }
+     float4 o = over.SampleLevel(smooth_, v.uv, 0);
+@@ -224,7 +236,7 @@ impl Composer {
+         slot: usize,
+         list: &ID3D12GraphicsCommandList,
+         planes: [(&ID3D12Resource, DXGI_FORMAT); 2],
+-        linear_scene: bool,
++        exposure: Option<f32>,
+         back: &ID3D12Resource,
+         (width, height): (u32, u32),
+     ) -> windows::core::Result<()> {
+@@ -272,7 +284,7 @@ impl Composer {
+             list.SetGraphicsRootSignature(&self.root);
+             list.SetPipelineState(&self.pso);
+             list.SetGraphicsRootDescriptorTable(0, gpu);
+-            list.SetGraphicsRoot32BitConstant(1, u32::from(linear_scene), 0);
++            list.SetGraphicsRoot32BitConstant(1, exposure.unwrap_or(0.0).to_bits(), 0);
+             list.IASetPrimitiveTopology(
+                 windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+             );
+@@ -318,7 +330,7 @@ pub(crate) fn view(d: &D3D12_RESOURCE_DESC) -> Option<DXGI_FORMAT> {
+ mod tests {
+     use super::*;
+ 
+-    fn composite(host: &Host, scene_format: DXGI_FORMAT, colors: &[[f32; 4]], ui: &[[f32; 4]], linear_scene: bool) -> Vec<u8> {
++    fn composite(host: &Host, scene_format: DXGI_FORMAT, colors: &[[f32; 4]], ui: &[[f32; 4]], exposure: Option<f32>) -> Vec<u8> {
+         let format = DXGI_FORMAT_R8G8B8A8_UNORM;
+         let mut compositor = Composer::new(host, format).unwrap();
+         let list = host.new_list().unwrap();
+@@ -381,7 +393,7 @@ mod tests {
+                     0,
+                     cmds,
+                     [(&base, scene_format), (&overlay, format)],
+-                    linear_scene,
++                    exposure,
+                     &output,
+                     (ui.len() as u32, 1),
+                 )
+@@ -412,13 +424,24 @@ mod tests {
+             return;
+         };
+         let ui = [[0.0; 4], [0.0, 0.5, 0.0, 0.5], [0.0, 0.0, 1.0, 1.0]];
+-        let pixels = composite(host, DXGI_FORMAT_R8G8B8A8_UNORM, &[[0.5, 0.0, 0.0, 1.0]], &ui, false);
++        let pixels = composite(host, DXGI_FORMAT_R8G8B8A8_UNORM, &[[0.5, 0.0, 0.0, 1.0]], &ui, None);
+         for (actual, expected) in pixels.iter().zip([128, 0, 0, 255, 64, 128, 0, 255, 0, 0, 255, 255]) {
+             assert!(actual.abs_diff(expected) <= 1, "unexpected composite {pixels:?}");
+         }
+         eprintln!("D3D12 display-plane readback RGBA: {pixels:?}");
+     }
+ 
++    #[test]
++    fn preview_exposure_lifts_scene_without_changing_hud_on_gpu() {
++        let host = crate::host::host().expect("D3D12 device");
++        let colors = [[0.0, 0.0, 0.0, 1.0], [1.0/64.0, 0.0, 0.0, 1.0], [1.0; 4]];
++        let ui = [[0.; 4], [0.; 4], [0.0, 0.5, 0.0, 1.0]];
++        let pixels = composite(host, DXGI_FORMAT_R16G16B16A16_FLOAT, &colors, &ui, Some(16.0));
++        for (actual, expected) in pixels.iter().zip([0u8,0,0,255,137,0,0,255,0,128,0,255]) {
++            assert!(actual.abs_diff(expected) <= 2, "exposed scene and HUD: {pixels:?}");
++        }
++    }
++
+     #[test]
+     fn encodes_linear_scene_before_blending_sdr_ui_on_gpu() {
+         let Some(host) = crate::host::host() else {
+@@ -431,7 +454,7 @@ mod tests {
+         ui[8] = [0.25, 0.0, 0.0, 0.5];
+         ui[9] = [0.25, 0.5, 0.75, 1.0];
+         for format in [DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT] {
+-            let pixels = composite(host, format, &colors, &ui, true);
++            let pixels = composite(host, format, &colors, &ui, Some(1.0));
+             let mut expected = [0u8, 6, 13, 34, 118, 188, 255, 255, 0, 0].map(|v| [v, v, v, 255]);
+             expected[8] = [158, 94, 94, 255];
+             expected[9] = [64, 128, 191, 255];
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index db34c44..0ac9b8c 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -3166,7 +3166,7 @@ impl State {
+         let world_color = p.stages.first()
+             .and_then(|stage| crate::capture::lighting::select(&stage.shader.hash))
+             .and_then(|probe| {
+-                let Root::Table(table) = self.roots_ref(true).get(1)? else { return None };
++                let Root::Table(table) = self.roots_ref(true).get(probe.table)? else { return None };
+                 match crate::descriptor::view(table + u64::from(probe.word) * 4) {
+                     Some(View::Unordered(resource, ..)) => Some((resource as This, probe)),
+                     _ => None,
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index d5326b1..19fc428 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -1119,6 +1119,48 @@ mod tests {
+         }
+     }
+ 
++    /// Times repeated refreshes of a buffer with a long committed prefix.
++    /// Both strategies must copy fresh edge bytes and recover a newly filled hole.
++    #[test]
++    #[ignore = "CrossOver buffer-copy measurement"]
++    fn repeated_sparse_prefix_cost() {
++        use windows_sys::Win32::System::Memory::*;
++        const SIZE: usize = 16 << 20;
++        const BLOCK: usize = 64 << 10;
++        unsafe {
++            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
++            assert!(!base.is_null());
++            let hole = SIZE - 2 * BLOCK;
++            for (offset, len) in [(0, hole), (hole + BLOCK, BLOCK)] {
++                let p = base.add(offset);
++                assert_eq!(VirtualAlloc(p.cast(), len, MEM_COMMIT, PAGE_READWRITE), p.cast());
++                p.write_bytes(0x6b, len);
++            }
++            let mut output = vec![0u8; SIZE];
++            super::copy_mapped(output.as_mut_ptr(), base, SIZE, false);
++            let mut times = Vec::new();
++            for round in 1..=21u8 {
++                base.write(round);
++                base.add(SIZE - 1).write(round);
++                let start = std::time::Instant::now();
++                super::copy_mapped(output.as_mut_ptr(), base, SIZE, false);
++                times.push(start.elapsed().as_micros());
++                assert_eq!((output[0], output[SIZE - 1]), (round, round));
++            }
++            assert!(output[1..hole].iter().all(|&v| v == 0x6b));
++            assert!(output[hole..hole + BLOCK].iter().all(|&v| v == 0));
++            assert!(output[hole + BLOCK..SIZE - 1].iter().all(|&v| v == 0x6b));
++            let p = base.add(hole);
++            assert_eq!(VirtualAlloc(p.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE), p.cast());
++            p.write_bytes(0xab, BLOCK);
++            super::copy_mapped(output.as_mut_ptr(), base, SIZE, false);
++            assert!(output[hole..hole + BLOCK].iter().all(|&v| v == 0xab));
++            times.sort_unstable();
++            eprintln!("median sparse refresh (16 MiB, 21 copies): {} us", times[10]);
++            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
++        }
++    }
++
+     use super::*;
+ 
+     #[test]
+@@ -8273,7 +8315,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
+     let since = crate::watch::changes();
+     // (A title destination that is away only while the runtime changes a
+     // mapping beside it is written when that is done.)
+-    let whole = read(src, dst, len) || title_dst && crate::watch::again_after_change(since, || read(src, dst, len));
++    let range = (src as usize, len);
++    let predict = !title_dst && len >= 64 << 10 && sparse_hints_enabled();
++    let slot = ((range.0 >> 16) ^ (range.0 >> 22) ^ (len >> 16)) & 63;
++    let walk_first = predict && SPARSE_HINTS.with_borrow(|hints| hints[slot] == range);
++    let whole = !walk_first && (read(src, dst, len) || title_dst && crate::watch::again_after_change(since, || read(src, dst, len)));
+     #[cfg(feature = "diagnostics")]
+     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
+     if whole {
+@@ -8291,7 +8337,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
+     #[cfg(feature = "diagnostics")]
+     let sparse = std::time::Instant::now();
+     if !title_dst && len >= 64 << 10 {
+-        read_sparse(src, dst, len);
++        let sparse = read_sparse(src, dst, len);
++        if predict {
++            SPARSE_HINTS.with_borrow_mut(|hints| hints[slot] = if sparse { range } else { (0, 0) });
++        }
+     } else {
+         read_pieces(src, dst, len);
+     }
+@@ -8299,13 +8348,26 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
+     crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
+ }
+ 
+-/// After a failed bulk read into host memory, skip contiguous holes. Never
+-/// cache the query across copies: the title may remap the same address.
+-fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
++// Only the preferred read strategy survives a copy. The next copy queries
++// current protections and reads current bytes even on an exact hit.
++thread_local! {
++    static SPARSE_HINTS: std::cell::RefCell<[(usize, usize); 64]> =
++        const { std::cell::RefCell::new([(0, 0); 64]) };
++}
++
++fn sparse_hints_enabled() -> bool {
++    static ENABLED: OnceLock<bool> = OnceLock::new();
++    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_SPARSE_HINTS").is_some_and(|v| v == "1"))
++}
++
++/// Walk current regions. Report whether a later copy should walk first to
++/// avoid copying a long readable prefix twice before reaching the first hole.
++fn read_sparse(src: *const u8, dst: *mut u8, len: usize) -> bool {
+     use windows_sys::Win32::System::Memory::{
+         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
+     };
+     let mut offset = 0;
++    let mut sparse = false;
+     while offset < len {
+         let at = src.wrapping_add(offset);
+         let to = dst.wrapping_add(offset);
+@@ -8317,19 +8379,22 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
+             .saturating_sub(at as usize).min(remaining);
+         if size != size_of_val(&info) || n == 0 {
+             read_pieces(at, to, remaining);
+-            break;
++            return true;
+         }
+         if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
++            sparse = true;
+             #[cfg(feature = "diagnostics")]
+             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+             // SAFETY: this path is only used with a writable host destination.
+             unsafe { to.write_bytes(0, n) };
+         } else if !read(at, to, n) {
++            sparse = true;
+             // A mapping may change between query and read.
+             read_pieces(at, to, n);
+         }
+         offset += n;
+     }
++    sparse
+ }
+ 
+ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
+@@ -9128,7 +9193,7 @@ impl Host {
+                         compose_slot,
+                         list,
+                         [(texture, base_fmt), (over, over_fmt)],
+-                        early.is_some(),
++                        early.as_ref().map(|_| crate::compose::scene_exposure()),
+                         &back,
+                         (width, height),
+                     ) {
+-- 
+2.50.1 (Apple Git-155)
+
