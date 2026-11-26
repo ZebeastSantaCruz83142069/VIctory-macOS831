@@ -23,6 +23,8 @@ extern "system" fn create_device(
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
     #[cfg(all(windows, feature = "diagnostics"))]
     victory_gpu::use_mapped_reader(super::xmem::read_physical_view);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    victory_gpu::use_physical_layout(super::xmem::physical_layout);
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
     device::create(adapter, parameters, iid, out)

@@ -1689,6 +1689,8 @@ impl Host {
                 group.push(mark.list());
             }
             let queue = self.queue();
+            #[cfg(feature = "diagnostics")]
+            let _tile_bindings = crate::physical::prepare(&queue);
             // SAFETY: closed lists; the fence and event are ours.
             let waited = unsafe {
                 queue.ExecuteCommandLists(&group);
@@ -1706,6 +1708,10 @@ impl Host {
                     }
                 }
             };
+            #[cfg(feature = "diagnostics")]
+            if _tile_bindings.is_some() && !waited {
+                fail(format_args!("waiting for XMem tile mappings and their host submission failed"));
+            }
             if waited
                 && let Some(mark) = mark
                 && !mark.saw(*submitted)

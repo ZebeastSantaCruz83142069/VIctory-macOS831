@@ -383,7 +383,7 @@ struct Section {
     /// Optional shared CPU/GPU backing. The file still supplies Wine's
     /// placeholder-view metadata.
     #[cfg(feature = "diagnostics")]
-    shared: Option<victory_gpu::PhysicalHeap>,
+    shared: Option<Arc<victory_gpu::PhysicalHeap>>,
     /// Our own view of the whole section, mapped the first time a
     /// DirectStorage request writes its pages and kept while the section
     /// lives (0: it could not be mapped). A view per request cost a map
@@ -559,6 +559,36 @@ fn physical() -> MutexGuard<'static, Physical> {
     PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The physical runs currently mapped in a reserved GPU buffer. The gaps
+/// in the returned runs are unmapped tiles.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn physical_layout(base: usize, len: usize) -> Option<Vec<victory_gpu::PhysicalTiles>> {
+    let end = base.checked_add(len)?;
+    let physical = physical();
+    let first = physical.views.range(..=base).next_back().map_or(base, |(&at, _)| at);
+    let mut runs: Vec<victory_gpu::PhysicalTiles> = Vec::new();
+    for (&at, (size, slice)) in physical.views.range(first..end) {
+        let (from, to) = (base.max(at), end.min(at.saturating_add(*size)));
+        if from >= to {
+            continue;
+        }
+        let first = u32::try_from((from - base) / PAGE).ok()?;
+        let count = u32::try_from((to - from) / PAGE).ok()?;
+        let heap_tile = u32::try_from(slice.index + (from - at) / PAGE).ok()?;
+        let heap = slice.section.shared.as_ref()?;
+        if let Some(last) = runs.last_mut()
+            && last.first + last.count == first
+            && last.heap_tile + last.count == heap_tile
+            && Arc::ptr_eq(&last.heap, heap)
+        {
+            last.count += count;
+        } else {
+            runs.push(victory_gpu::PhysicalTiles { first, count, heap_tile, heap: heap.clone() });
+        }
+    }
+    Some(runs)
+}
+
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
 pub extern "system" fn XMemAllocatePhysicalPages(
     flags: u64,
@@ -572,6 +602,16 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let n = unsafe { *count };
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
+    };
+    #[cfg(feature = "diagnostics")]
+    let shared = match victory_gpu::physical_heap(size) {
+        Ok(shared) => shared,
+        Err(error) => {
+            tracing::warn!(size, %error, "XMem physical tile heap allocation failed");
+            // SAFETY: the title passed a non-null out count.
+            unsafe { count.write(0) };
+            return 0;
+        }
     };
     // A pagefile-backed section of `size` bytes, its pages committed when
     // first mapped or written (`commit`): Grand Theft Auto VI asks for 6.1
@@ -607,7 +647,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         handle,
         size,
         #[cfg(feature = "diagnostics")]
-        shared: victory_gpu::physical_heap(size),
+        shared,
         whole: OnceLock::new(),
     });
     let mut physical = physical();
@@ -1008,7 +1048,13 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         victory_gpu::title_memory_aliased(base + k * PAGE, shown);
         shown.push(base + k * PAGE);
     }
+    #[cfg(feature = "diagnostics")]
+    let shared = slice.section.shared.is_some();
     physical.views.insert(base, (len, slice));
+    #[cfg(feature = "diagnostics")]
+    if shared {
+        victory_gpu::physical_layout_changed();
+    }
     true
 }
 
@@ -1150,6 +1196,10 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 MEM_PRESERVE_PLACEHOLDER,
             )
         };
+        #[cfg(feature = "diagnostics")]
+        if slice.section.shared.is_some() {
+            victory_gpu::physical_layout_changed();
+        }
         if at < base {
             map(physical, at, base - at, slice.clone());
         }
@@ -1524,6 +1574,13 @@ mod tests {
         assert_eq!(query(at(a, 1)).host.State, MEM_RESERVE);
         assert_eq!(query(a).host.State, MEM_COMMIT);
         assert_eq!(query(at(a, 2)).host.State, MEM_COMMIT);
+        #[cfg(feature = "diagnostics")]
+        if std::env::var("VICTORY_PHYSICAL_TILES").as_deref() == Ok("1") {
+            let runs = physical_layout(a as usize, 3 * PAGE).unwrap();
+            let positions: Vec<_> = runs.iter().map(|r| (r.first, r.count, r.heap_tile)).collect();
+            assert_eq!(positions, [(0, 1, 0), (2, 1, 2)]);
+            assert!(Arc::ptr_eq(&runs[0].heap, &runs[1].heap));
+        }
         // SAFETY: still mapped.
         assert_eq!(unsafe { at(a, 2).cast::<u8>().read() }, 7);
 

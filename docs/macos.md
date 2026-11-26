@@ -198,6 +198,10 @@ The diagnostics switch `VICTORY_PHYSICAL_TILES=1` lets XMem use CPU-visible D3D1
 
 A separate 6.10 GiB heap and reserved buffer worked on the same M1 Max. Readback matched data from four sampled tiles, including the last two in the heap. A GPU write reached the final tile's CPU mapping.
 
+With `VICTORY_PHYSICAL_TILES=1` and fault tracking off, a registered buffer that starts entirely in these physical heaps can take a reserved GPU address. The host queue updates its tile bindings before submitting lists and holds the old heaps through the submission fence. A replay test reused a recorded copy after changing the mapping and unmapping one tile. Readback followed the new mapping, including zeros for the hole.
+
+The trial gives a new buffer a host copy if another reserved buffer already covers its physical tiles. It reports any later remap that would overlap two live reserved buffers. Direct3D 12 requires synchronization when two resources access the same physical memory within one submission. [Direct3D 12 resource aliasing](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-createplacedresource#advanced-model)
+
 ## Host presentation size
 
 Set `VICTORY_PRESENT_MAX=1280x720` to cap the host presentation pass and DXGI swap chain at 720p. Smaller pictures keep their native size. The cap preserves the picture’s aspect ratio and applies after the game’s rendering and upscaling.

@@ -111,6 +111,9 @@ pub(crate) struct Shadow {
     /// True when the title's virtual range `[start, start + len)` is
     /// `mach_vm_remap`-aliased onto `buffer`'s physical pages (zero-copy).
     aliased: bool,
+    /// Keeps a reserved resource's tile bindings registered for this shadow.
+    #[cfg(feature = "diagnostics")]
+    tiles: std::sync::OnceLock<Arc<crate::physical::ReservedBuffer>>,
 }
 
 /// A 16-byte-element host copy of a three-channel 32-bit buffer view. D3DMetal
@@ -198,12 +201,23 @@ impl Widened {
         }
         let first = (from - start) / 12;
         let last = (to - start).div_ceil(12);
-        // SAFETY: the source range is inside the shadow and the destination
-        // has one 16-byte element for each 12 source bytes.
+        let source = shadow.data.wrapping_add(start - shadow.start as usize + first * 12);
+        #[cfg(feature = "diagnostics")]
+        let mut packed = Vec::new();
+        #[cfg(feature = "diagnostics")]
+        let source = if shadow.tiles.get().is_some() {
+            // An XMem remap can leave holes in the CPU view.
+            packed.resize((last - first) * 12, 0u8);
+            crate::host::copy_mapped(packed.as_mut_ptr(), source, packed.len(), false);
+            packed.as_ptr()
+        } else {
+            source
+        };
+        // SAFETY: the source holds the requested elements and the
+        // destination has one 16-byte element for each 12 source bytes.
         unsafe {
-            let source = shadow.data.add(start - shadow.start as usize);
             for i in first..last {
-                let at = source.add(i * 12);
+                let at = source.add((i - first) * 12);
                 let to = self.data.add(i * 16);
                 std::ptr::copy_nonoverlapping(at, to, 12);
                 to.add(12).cast::<u32>().write_volatile(self.w);
@@ -305,6 +319,16 @@ impl Shadow {
     pub(crate) fn peek(&self, address: u64, len: u64) -> String {
         let at = address.saturating_sub(self.start) as usize;
         let n = (len.min(64) as usize).min((self.len as usize).saturating_sub(at)) / 4;
+        if self.tiles.get().is_some() {
+            let mut values = [0.0f32; 16];
+            crate::host::copy_mapped(
+                values.as_mut_ptr().cast(),
+                self.data.wrapping_add(at),
+                n * 4,
+                false,
+            );
+            return format!("copy {:#x}+{:#x} {:?}", self.start, self.len, &values[..n]);
+        }
         // SAFETY: inside the mapping (checked); a racing GPU write only makes
         // the logged value stale.
         let v = unsafe { std::slice::from_raw_parts(self.data.add(at).cast::<f32>(), n) };
@@ -501,6 +525,8 @@ impl Shadow {
             base: slice.map_or(0, |s| s.offset),
             slice,
             aliased: false,
+            #[cfg(feature = "diagnostics")]
+            tiles: Default::default(),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -534,6 +560,8 @@ impl Shadow {
             base: 0,
             slice: None,
             aliased: true,
+            #[cfg(feature = "diagnostics")]
+            tiles: Default::default(),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -1699,6 +1727,23 @@ fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
+        #[cfg(feature = "diagnostics")]
+        if let Some(tiles) = crate::physical::ReservedBuffer::new(key.0 as usize, len as usize) {
+            // SAFETY: the reserved buffer retains the same GPU address
+            // across page mappings and outlives the shadow.
+            let gpu = unsafe { tiles.resource.GetGPUVirtualAddress() };
+            let shadow = Shadow::new_aliased(
+                tiles.resource.clone(),
+                key.0 as *mut u8,
+                gpu,
+                key.0,
+                len,
+            );
+            let _ = shadow.tiles.set(tiles);
+            entry.shadow = Some(shadow.clone());
+            changed();
+            return Some(shadow);
+        }
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
         let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
