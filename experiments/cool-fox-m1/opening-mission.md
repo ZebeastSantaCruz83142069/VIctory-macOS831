@@ -12,3 +12,13 @@ This trace disabled deferred list recording and asynchronous submission preparat
 | 4295 | The HUD was absent and the image returned to the same 0–1 range throughout. |
 
 The player reported an entirely black window during the HUD check. A visible pause menu, response to camera input and sustained gameplay frame rate remain unverified. The data support tracing the 1280×720 color target through lighting and post-processing. An end-of-frame target snapshot cannot identify the first draw that lost the color or establish what a later pass sampled earlier in the same frame.
+
+## Lighting and presentation follow-up
+
+The HDR target at 1280×720 and the two RGBA16_FLOAT targets at 1920×1080 contained zero positive finite RGB values at the end of frames 4273 and 4277. At frame 4301, the 640×360 scene radiance cache had color in the sky and silhouetted geometry. The submitted image outside the HUD still had RGB values of 0 or 1. The original display was closed after this capture.
+
+A separate run kept serial submission, selected `VICTORY_AMBIENT=constant:0.8` and disabled the full render-target dump. The ambient shader confirmed the constant on the GPU path. The sixth captured scene frame still showed RGB 0–1 outside the HUD.
+
+An optional third patch, `source-radiance-experiment.patch`, adds `VICTORY_PRESENT_SCENE_COLOR=1`. It copies the title's shaded 640×360 scene radiance on the GPU when the title runs its radiance pass. After the producing list completes, the compositor can draw the recent color under the title's existing interface. The normal path is the default. This omits later title effects and the native upscaler.
+
+The source-built executable had SHA-256 `7ffa46bd3309882bc8438fe8fa0b026f89afd29a2dc4261e49a5c9c5d2478b4b`. The compositor selected the completed image at frame 3657. Frames 3657 and 3658 contained faint distant lights. Frame 3662 remained too dark to navigate. Across six reporting windows with at least 100 draws per frame, median frame time was 7.58 seconds, including 6.77 seconds of copying and 12,247 MB copied per frame. The test was stopped under host disk pressure before player control could be verified. This experiment is unsuitable as a default graphics path.

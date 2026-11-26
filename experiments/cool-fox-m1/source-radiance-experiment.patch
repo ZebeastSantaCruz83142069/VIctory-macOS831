@@ -1,0 +1,163 @@
+diff --git a/crates/victory-gpu/src/compose.rs b/crates/victory-gpu/src/compose.rs
+index be473764dffb3b4ccfd0cf1da7fb448f0cb0a99c..2168f87b409464c9134970bae70b09632fda99d1 100644
+--- a/crates/victory-gpu/src/compose.rs
++++ b/crates/victory-gpu/src/compose.rs
+@@ -10,6 +10,30 @@ use windows::core::{PCSTR, s};
+ 
+ use crate::host::Host;
+ 
++/// Optional presentation of the game's own scene radiance before post-processing.
++/// Hold only completed captures. A menu or a movie ages the last scene out.
++static SCENE_COLOR: std::sync::Mutex<Option<(u64, ID3D12Resource)>> = std::sync::Mutex::new(None);
++
++pub(crate) fn scene_color_enabled() -> bool {
++    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_PRESENT_SCENE_COLOR").is_some_and(|v| v == "1"))
++}
++
++pub(crate) fn finish_scene_color(texture: ID3D12Resource) {
++    let mut scene = SCENE_COLOR.lock().unwrap_or_else(|e| e.into_inner());
++    *scene = Some((crate::queue::presented(), texture));
++}
++
++pub(crate) fn scene_color(frame: u64) -> Option<ID3D12Resource> {
++    let mut scene = SCENE_COLOR.lock().unwrap_or_else(|e| e.into_inner());
++    let (captured, texture) = scene.as_ref()?;
++    if frame.abs_diff(*captured) <= 2 {
++        return Some(texture.clone());
++    }
++    *scene = None;
++    None
++}
++
+ const SOURCE: &str = r#"
+ Texture2D<float4> scene : register(t0);
+ Texture2D<float4> over : register(t1);
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index e05304c85d76f70cf761dec3e2966ca6108c2107..a76c8ff58d3a70923bc09d9ba83aeea30e48076b 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -3157,6 +3157,17 @@ impl State {
+         unsafe { list.list.Dispatch(x, y, z) };
+         self.buffers_written();
+         DISPATCHED.fetch_add(1, Ordering::Relaxed);
++        if crate::compose::scene_color_enabled()
++            && p.stages.first().and_then(|s| s.shader.ambient) == Some(crate::ambient::Role::Radiance)
++        {
++            let (slot, offset) = crate::ambient::RADIANCE;
++            if let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot))
++                && let Some(View::Unordered(resource, ..)) = crate::descriptor::view(table + u64::from(offset) * 4)
++                && let Some(source) = crate::resource::host_copy(resource as This)
++            {
++                list.copy_scene_color(&source);
++            }
++        }
+         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+             && crate::ambient::on()
+             && self.ambient(list, p, role)
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 3e1ba92d00b9b4706c93cdb578c1acd523831124..34dfac19f42e228cf7d767e102f85da922544e38 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -2160,6 +2160,7 @@ enum Step {
+ /// the upload buffers its GPU commands read, kept until the list is reset.
+ #[derive(Default)]
+ struct Deferred {
++    scene_color: Option<ID3D12Resource>,
+     /// Destination, source, bytes.
+     copies: Vec<Step>,
+     uploads: Vec<ID3D12Resource>,
+@@ -3757,6 +3758,11 @@ pub(crate) fn walls_trace() -> bool {
+ /// without it, so the title read a buffer nobody wrote, as before read-backs
+ /// were made (the exposure metering's two small float targets, every frame).
+ fn read_backs(list: &HostList) {
++    if crate::compose::scene_color_enabled()
++        && let Some(texture) = list.deferred().scene_color.clone()
++    {
++        crate::compose::finish_scene_color(texture);
++    }
+     // Textures shaders wrote that the title reads on the CPU
+     // ([`crate::texback`]).
+     for back in &list.deferred().texture_backs {
+@@ -6680,7 +6686,8 @@ impl HostList {
+                 && deferred.textures.is_empty()
+                 && deferred.writes.is_empty()
+                 && deferred.backs.is_empty()
+-                && deferred.texture_backs.is_empty())
++                && deferred.texture_backs.is_empty()
++                && deferred.scene_color.is_none())
+             {
+                 return false;
+             }
+@@ -7128,6 +7135,44 @@ impl HostList {
+         self.deferred().indirect_readable = scratch.as_raw() as usize;
+     }
+ 
++    /// Snapshot the shaded scene on the producing command list, after the title's
++    /// radiance dispatch. The presenter only receives it when this list finishes.
++    pub(crate) fn copy_scene_color(&self, source: &crate::resource::HostTexture) {
++        let Some(host) = host() else { return };
++        // SAFETY: the source is a live texture retained by this command list.
++        let mut desc = unsafe { source.texture.GetDesc() };
++        if desc.Format != DXGI_FORMAT_R11G11B10_FLOAT || desc.MipLevels != 1
++            || desc.DepthOrArraySize != 1 || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1
++        {
++            return;
++        }
++        desc.Flags = D3D12_RESOURCE_FLAG_NONE;
++        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
++        desc.Alignment = 0;
++        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, CreationNodeMask: 1, VisibleNodeMask: 1, ..Default::default() };
++        let mut copy: Option<ID3D12Resource> = None;
++        // SAFETY: matching texture shape and format. Restore the title texture's
++        // tracked state, and retain both resources until GPU completion.
++        unsafe {
++            if host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut copy).is_err() {
++                return;
++            }
++            let Some(copy) = copy else { return };
++            let state = D3D12_RESOURCE_STATES(source.state.load(Ordering::Relaxed) as i32);
++            if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
++                self.list.ResourceBarrier(&[transition(&source.texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
++            }
++            self.list.CopyResource(&copy, &source.texture);
++            self.list.ResourceBarrier(&[transition(&copy, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)]);
++            if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
++                self.list.ResourceBarrier(&[transition(&source.texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state)]);
++            }
++            self.keep(&source.texture);
++            self.keep(&copy);
++            self.deferred().scene_color = Some(copy);
++        }
++    }
++
+     /// Keeps `object` alive until the list is reset.
+     pub(crate) fn keep(&self, object: &impl Interface) {
+         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
+@@ -9001,7 +9046,17 @@ impl Host {
+             copy.reset();
+             copy.keep(texture);
+             let list = &copy.list;
++            let submitted_base = texture;
+             let composed = if let Some((over, over_state, base_fmt, over_fmt)) = planes {
++                let early = crate::compose::scene_color_enabled().then(|| crate::compose::scene_color(frame)).flatten();
++                let (texture, state, base_fmt) = if let Some(ref scene) = early {
++                    static LOGGED: std::sync::Once = std::sync::Once::new();
++                    LOGGED.call_once(|| tracing::info!(frame, "presenting the title's completed scene radiance under its UI"));
++                    copy.keep(scene);
++                    (scene, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, DXGI_FORMAT_R11G11B10_FLOAT)
++                } else {
++                    (texture, state, base_fmt)
++                };
+                 copy.keep(over);
+                 if let Some(composer) = p.composer.as_mut() {
+                     let mut pre = Vec::with_capacity(3);
+@@ -9026,7 +9081,7 @@ impl Host {
+                         drop(back);
+                         drop(presenter);
+                         tracing::warn!(%err, "could not record display composite; presenting the base plane");
+-                        return self.present_planes(texture, state_u32, None, frame);
++                        return self.present_planes(submitted_base, state_u32, None, frame);
+                     }
+                     static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                     if !ONCE.swap(true, Ordering::Relaxed) {
