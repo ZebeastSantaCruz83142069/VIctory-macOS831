@@ -315,10 +315,27 @@ fn supported() -> Option<bool> {
 #[cfg(any(test, feature = "diagnostics"))]
 pub struct PhysicalHeap {
     backing: ID3D12Resource,
-    // A placed buffer must keep its heap alive.
-    pub(crate) _heap: ID3D12Heap,
+    pub(crate) heap: ID3D12Heap,
     address: usize,
     len: usize,
+}
+
+#[cfg(any(test, feature = "diagnostics"))]
+pub(crate) fn physical_buffer_desc(len: usize, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
+    D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: len as u64,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: flags,
+        ..Default::default()
+    }
 }
 
 #[cfg(any(test, feature = "diagnostics"))]
@@ -336,19 +353,7 @@ impl PhysicalHeap {
             Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
             ..Default::default()
         };
-        let buffer = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: len as u64,
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            ..Default::default()
-        };
+        let buffer = physical_buffer_desc(len, D3D12_RESOURCE_FLAG_NONE);
         let mut heap = None;
         let mut backing = None;
         let mut address = std::ptr::null_mut();
@@ -373,7 +378,7 @@ impl PhysicalHeap {
         }
         Ok(Self {
             backing,
-            _heap: heap,
+            heap,
             address: address as usize,
             len,
         })
@@ -419,24 +424,24 @@ impl Drop for PhysicalHeap {
     }
 }
 
+#[cfg(feature = "diagnostics")]
+pub(crate) fn physical_heaps_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        crate::switch::on("VICTORY_PHYSICAL_TILES")
+            && !crate::watch::fault_tracking()
+            && supported().is_some()
+    })
+}
+
 /// Allocates CPU-visible physical tiles for the Rosetta diagnostics trial.
 #[cfg(feature = "diagnostics")]
-pub fn physical_heap(len: usize) -> Option<PhysicalHeap> {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    if !*ENABLED.get_or_init(|| crate::switch::on("VICTORY_PHYSICAL_TILES") && supported().is_some())
-        || len == 0
-        || !len.is_multiple_of(PAGE)
-    {
-        return None;
+pub fn physical_heap(len: usize) -> windows::core::Result<Option<std::sync::Arc<PhysicalHeap>>> {
+    if !physical_heaps_enabled() {
+        return Ok(None);
     }
-    let host = host()?;
-    match PhysicalHeap::new(&host.device, len) {
-        Ok(heap) => Some(heap),
-        Err(error) => {
-            tracing::warn!(len, %error, "physical tile heap unavailable; using a file section");
-            None
-        }
-    }
+    let host = host().ok_or_else(windows::core::Error::empty)?;
+    PhysicalHeap::new(&host.device, len).map(|heap| Some(std::sync::Arc::new(heap)))
 }
 
 /// Aliases `[base, base + len)` onto a new write-back L0 D3D12 buffer so CPU

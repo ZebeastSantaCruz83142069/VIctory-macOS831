@@ -96,8 +96,7 @@ pub(crate) enum C {
     MarkedUs,
     MarkedKept,
     SavedPages,
-    /// Title copies into memory shown at two addresses, which make every
-    /// range of the submission due again.
+    /// Title copies into memory also visible at other addresses.
     AliasedCopies,
     /// Preparing submissions: descriptors the title copied into its heaps
     /// as bytes, made on the host first.

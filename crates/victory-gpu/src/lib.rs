@@ -69,6 +69,8 @@ mod sampler;
 pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod physical;
 pub mod signature;
 mod switch;
 #[cfg(windows)]
@@ -93,6 +95,8 @@ pub use host::use_mapped_reader;
 pub use alias::{alias_region, enabled as alias_buffers, unalias_region};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use alias::{PhysicalHeap, physical_heap};
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use physical::{PhysicalTiles, physical_layout_changed, use_physical_layout};
 #[cfg(windows)]
 pub use host::{MeshSupport, host_mesh_support, on_failure};
 #[cfg(windows)]

@@ -817,7 +817,7 @@ fn inplace_probe_6_remap_cpu_visible_tiles() {
                 1,
                 Some(&start),
                 Some(&size),
-                &backing._heap,
+                &backing.heap,
                 TILES as u32,
                 Some(flags.as_ptr()),
                 Some(offsets.as_ptr()),
@@ -909,4 +909,67 @@ fn inplace_probe_6_remap_cpu_visible_tiles() {
             assert!(tile.iter().all(|&byte| byte == 0x43), "GPU after guest unmap");
         }
     }
+}
+
+#[cfg(feature = "diagnostics")]
+#[test]
+#[ignore = "hardware probe: requires D3D12 tiled buffers"]
+fn reserved_xmem_shadow_rebinds_for_a_recorded_list() {
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    const BASE: usize = 0x1_9460_0000;
+    const BYTES: usize = 4 * K64;
+    static HEAP: OnceLock<Arc<crate::alias::PhysicalHeap>> = OnceLock::new();
+    static ORDER: Mutex<[Option<u32>; 4]> = Mutex::new([Some(0), Some(1), Some(2), Some(3)]);
+    let host = crate::host::host().expect("D3D12 host");
+    let rig = Rig::new(&host.device).unwrap();
+    let heap = HEAP.get_or_init(|| Arc::new(crate::alias::PhysicalHeap::new(&host.device, BYTES).unwrap()));
+    crate::physical::use_physical_layout(|base, len| {
+        if (base, len) != (BASE, BYTES) {
+            return None;
+        }
+        Some(ORDER.lock().unwrap().iter().enumerate().filter_map(|(first, &tile)| {
+            Some(crate::physical::PhysicalTiles {
+                first: first as u32,
+                count: 1,
+                heap_tile: tile?,
+                heap: HEAP.get().unwrap().clone(),
+            })
+        }).collect())
+    });
+    for (tile, value) in [0x11, 0x22, 0x33, 0x44].into_iter().enumerate() {
+        // SAFETY: each tile is inside the CPU view and idle.
+        unsafe { (heap.cpu_address() as *mut u8).add(tile * K64).write_bytes(value, K64) };
+    }
+    crate::shadow::register(BASE, BASE as u64, BYTES as u64);
+    let shadow = crate::shadow::find(BASE as u64, BYTES as u64).unwrap();
+    assert!(shadow.is_aliased());
+    let readback = rig.committed(
+        D3D12_HEAP_TYPE_READBACK,
+        BYTES as u64,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+    ).unwrap();
+    let list = host.new_list().unwrap();
+    // SAFETY: the list is open and both buffers are held across submissions.
+    unsafe { list.list.CopyBufferRegion(&readback, 0, &shadow.buffer, 0, BYTES as u64) };
+    list.close();
+    let mut data = std::ptr::null_mut();
+    // SAFETY: the readback buffer is live, and only read after a completed submission.
+    unsafe { readback.Map(0, None, Some(&mut data)).unwrap() };
+    for (order, expected) in [
+        ([Some(0), Some(1), Some(2), Some(3)], [0x11, 0x22, 0x33, 0x44]),
+        ([Some(2), Some(0), None, Some(1)], [0x33, 0x11, 0x00, 0x22]),
+    ] {
+        *ORDER.lock().unwrap() = order;
+        crate::physical::physical_layout_changed();
+        host.execute(&[&list]);
+        // SAFETY: the completed submission wrote precisely these bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), BYTES) };
+        for (tile, value) in bytes.as_chunks::<K64>().0.iter().zip(expected) {
+            assert!(tile.iter().all(|&byte| byte == value), "tile value {value:#x}");
+        }
+    }
+    // SAFETY: this test previously mapped the readback buffer.
+    unsafe { readback.Unmap(0, None) };
+    crate::shadow::unregister(BASE, BASE as u64);
 }
