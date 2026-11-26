@@ -48,3 +48,19 @@ The same display run later submitted a skyline with visible windows on frame 282
 Between 11:25:04 and 11:32:20 UTC, 46 renderer reports had a median of 9,900 buffer refresh entries per frame. The renderer classified zero entries as safe to skip in all 46 reports. Median time spent refreshing was 6.94 seconds per frame, with the submitting thread working while the GPU queue was empty for 6.89 seconds. Median estimated GPU occupancy in these reports was 13%.
 
 The comparison enabled `VICTORY_BVH_BUILDER=1` on the same executable and copied the save directory before launch. All 53 of the title’s builder pipelines were available, and the renderer entered the builder path at 11:38:22 UTC. Frame 4307 was entirely black. This run then exited with an unhandled guest access violation before producing its next scheduled scene capture. The single heavy reporting window is insufficient to compare frame rates. The user’s original save directory was used again when restoring the previous graphics configuration.
+
+## Aligned renderer copies under CrossOver
+
+The restored scene showed lit windows and a vehicle silhouette at frame 6039. Frame 6079 showed legible intro credits over a white sky and a mostly black foreground. In the restored run's first 20 reporting windows with at least 100 draws per frame, the median frame took 7,864.75 ms, including 6,705.0 ms preparing copies. One 174 MiB mapped buffer accounted for a median of 23 whole-buffer copies per frame (4,196.4 MB), timed at 1,566.94 ms. The broader refresh counter also includes requests whose busy portions can be skipped. Its byte count should be interpreted as the length requested.
+
+After the other three patches, apply `source-vector-copy.patch` and set `VICTORY_VECTOR_COPY=1` to test the aligned SSE2 path on Rosetta. The default remains the forward byte-copy path. This experiment keeps that path for short copies, unaligned addresses and forward overlap with the destination inside the source. Each aligned vector access stays within a 4 KiB page. It uses the renderer's existing fault handling. The source tree after all four patches is `2189f030780b43a461d73ed1cfbce4ef37e60221`. The release-optimized diagnostic executable (debug symbols disabled) has SHA-256 `ef82e8232637160502115c881732aa6783310a21a8f9611c9c8cf92ecde5d786`.
+
+The same test executable passed the renderer's alignment, missing-page, sparse remap and two GPU compositor checks with the setting off and on. Two added tests cover forward overlap and tails, and the exact copied prefix at an inaccessible source or destination page. The full memory-helper suite stopped in an existing masked-merge test with a Rosetta instruction error while vector copying was disabled. That test exercises a separate assembly routine. The passing results above are for the individually selected tests.
+
+The existing D3D12 shared-buffer benchmark measured the following microseconds per copy on M1 Max. Its timer reports the best of five passes at each size. The column printed as `rep movsb` in its original output calls the selected renderer routine in both cases.
+
+| Bytes per copy | Vector option off | Vector option on |
+| ---: | ---: | ---: |
+| 256 | 0.16 | 0.02 |
+| 4,096 | 1.86 | 0.40 |
+| 65,536 | 25.04 | 3.31 |
