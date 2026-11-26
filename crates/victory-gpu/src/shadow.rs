@@ -824,12 +824,13 @@ impl Shadow {
             return 0;
         };
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        // What goes back (address, bytes), and the pages equal to title
+        // What goes back (address ranges), and the pages equal to title
         // memory once it has: written, then guarded, all at once (each
         // opening and guarding is a Wine call and a guard-lock round trip,
         // ~1,000 pages a frame in #50's world).
-        let mut writes: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut writes: crate::watch::Runs = Vec::new();
         let mut taken = Vec::new();
+        let mut title = Vec::new();
         for &page in pages {
             let (from, to) = (page.max(start), (page + PAGE).min(end));
             if from >= to {
@@ -846,27 +847,24 @@ impl Shadow {
             let n = to - from;
             // SAFETY: inside the mapping; only the submitting thread writes it.
             let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
-            let mut title = vec![0u8; n];
+            title.resize(n, 0);
             if !crate::host::read_into(from as *const u8, &mut title) {
                 continue;
             }
             let differs = match &saved {
                 // The title's bytes are the copy's from before: what differs
                 // is the shaders'.
-                None => {
-                    let differs = *host != title[..];
-                    if differs {
-                        title.copy_from_slice(host);
-                    }
-                    differs
-                }
+                None => *host != title[..],
                 Some(before) => {
                     let before = &before[from - page..to - page];
                     merge_writeback(&mut title, host, before)
                 }
             };
             if differs {
-                writes.push((from, title));
+                match writes.last_mut() {
+                    Some((_, end)) if *end == from => *end = to,
+                    _ => writes.push((from, to)),
+                }
             }
             if self.has_widened.load(Ordering::Acquire) {
                 self.refresh_widened(from, to);
@@ -877,22 +875,14 @@ impl Shadow {
             }
         }
         let mut written = 0;
-        {
-            // Consecutive writes share one opening.
-            let mut i = 0;
-            while i < writes.len() {
-                let mut j = i + 1;
-                while j < writes.len() && writes[j].0 == writes[j - 1].0 + writes[j - 1].1.len() {
-                    j += 1;
-                }
-                let (from, to) = (writes[i].0, writes[j - 1].0 + writes[j - 1].1.len());
-                let _writing = crate::watch::writing(from, to - from);
-                for (at, bytes) in &writes[i..j] {
-                    crate::host::write_mapped(*at as *mut u8, bytes.as_ptr(), bytes.len());
-                    written += bytes.len();
-                }
-                i = j;
-            }
+        for (from, to) in writes {
+            let len = to - from;
+            let _writing = crate::watch::writing(from, len);
+            // SAFETY: this run is inside the shadow. The GPU is done and
+            // widened_source keeps the merged bytes stable until the write.
+            let src = unsafe { self.data.add(from - start) };
+            crate::host::write_mapped(from as *mut u8, src, len);
+            written += len;
         }
         if !taken.is_empty() {
             t.taken(&taken);
@@ -2543,6 +2533,43 @@ pub(crate) mod tests {
         drop(quiet);
         assert_eq!(copy.copy_back(p, len), 0, "nothing kept to compare");
         unregister(p, p as u64);
+    }
+
+    #[test]
+    fn marked_writeback_copies_adjacent_pages_and_keeps_gaps_and_edges() {
+        let Some(host) = host() else {
+            return;
+        };
+        let base = crate::watch::tests::pool(4);
+        let start = base + 32;
+        let end = base + 4 * PAGE - 32;
+        let len = end - start;
+        let (buffer, data) = host.shared_buffer(len as u64).unwrap();
+        // SAFETY: a live D3D12 buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let copy = Shadow::new(buffer, data, gpu, start as u64, len as u64);
+        assert!(copy.marked(), "the title allocation is tracked");
+        // SAFETY: a private allocation of four pages, untouched by the GPU.
+        unsafe { (base as *mut u8).write_bytes(0x11, 4 * PAGE) };
+        copy.update(start, len);
+        let changed = [(start, 0xaa), (base + PAGE, 0xbb), (end - 1, 0xcc)];
+        for (at, byte) in changed {
+            copy.write_host(at as u64, &[byte]);
+        }
+
+        let pages = [base, base + PAGE, base + 2 * PAGE, base + 3 * PAGE];
+        assert_eq!(copy.copy_back_marked(&pages), len - PAGE);
+        // SAFETY: all sampled addresses lie inside our allocation.
+        let read = |at: usize| unsafe { (at as *const u8).read_volatile() };
+        for (at, byte) in changed {
+            assert_eq!(read(at), byte);
+        }
+        for at in [start - 1, base + 2 * PAGE, end] {
+            assert_eq!(read(at), 0x11);
+        }
+        assert_eq!(copy.copy_back_marked(&pages), 0);
+        drop(copy);
+        crate::watch::tests::free(base);
     }
 
     /// Marks of shaders using title memory stay out of title memory while
