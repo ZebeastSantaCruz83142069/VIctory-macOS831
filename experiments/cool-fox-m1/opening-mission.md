@@ -136,7 +136,10 @@ The first full-resolution launch exited during title startup before recording a 
 | 3240 | 1 | 518,400 | 259,200 | 0 |
 | 3244 | 5 | 3,723 | 167 | 0 |
 | 3259 | 20 | 9,757 | 414 | 36 |
+| 3299 | 60 | 260,946 | 29,999 | 36,397 |
 
 Frame 3239 was black and frame 3240 showed the dark loading background. Frame 3244 showed lit building windows on a dark street. Frame 3259 showed additional buildings with distinct purple, yellow and green lights. Most of the street foreground was still black. In frame 3259 only 414 of 259,200 lower-half pixels (0.16%) reached 8/255 luminance.
 
 Across the first 20 reports with at least 100 draws per frame, median frame time was 6,066.75 ms (0.165 FPS), GPU time was 865.95 ms, and copy preparation took 4,661.4 ms for 15,569.1 MB per frame. These are timings from the diagnostic run. The image now shows a city before atmosphere, with incomplete foreground lighting. Player control and real-time gameplay remain unverified.
+
+At frame 3299, sixty presented frames into the scene, the window showed a blue-purple sky, a line of trees and legible pink opening credits. The ground away from the credits remained almost black. In the lower-right 640×270 area of the 960×540 readback, 660 of 172,800 pixels reached 8/255 luminance. The person at the Mac reported still being in the intro or that it was too dark to judge the opposite camera inputs. The full-resolution run was left open.
