@@ -90,7 +90,7 @@ mod inplace_probe;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use copystat::CountingAlloc;
 #[cfg(all(windows, feature = "diagnostics"))]
-pub use host::use_mapped_reader;
+pub use host::{PhysicalRead, use_mapped_reader};
 #[cfg(windows)]
 pub use alias::{alias_region, enabled as alias_buffers, unalias_region};
 #[cfg(all(windows, feature = "diagnostics"))]

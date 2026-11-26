@@ -466,34 +466,44 @@ impl Drop for Section {
     }
 }
 
-/// Copies the prefix of a GPU refresh covered by one physical view. The
-/// section's CPU view stays alive through the copy even if the title
-/// unmaps its view. Returns zero if the refresh starts outside a view.
-#[cfg(any(test, feature = "diagnostics"))]
-pub(crate) fn read_physical_view(at: usize, dst: &mut [u8]) -> usize {
+/// Copies the prefix covered by one physical view, or identifies a hole
+/// inside an XMem reservation. The section stays alive through the copy.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn read_physical_view(at: usize, dst: &mut [u8]) -> victory_gpu::PhysicalRead {
+    use victory_gpu::PhysicalRead;
+
     if !on_wine() {
-        return 0;
+        return PhysicalRead::Unknown;
     }
     let (section, offset, len) = {
         let physical = physical();
-        let Some((&base, (size, slice))) = physical.views.range(..=at).next_back() else {
-            return 0;
-        };
-        let offset = at - base;
-        if offset >= *size {
-            return 0;
+        if let Some((&base, (size, slice))) = physical.views.range(..=at).next_back()
+            && at - base < *size
+        {
+            let offset = at - base;
+            (slice.section.clone(), slice.index * PAGE + offset, dst.len().min(size - offset))
+        } else {
+            let Some(end) = physical
+                .reservations
+                .range(..=at)
+                .next_back()
+                .and_then(|(_, &(end, _))| (at < end).then_some(end))
+            else {
+                return PhysicalRead::Unknown;
+            };
+            let next = physical.views.range(at..end).next().map_or(end, |(&at, _)| at);
+            return PhysicalRead::Unmapped(dst.len().min(next - at));
         }
-        (slice.section.clone(), slice.index * PAGE + offset, dst.len().min(size - offset))
     };
     let Some(whole) = section.whole() else {
-        return 0;
+        return PhysicalRead::Unknown;
     };
     // SAFETY: these bytes are in the section's committed view. Holding
     // the section keeps it mapped, and the destination is ours alone.
     unsafe {
         std::ptr::copy_nonoverlapping((whole + offset) as *const u8, dst.as_mut_ptr(), len)
     };
-    len
+    PhysicalRead::Copied(len)
 }
 
 /// Where a page lives, or what a view starts with: a section and a page
@@ -1616,15 +1626,28 @@ mod tests {
         assert!(write_physical(&pages[2..], 1, &[9]));
         // SAFETY: mapped read-write.
         assert_eq!(unsafe { at(b, 1).cast::<u8>().add(1).read() }, 9);
+        #[cfg(feature = "diagnostics")]
         if on_wine() {
+            use victory_gpu::PhysicalRead;
+
             let mut bytes = [0xCC; 2];
-            assert_eq!(read_physical_view(at(b, 1) as usize, &mut bytes), 2);
+            assert_eq!(read_physical_view(at(b, 1) as usize, &mut bytes), PhysicalRead::Copied(2));
             assert_eq!(bytes, [7, 9], "the view starts on the third section page");
             // SAFETY: the byte just before this hole is in the mapped view.
             unsafe { at(b, 2).cast::<u8>().sub(1).write(0xE5) };
-            assert_eq!(read_physical_view(at(b, 2) as usize - 1, &mut bytes), 1);
+            assert_eq!(
+                read_physical_view(at(b, 2) as usize - 1, &mut bytes),
+                PhysicalRead::Copied(1)
+            );
             assert_eq!(bytes, [0xE5, 9], "the prefix stops at the hole");
-            assert_eq!(read_physical_view(at(b, 2) as usize, &mut bytes), 0);
+            let tail = read_physical_view(at(b, 2) as usize, &mut bytes);
+            if victory_gpu::sparse_physical_buffers() {
+                assert_eq!(tail, PhysicalRead::Unmapped(2));
+                let mut across = vec![0xCC; PAGE + 2];
+                assert_eq!(read_physical_view(b as usize, &mut across), PhysicalRead::Unmapped(PAGE));
+            } else {
+                assert_eq!(tail, PhysicalRead::Unknown);
+            }
         }
 
         // Unmapping the middle page keeps its neighbours.
@@ -1703,6 +1726,10 @@ mod tests {
         let ordinary = unsafe { VirtualAlloc(a, 3 * PAGE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
         assert_eq!(ordinary, a);
         assert!(physical_layout(a as usize, PAGE).unwrap().reservation.is_none());
+        assert_eq!(
+            read_physical_view(a as usize, &mut [0; 4]),
+            victory_gpu::PhysicalRead::Unknown
+        );
         assert_ne!(free_virtual_memory(a, 0, MEM_RELEASE), 0);
     }
 
