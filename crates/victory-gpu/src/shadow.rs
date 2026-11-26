@@ -1402,8 +1402,17 @@ pub(crate) fn generation() -> u64 {
     GENERATION.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Epoch for [`find`]'s per-thread lookup cache; bumped on every change to
+/// `BUFFERS`, `ALIASED`, or `LOOSE` (while holding that table's write lock).
+static LOOKUP_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+fn lookup_changed() {
+    LOOKUP_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
 fn changed() {
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+    lookup_changed();
 }
 
 /// The longest title buffer registered so far (it stays after the buffer is
@@ -1422,12 +1431,18 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
             shadow: None,
         },
     );
+    lookup_changed();
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    if buffers().remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
-        changed();
+    let mut map = buffers();
+    if let Some(entry) = map.remove(&(start, resource)) {
+        if entry.shadow.is_some() {
+            changed();
+        } else {
+            lookup_changed();
+        }
     }
 }
 
@@ -1455,8 +1470,12 @@ fn enclosing(map: &BTreeMap<(u64, usize), Entry>, span: u64, address: u64, end: 
 /// Zero-copy title regions aliased onto host buffers (`crate::alias`), by start address.
 static ALIASED: RwLock<BTreeMap<u64, Arc<Shadow>>> = RwLock::new(BTreeMap::new());
 static ALIASED_SPAN: AtomicU64 = AtomicU64::new(0);
+static ALIASED_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub(crate) fn has_aliased_overlap(start: u64, end: u64) -> bool {
+    if ALIASED_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
     let map = ALIASED.read().unwrap_or_else(|e| e.into_inner());
     let span = ALIASED_SPAN.load(Ordering::Relaxed);
     let lowest = start.saturating_sub(span);
@@ -1472,26 +1491,27 @@ pub(crate) fn has_aliased_overlap(start: u64, end: u64) -> bool {
 
 pub(crate) fn register_aliased(shadow: Arc<Shadow>) {
     ALIASED_SPAN.fetch_max(shadow.len, Ordering::Relaxed);
-    ALIASED
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(shadow.start, shadow);
+    let mut map = ALIASED.write().unwrap_or_else(|e| e.into_inner());
+    if map.insert(shadow.start, shadow).is_none() {
+        ALIASED_COUNT.fetch_add(1, Ordering::Release);
+    }
     changed();
 }
 
 pub(crate) fn unregister_aliased(start: u64) -> bool {
-    let removed = ALIASED
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&start)
-        .is_some();
+    let mut map = ALIASED.write().unwrap_or_else(|e| e.into_inner());
+    let removed = map.remove(&start).is_some();
     if removed {
+        ALIASED_COUNT.fetch_sub(1, Ordering::Release);
         changed();
     }
     removed
 }
 
 fn find_aliased(address: u64, end: u64) -> Option<Arc<Shadow>> {
+    if ALIASED_COUNT.load(Ordering::Acquire) == 0 {
+        return None;
+    }
     let map = ALIASED.read().unwrap_or_else(|e| e.into_inner());
     if map.is_empty() {
         return None;
@@ -1507,10 +1527,156 @@ fn find_aliased(address: u64, end: u64) -> Option<Arc<Shadow>> {
         .map(|(_, s)| s.clone())
 }
 
+/// Number of sets in the per-thread 2-way lookup cache (power of two).
+const LOOKUP_SETS: usize = 2048;
+
+#[derive(Default)]
+struct LookupSlot {
+    address: u64,
+    end: u64,
+    shadow: std::sync::Weak<Shadow>,
+}
+
+struct LookupCache {
+    epoch: u64,
+    dirty: bool,
+    slots: Box<[[LookupSlot; 2]]>,
+}
+
+impl LookupCache {
+    fn new(epoch: u64) -> Self {
+        let slots = std::iter::repeat_with(|| [LookupSlot::default(), LookupSlot::default()])
+            .take(LOOKUP_SETS)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            epoch,
+            dirty: false,
+            slots,
+        }
+    }
+
+    fn clear_if_stale(&mut self, epoch: u64) {
+        if self.epoch != epoch {
+            if self.dirty {
+                for pair in &mut self.slots {
+                    *pair = [LookupSlot::default(), LookupSlot::default()];
+                }
+                self.dirty = false;
+            }
+            self.epoch = epoch;
+        }
+    }
+
+    fn get(&mut self, epoch: u64, address: u64, end: u64) -> Option<Arc<Shadow>> {
+        if self.epoch != epoch {
+            self.clear_if_stale(epoch);
+            return None;
+        }
+        let pair = &mut self.slots[lookup_set(address, end)];
+        for way in 0..2 {
+            if pair[way].address == address && pair[way].end == end {
+                if let Some(shadow) = pair[way].shadow.upgrade() {
+                    if way == 1 {
+                        pair.swap(0, 1);
+                    }
+                    return Some(shadow);
+                }
+                pair[way] = LookupSlot::default();
+            }
+        }
+        None
+    }
+
+    fn insert(&mut self, epoch: u64, address: u64, end: u64, shadow: &Arc<Shadow>) {
+        self.clear_if_stale(epoch);
+        let pair = &mut self.slots[lookup_set(address, end)];
+        let entry = LookupSlot {
+            address,
+            end,
+            shadow: Arc::downgrade(shadow),
+        };
+        if pair[0].address == address && pair[0].end == end {
+            pair[0] = entry;
+        } else {
+            pair[1] = std::mem::replace(&mut pair[0], entry);
+        }
+        self.dirty = true;
+    }
+}
+
+fn lookup_set(address: u64, end: u64) -> usize {
+    let mut h = address ^ end.rotate_left(29);
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^= h >> 31;
+    (h as usize) & (LOOKUP_SETS - 1)
+}
+
+fn lookup_cache_enabled_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("0"))
+}
+
+fn lookup_cache_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| lookup_cache_enabled_value(std::env::var_os("VICTORY_LOOKUP_CACHE").as_deref()))
+}
+
+std::thread_local! {
+    static LOOKUP_CACHE: std::cell::RefCell<Option<LookupCache>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Hits and misses of [`find`]'s per-thread lookup cache (diagnostics).
+#[cfg(feature = "diagnostics")]
+static LOOKUP_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Logs [`LOOKUP_STATS`] per frame over `frames`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_lookups(frames: f64) {
+    let hits = LOOKUP_STATS[0].swap(0, Ordering::Relaxed);
+    let misses = LOOKUP_STATS[1].swap(0, Ordering::Relaxed);
+    let total = hits + misses;
+    if total > 0 {
+        tracing::info!(
+            "shadow lookup cache: {:.0} hits/frame, {:.0} misses/frame ({:.1}% hit)",
+            hits as f64 / frames,
+            misses as f64 / frames,
+            hits as f64 * 100.0 / total as f64
+        );
+    }
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
+    if !lookup_cache_enabled() {
+        return find_uncached(address, end);
+    }
+    let epoch = LOOKUP_EPOCH.load(Ordering::Acquire);
+    let hit = LOOKUP_CACHE.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        guard.as_mut().and_then(|cache| cache.get(epoch, address, end))
+    });
+    if let Some(shadow) = hit {
+        #[cfg(feature = "diagnostics")]
+        LOOKUP_STATS[0].fetch_add(1, Ordering::Relaxed);
+        return Some(shadow);
+    }
+    #[cfg(feature = "diagnostics")]
+    LOOKUP_STATS[1].fetch_add(1, Ordering::Relaxed);
+    let shadow = find_uncached(address, end)?;
+    LOOKUP_CACHE.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let cache = guard.get_or_insert_with(|| LookupCache::new(epoch));
+        cache.insert(epoch, address, end, &shadow);
+    });
+    Some(shadow)
+}
+
+fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if let Some(shadow) = find_aliased(address, end) {
         return Some(shadow);
     }
@@ -2846,7 +3012,11 @@ pub(crate) mod tests {
         assert_eq!(back, 0x33, "back in title memory");
         first.update(b + w - 64, 64);
         assert_eq!(byte(&first, w - 40), 0x33, "and in the first copy");
-        LOOSE.lock().unwrap_or_else(|e| e.into_inner()).retain(|&(s, _), _| s != b as u64);
+        {
+            let mut loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+            loose.retain(|&(s, _), _| s != b as u64);
+            lookup_changed();
+        }
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
@@ -2867,5 +3037,132 @@ pub(crate) mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
         // Too close to the top to round up to a window.
         assert!(loose(u64::MAX - 8, u64::MAX).is_none());
+    }
+
+    #[test]
+    fn lookup_cache_switch_defaults_on_and_disables_with_zero() {
+        use std::ffi::OsStr;
+        assert!(lookup_cache_enabled_value(None));
+        assert!(lookup_cache_enabled_value(Some(OsStr::new("1"))));
+        assert!(lookup_cache_enabled_value(Some(OsStr::new(""))));
+        assert!(!lookup_cache_enabled_value(Some(OsStr::new("0"))));
+    }
+
+    #[test]
+    fn lookup_cache_hits_and_invalidates_on_register_and_unregister() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        let len = 0x20000usize;
+        // SAFETY: fresh committed range, freed below.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as u64;
+        assert_ne!(base, 0);
+        let outer_id = 0x7001usize;
+        let inner_id = 0x7002usize;
+        register(outer_id, base, len as u64);
+        let Some(outer) = find(base + 0x1000, 256) else {
+            unregister(outer_id, base);
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+            return;
+        };
+        let outer_hit = find(base + 0x1000, 256).expect("outer cache hit");
+        assert!(Arc::ptr_eq(&outer, &outer_hit));
+
+        // Registering an overlapping inner buffer without a shadow must invalidate
+        // the cached outer hit on this thread.
+        register(inner_id, base + 0x1000, 0x10000);
+        let inner = find(base + 0x1000, 256).expect("inner shadow");
+        assert!(!Arc::ptr_eq(&outer, &inner));
+
+        // Unregistering the inner buffer restores the outer shadow.
+        unregister(inner_id, base + 0x1000);
+        let restored = find(base + 0x1000, 256).expect("restored outer shadow");
+        assert!(Arc::ptr_eq(&outer, &restored));
+
+        unregister(outer_id, base);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn lookup_cache_invalidates_on_aliased_register_and_unregister() {
+        let Some(h) = host() else { return };
+        let Some((buffer, data)) = h.shared_buffer(0x10000) else { return };
+        // SAFETY: live host buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let base = 0x7000_1000_0000u64;
+        let outer_id = 0x7003usize;
+        register(outer_id, base, 0x10000);
+        let outer = find(base + 0x100, 64).expect("outer shadow");
+        assert!(!outer.is_aliased());
+
+        let aliased = Shadow::new_aliased(buffer, data, gpu, base, 0x10000);
+        register_aliased(aliased.clone());
+        let hit = find(base + 0x100, 64).expect("aliased shadow");
+        assert!(hit.is_aliased());
+        assert!(Arc::ptr_eq(&aliased, &hit));
+
+        assert!(unregister_aliased(base));
+        let restored = find(base + 0x100, 64).expect("restored outer shadow");
+        assert!(!restored.is_aliased());
+        assert!(Arc::ptr_eq(&outer, &restored));
+
+        unregister(outer_id, base);
+    }
+
+    #[test]
+    fn lookup_cache_does_not_keep_released_shadow_alive() {
+        let base = 0x7000_2000_0000u64;
+        let id = 0x7004usize;
+        register(id, base, 0x10000);
+        let Some(shadow) = find(base + 64, 64) else {
+            unregister(id, base);
+            return;
+        };
+        let weak = Arc::downgrade(&shadow);
+        drop(shadow);
+        unregister(id, base);
+        assert_eq!(weak.strong_count(), 0, "TLS cache must not keep released shadow alive");
+    }
+
+    #[test]
+    fn lookup_cache_concurrent_register_stays_coherent() {
+        let base = 0x7000_3000_0000u64;
+        let outer_id = 0x7005usize;
+        let inner_id = 0x7006usize;
+        register(outer_id, base, 0x20000);
+        let Some(outer) = find(base + 0x1000, 64) else {
+            unregister(outer_id, base);
+            return;
+        };
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    while !done.load(Ordering::Relaxed) {
+                        let _ = find(base + 0x1000, 64);
+                    }
+                    find(base + 0x1000, 64)
+                })
+            })
+            .collect();
+
+        for _ in 0..50 {
+            register(inner_id, base + 0x1000, 0x10000);
+            let _ = find(base + 0x1000, 64);
+            unregister(inner_id, base + 0x1000);
+        }
+        // Leave inner registered as the final state and verify every reader converges to it.
+        register(inner_id, base + 0x1000, 0x10000);
+        let expected = find(base + 0x1000, 64).expect("final inner shadow");
+        assert!(!Arc::ptr_eq(&outer, &expected));
+        done.store(true, Ordering::Release);
+
+        for r in readers {
+            let seen = r.join().expect("reader thread").expect("final shadow");
+            assert!(Arc::ptr_eq(&expected, &seen), "reader must not hold stale TLS entry");
+        }
+        unregister(inner_id, base + 0x1000);
+        unregister(outer_id, base);
     }
 }
