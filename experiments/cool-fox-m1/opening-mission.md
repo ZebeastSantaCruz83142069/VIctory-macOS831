@@ -104,3 +104,19 @@ The M1 Max test used a verified copy of the optimized save, Series S, serialized
 On all three frames the sky pass populated the native HDR target. Immediately before atmospheric scattering, hundreds of thousands of pixels carried positive RGB. Immediately after, every byte of all four channels matched an independently generated zero texture. The tiled lighting dispatch also entered and left this target at zero. Its conditional zero store is consistent with this observation. The sky and scattering hashes were taken independently around each dispatch. Other work may occur between the two.
 
 The captured display still showed a dark silhouette with a few lights on frame 2994. It was presenting the separate radiance texture. This test establishes the location of a complete loss of scene color in the title's HDR path. It leaves open whether the atmosphere shader loads the wrong value or receives invalid fog inputs. A previous frame capture showed the 480×272 R10G10B10A2 input at table 1 offset 24 as black in the exported RGB image. It lists two indirect compute writers for that input, both with successfully created host pipelines. The capture did not measure their output alpha or the number of workgroups each actually ran.
+
+
+## Normal display with atmospheric scattering excluded
+
+A second run used the exact tested binary and a verified copy of the save, with the native SDR planes selected. It set `VICTORY_PRESENT_SCENE_COLOR=0` and `VICTORY_SKIP_PIPELINES=577248728544d74b`. The normal post-processing and two-plane presentation continued. The log identified precisely this skipped shader. The overlay and base were both 1920×1080 RGBA8_UNORM. The submitted image was sampled at 960×540. Because the previous run used the early radiance presenter, this comparison changes both the atmosphere pass and the selected presentation source.
+
+The sky pass left 185,191, 638,085 and 918,065 out of 921,600 pixels with positive RGB at its first, sixth and twenty-first occurrences. The lower halves held 113,188, 320,005 and 460,372 positive pixels. On the twenty-first occurrence (frame 3198), 917,042 pixels were already positive as the earlier tiled-lighting pass began. Color therefore survived into work on a later frame.
+
+| Submitted frame | Largest RGB byte | Pixels at or above 8/255 luminance | Lower-half pixels at that luminance |
+| ---: | ---: | ---: | ---: |
+| 3179 | 1 | 0 | 0 |
+| 3180 | 1 | 0 | 0 |
+| 3184 | 1 | 0 | 0 |
+| 3199 | 1 | 0 | 0 |
+
+A separate synthetic compute test on the same M1 Max and D3DMetal queried RGBA16_FLOAT typed UAV load/store support and exercised a 16×16 texture using two DXC-compiled shaders. The first wrote known RGBA values, then a UAV barrier preceded an in-place componentwise multiply-add. All 1,024 FP16 channel readbacks matched exactly. This confirms the basic typed read/write operation on this device. It leaves the translated atmosphere shader, bindings, inputs and downstream passes to be distinguished.
