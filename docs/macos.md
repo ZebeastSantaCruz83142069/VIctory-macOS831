@@ -116,6 +116,10 @@ The Series X build requested a 33.333 ms frame interval and presented a single 3
 
 A separate profile requested 60 FPS at 4K. The game still requested 33.333 ms at startup. The Windows x64 Pareto Residency release stopped in Rosetta before its first present. A locally rebuilt Series S composer displayed loading artwork at 9 and 24 FPS in two samples. During the transition to the opening scene, the process read over 1 GB of additional data and the renderer advanced to hundreds of draws per frame. Four reports took 4.33 to 7.53 seconds per frame and refreshed roughly 7 GB of buffers each. Player control at 60 FPS remains unverified. [Series S transition measurements](https://github.com/ZebeastSantaCruz83142069/VIctory-macOS831/pull/8#issuecomment-7189371408)
 
+In the Series S composer, the loading artwork gave way to the opening cutscene. At frame 4,273, the displayed capture had zero RGB across the entire frame. Intermediate scene and depth targets from that same frame contained identifiable buildings and foliage. In a separate run, six world-loading reports had a median frame time of 5.96 seconds and a median of 9.29 GB of buffer refreshes per frame. The tests have yet to establish visible, player-controlled gameplay. [Scene and depth capture findings](https://github.com/ZebeastSantaCruz83142069/VIctory-macOS831/pull/8#issuecomment-7189966624)
+
+The Mac translator emitted 18 of 50 game compute shaders that the preceding release refused for reads between 32-lane halves. Microsoft's DXIL validator accepted all 18, and D3DMetal created all 18 pipelines on this Mac. [Shader comparison](https://github.com/ZebeastSantaCruz83142069/VIctory-macOS831/pull/8#issuecomment-7189751510)
+
 ## Route B: a native macOS host
 
 Later work replaces the Windows host underneath the title. That needs a Rosetta x86-64 process that maps the PE image, a macOS version of the host pass-through in `victory-hle`, a Metal backend for `victory-gpu`, and DXIL to Metal conversion with Apple's Metal shader converter. This only makes sense after Route A shows where things break.
