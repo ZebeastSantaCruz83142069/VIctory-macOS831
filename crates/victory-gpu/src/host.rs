@@ -1185,17 +1185,16 @@ enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
     /// buffer and memory copies, which later refreshes must see.
     Copy(usize, usize, usize),
+    /// A copy between overlapping title ranges (destination, source, bytes).
+    Move(usize, usize, usize),
     /// A copy of title memory into the list's own upload memory.
     Fill(usize, usize, usize),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
-    /// once per submission, whichever lists ask, until a `Copy` into it or a
-    /// `Run` intervenes.
+    /// once per submission, whichever lists ask, until a copy into it.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings the current buffer view of a table slot up to date: the title
     /// may have rewritten the slot since the draw was recorded.
     Slot(std::sync::Arc<crate::bindless::Viewed>, u32),
-    /// Work that may write title memory.
-    Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy;
@@ -1204,7 +1203,7 @@ enum Step {
     /// when such a list misses, `crate::memory::withholding`).
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool, bool),
     /// Brings a texture's staging buffer up to date: once per submission,
-    /// whichever lists sample it, until a `Copy` or `Run` intervenes.
+    /// whichever lists sample it, until a title copy intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::resource::HostTexture>),
     /// Brings every buffer range a view heap's views reach up to date
     /// (`crate::bindless`).
@@ -2703,10 +2702,17 @@ impl HostList {
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
+        self.defer_title_copy(Step::Copy(dst as usize, src as usize, len));
+    }
+
+    /// Moves bytes between overlapping title ranges at submission.
+    pub(crate) fn defer_move(&self, dst: *mut u8, src: *const u8, len: usize) {
+        self.defer_title_copy(Step::Move(dst as usize, src as usize, len));
+    }
+
+    fn defer_title_copy(&self, step: Step) {
         let mut deferred = self.deferred();
-        deferred
-            .copies
-            .push(Step::Copy(dst as usize, src as usize, len));
+        deferred.copies.push(step);
         deferred.refreshed.clear();
         deferred.slots.clear();
     }
@@ -2938,16 +2944,7 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
-    /// Runs `work` when the list is submitted, in order with its copies.
-    /// `work` may write title memory (refreshes after it copy again).
-    pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        let mut deferred = self.deferred();
-        deferred.copies.push(Step::Run(Box::new(work)));
-        deferred.refreshed.clear();
-        deferred.slots.clear();
-    }
-
-    /// As [`HostList::defer`], for work that writes only host memory.
+    /// Runs `work` on host memory at submission, in order with the copies.
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Host(Box::new(work)));
     }
@@ -2976,8 +2973,8 @@ impl HostList {
                 started,
                 match step {
                     Step::Refresh(..) | Step::Slot(..) => C::StepRefreshUs,
-                    Step::Copy(..) | Step::Fill(..) => C::StepCopyUs,
-                    Step::Run(_) | Step::Host(_) => C::StepWorkUs,
+                    Step::Copy(..) | Step::Move(..) | Step::Fill(..) => C::StepCopyUs,
+                    Step::Host(_) => C::StepWorkUs,
                     Step::GpuWrite(..) => C::StepGpuWriteUs,
                     Step::Texture(..) => C::StepTextureUs,
                     Step::Heap(_) => C::StepHeapUs,
@@ -2985,14 +2982,18 @@ impl HostList {
                 },
             );
             let copied = match step {
-                &Step::Copy(dst, src, len) => {
+                &Step::Copy(dst, src, len) | &Step::Move(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_copied(dst, len);
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    if matches!(step, Step::Move(..)) {
+                        move_mapped(dst as *mut u8, src as *const u8, len);
+                    } else {
+                        copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    }
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -3017,10 +3018,7 @@ impl HostList {
                     crate::bindless::refresh_slot(viewed, *index, |s, a, l| batch.add(s, a, l));
                     continue;
                 }
-                Step::Run(work) | Step::Host(work) => {
-                    if matches!(step, Step::Run(_)) {
-                        batch.title_written();
-                    }
+                Step::Host(work) => {
                     work();
                     #[cfg(feature = "diagnostics")]
                     {
@@ -3336,6 +3334,16 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
             });
         }
         at = next;
+    }
+}
+
+/// Moves bytes between overlapping title ranges when both are committed.
+fn move_mapped(dst: *mut u8, src: *const u8, len: usize) {
+    if crate::texture::committed(src, len) && crate::texture::committed(dst, len) {
+        let _writing = crate::watch::writing(dst as usize, len);
+        // SAFETY: both ranges name committed title memory. The copy
+        // preserves the source bytes when the ranges overlap.
+        unsafe { std::ptr::copy(src, dst, len) };
     }
 }
 
@@ -4683,6 +4691,35 @@ mod batch {
     fn title_copy(batch: &mut Batch, dst: usize, src: usize, len: usize) {
         batch.title_copied(dst, len);
         super::copy_mapped(dst as *mut u8, src as *const u8, len, true);
+    }
+
+    #[test]
+    fn overlapping_title_copy_refreshes_its_destination() {
+        let Some((pa, a)) = plain(4) else {
+            return; // no host GPU here
+        };
+        let (pb, b) = plain(4).expect("second host buffer");
+        fill(pa, PAGE, 0x12);
+        fill(pa + PAGE, PAGE, 0x34);
+        fill(pb, 4 * PAGE, 0x56);
+        let mut batch = Batch::default();
+        batch.add(&a, pa, 4 * PAGE);
+        batch.add(&b, pb, 4 * PAGE);
+        let list = super::host().unwrap().new_list().unwrap();
+        list.defer_move((pa + PAGE) as *mut u8, pa as *const u8, 2 * PAGE);
+        list.run_deferred(&mut batch);
+        batch.add(&a, pa, 4 * PAGE);
+        batch.add(&b, pb, 4 * PAGE);
+        assert_eq!(
+            batch.flush(),
+            2 * PAGE,
+            "only the overlapping copy's destination"
+        );
+        assert_eq!(a.read_host((pa + PAGE) as u64, 1)[0], 0x1212_1212);
+        assert_eq!(a.read_host((pa + 2 * PAGE) as u64, 1)[0], 0x3434_3434);
+        assert_eq!(b.read_host(pb as u64, 1)[0], 0x5656_5656);
+        done(pa, Some(a));
+        done(pb, Some(b));
     }
 
     /// Two copies of title memory, every list of a submission asking for

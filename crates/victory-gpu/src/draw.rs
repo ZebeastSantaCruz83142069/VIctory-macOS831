@@ -3330,7 +3330,9 @@ void main() { dst.Store4(0, asuint(src[0])); }
         let list = host.new_list().unwrap();
         if mode == Rewrite::DuringSubmission {
             let handle = title_heap.start;
-            list.defer(move || crate::descriptor::create_cbv(std::ptr::null(), &b_desc, handle));
+            list.defer_host(move || {
+                crate::descriptor::create_cbv(std::ptr::null(), &b_desc, handle)
+            });
         }
         let mut state = State::default();
         state.set_heaps(&[heap]);
