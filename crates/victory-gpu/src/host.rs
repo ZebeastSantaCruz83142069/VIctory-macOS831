@@ -3061,9 +3061,8 @@ impl HostList {
 /// A copy's ranges brought up to date are not copied again in the
 /// submission until a step writes them: every list of a world submission
 /// using title memory asks for every copy whole, and the title copies into
-/// buffers ~80 times in between. A step that may write anywhere
-/// ([`Batch::title_written`]) makes all of them due again, a title copy
-/// ([`Batch::title_copied`]) only what it writes. What the title's threads
+/// buffers ~80 times in between. A title copy ([`Batch::title_copied`])
+/// makes the bytes it writes due again. What the title's threads
 /// write meanwhile is for later submissions (on the console it would race
 /// the GPU).
 #[derive(Default)]
@@ -3120,32 +3119,26 @@ impl Batch {
         }
     }
 
-    /// Before a step that may write any title memory: pending refreshes are
-    /// done first, and copies are checked again after it.
-    fn title_written(&mut self) {
+    /// Before a copy into title memory: pending refreshes are done first,
+    /// then the destination and its other mappings become due again.
+    fn title_copied(&mut self, at: usize, len: usize) {
         self.flush();
-        self.current.clear();
-        self.extents.clear();
+        self.invalidate(at, at.saturating_add(len));
+        let aliases = crate::watch::alias_ranges(at, len);
+        #[cfg(feature = "diagnostics")]
+        if !aliases.is_empty() {
+            crate::copystat::add(crate::copystat::C::AliasedCopies, 1);
+        }
+        for (from, to) in aliases {
+            self.invalidate(from, to);
+        }
     }
 
-    /// As [`Batch::title_written`], before a copy into the title memory
-    /// `[at, at + len)`, which `copy_mapped` writes and nothing more: only
-    /// what the copy can have changed is checked again after it.
-    // shortcut: memory shown at two addresses is what the runtime said it
-    // maps twice (`crate::watch::aliased`, as the trackers know it); where
-    // it says so, the copy makes everything due again, as it may change
-    // bytes any copy holds.
-    fn title_copied(&mut self, at: usize, len: usize) {
-        if crate::watch::aliased(at, len) {
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::AliasedCopies, 1);
-            return self.title_written();
+    fn invalidate(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
         }
-        self.flush();
-        let (from, to) = touched(at, at.saturating_add(len));
-        // Only the copies whose memory the bytes can be in: the rest
-        // hold nothing of the window, and what a no-op remove would
-        // leave whole it leaves whole.
+        let (from, to) = touched(from, to);
         for key in self.extents.overlapping(from, to) {
             if let Some((_, have)) = self.current.get_mut(&key) {
                 have.remove(from, to);
@@ -4619,13 +4612,13 @@ mod batch {
     use std::sync::Arc;
 
 
-    /// A host copy of tracked title memory: a submission whose lists all ask
-    /// for it whole copies the one page the title wrote, once, and again
-    /// only after a step that writes title memory.
+    /// A submission whose lists ask for a copy whole refreshes it once.
+    /// With tracking, each refresh copies only the page the title wrote.
     #[test]
     fn a_copy_is_refreshed_once_per_submission_by_the_pages_written() {
         let p = crate::watch::tests::pool(4);
         let len = 4 * PAGE;
+        let changed = if crate::watch::fault_tracking() { PAGE } else { len };
         crate::shadow::register(p, p as u64, len as u64);
         let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
             crate::shadow::unregister(p, p as u64);
@@ -4640,15 +4633,15 @@ mod batch {
         let mut batch = Batch::default();
         batch.add(&copy, p, len);
         batch.add(&copy, p + 100, 200);
-        assert_eq!(batch.flush(), PAGE, "the page written");
+        assert_eq!(batch.flush(), changed, "refreshed once in this submission");
         assert_eq!(copy.read_host((p + PAGE + 8) as u64, 1)[0], 7);
         // SAFETY: as above.
         unsafe { (p as *mut u8).write_volatile(1) };
         batch.add(&copy, p, len);
         assert_eq!(batch.flush(), 0, "nothing again in the submission");
-        batch.title_written();
+        let mut batch = Batch::default();
         batch.add(&copy, p, len);
-        assert_eq!(batch.flush(), PAGE, "after a title write, what changed");
+        assert_eq!(batch.flush(), changed, "refreshed in the following submission");
         crate::shadow::unregister(p, p as u64);
         drop(copy);
         crate::watch::tests::free(p);
@@ -4764,11 +4757,6 @@ mod batch {
         batch.add(&a, pa, la);
         batch.add(&b, pb, lb);
         assert_eq!(batch.flush(), 0);
-        // A step that may write anywhere makes everything due again.
-        batch.title_written();
-        batch.add(&a, pa, la);
-        batch.add(&b, pb, lb);
-        assert_eq!(batch.flush(), la + lb);
         done(pa, Some(a));
         done(pb, Some(b));
     }
@@ -4854,13 +4842,12 @@ mod batch {
         done(p, Some(copy));
     }
 
-    /// Pages the runtime maps at two addresses: a title copy at one
-    /// changes what a copy of the other holds, so it makes everything due
-    /// again, as any step that may write anywhere does.
+    /// A title copy crossing a page boundary refreshes the affected bytes
+    /// in both mappings, leaving the rest of each copy current.
     #[test]
-    fn a_title_copy_into_pages_shown_elsewhere_makes_everything_due_again() {
-        let (a, b) = crate::watch::tests::twin_views(2);
-        let len = 2 * PAGE;
+    fn a_title_copy_into_aliases_refreshes_only_the_written_range() {
+        let (a, b) = crate::watch::tests::twin_views(3);
+        let len = 3 * PAGE;
         crate::shadow::register(a, a as u64, len as u64);
         crate::shadow::register(b, b as u64, len as u64);
         let (Some(ca), Some(cb)) = (
@@ -4877,17 +4864,18 @@ mod batch {
         batch.add(&ca, a, len);
         batch.add(&cb, b, len);
         batch.flush();
-        // Through the first view; the second shows it too.
-        title_copy(&mut batch, a, src, PAGE);
+        let offset = PAGE - 4;
+        title_copy(&mut batch, a + offset, src, 8);
         batch.add(&ca, a, len);
         batch.add(&cb, b, len);
-        batch.flush();
+        let expected = if crate::watch::fault_tracking() { 4 * PAGE } else { 16 };
+        assert_eq!(batch.flush(), expected);
         assert_eq!(
-            cb.read_host(b as u64, 1)[0],
-            0x4242_4242,
+            cb.read_host((b + offset) as u64, 2),
+            [0x4242_4242; 2],
             "the other view's copy has it"
         );
-        assert_eq!(ca.read_host(a as u64, 1)[0], 0x4242_4242);
+        assert_eq!(ca.read_host((a + offset) as u64, 2), [0x4242_4242; 2]);
         crate::shadow::unregister(a, a as u64);
         crate::shadow::unregister(b, b as u64);
         done(src, None);
