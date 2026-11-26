@@ -64,3 +64,20 @@ The existing D3D12 shared-buffer benchmark measured the following microseconds p
 | 256 | 0.16 | 0.02 |
 | 4,096 | 1.86 | 0.40 |
 | 65,536 | 25.04 | 3.31 |
+
+### Opening-scene comparison with vector copies enabled
+
+The optimized executable passed profile selection and presented loading artwork at frame 4096. The renderer started presenting the opening scene's radiance at frame 4797. The person at the Mac reported a dark world or silhouettes. This run saved the loading frame and reported in-world timings. Its five extra opening-scene image captures were disabled, so foreground appearance during the timed interval is a player observation. Player control is still unverified.
+
+| Metric, median of the first 20 reports with at least 100 draws/frame | Restored baseline | Vector copies enabled |
+| --- | ---: | ---: |
+| Frame time | 7,864.75 ms | 5,014.70 ms |
+| FPS at the median frame time | 0.127 | 0.199 |
+| Time preparing copies per frame | 6,705.0 ms | 3,499.4 ms |
+| Bytes copied per frame (decimal MB) | 15,354.45 | 15,154.05 |
+| Whole-copy time for the 174 MiB buffer per frame | 1,566.94 ms | 198.14 ms |
+| Whole copies of that buffer per frame | 23 | 22 |
+| GPU time per frame | 901.00 ms | 737.65 ms |
+| Draws per frame | 2,795.5 | 3,147 |
+
+The baseline interval was 11:44:08–11:46:43 UTC and the optimized interval was 12:02:12–12:04:45 UTC. Each used the same M1 Max, CrossOver Preview, D3DMetal, Series S configuration and sRGB compositor. The optimized run started from a verified copy of the baseline profile. These are independent intro runs with different draw counts and cache state. The builds also differ in debug symbols and the extra capture setting. The measured 36.2% lower median frame time describes those two runs. The same-executable hardware fixture above isolates the copy change. The optimized game still takes about five seconds per frame and has incomplete lighting.
