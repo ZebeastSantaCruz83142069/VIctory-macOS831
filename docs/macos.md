@@ -148,7 +148,7 @@ In the loading freeze from #50 every thread stops logging, and `VICTORY_STACKS` 
 
 ## Presented planes
 
-On Series S the game presents two planes. Plane 0 is a 1920x1080 overlay and plane 1 is the 3840x2160 picture (#15). The window shows the plane whose first resource has the most pixels, and `VICTORY_PRESENT_PLANE=<n>` picks another one. With `VICTORY_PRESENT_COMPOSITE=1` the other plane is also blended over the shown one by a compute pass (`victory-gpu/src/composite.rs`), scaled to it and using its alpha as straight alpha. The blend is off by default until a run with the game shows that the overlay is clear where the picture should show.
+On Series S the game presents a 1920x1080 plane and a 3840x2160 plane (#15). In single-plane mode the window shows the plane whose first resource has the most pixels. `VICTORY_PRESENT_COMPOSITE=1` blends the second plane over the first in submission order, using premultiplied alpha and scaling to the output. `VICTORY_PRESENT_PLANE=<n>` can select a specific base plane in either mode.
 
 ## D3DMetal's shader cache needs unique shader hashes
 

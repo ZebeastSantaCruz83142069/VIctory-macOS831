@@ -62,7 +62,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         return;
     }
     float4 o = overlay.Load(int3(pixel.x * overWidth / width, pixel.y * overHeight / height, 0));
-    result[id.xy] = float4(lerp(p.rgb, o.rgb, o.a), 1.0);
+    result[id.xy] = float4(o.rgb + p.rgb * (1.0 - saturate(o.a)), 1.0);
 }
 "#;
 
@@ -356,7 +356,13 @@ mod tests {
         let (w, h) = fit_output(1920, 1080, (1280, 720));
         let stride = (w * 4).next_multiple_of(256);
         let picture_pixel = |x: u32, y: u32| [x as u8, y as u8, 37, 77];
-        let overlay_pixel = |x: u32, y: u32| [21, x as u8, y as u8, if (x + y).is_multiple_of(3) { 255 } else { 0 }];
+        let overlay_pixel = |x: u32, y: u32| {
+            if (x + y).is_multiple_of(3) {
+                [21, x as u8, y as u8, 255]
+            } else {
+                [0; 4]
+            }
+        };
         let upload = host.new_list().unwrap();
         let mut keep = Vec::new();
         let picture = texture(1920, 1080, &(0..1920 * 1080).map(|n| picture_pixel(n % 1920, n / 1920)).collect::<Vec<_>>(), &upload.list, &mut keep);
@@ -412,11 +418,11 @@ mod tests {
         let list = &run.list;
         let mut keep = Vec::new();
         let picture = texture(4, 4, &[[255, 0, 0, 255]; 16], list, &mut keep);
-        let clear = [9, 9, 9, 0];
+        let clear = [0; 4];
         let overlay = texture(
             2,
             2,
-            &[[0, 255, 0, 255], [0, 0, 255, 128], clear, clear],
+            &[[0, 255, 0, 255], [0, 0, 128, 128], clear, clear],
             list,
             &mut keep,
         );
