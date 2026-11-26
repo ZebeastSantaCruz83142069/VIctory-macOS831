@@ -1134,14 +1134,26 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
     }
 }
 
-/// Whether a page of `[at, at + len)` is shown elsewhere too, as the
-/// runtime told when it mapped it (tracked or not): a write here changes
-/// the bytes there. Asked at submission, by a batch of refreshes that
-/// keeps what a copy into title memory cannot have changed; it takes the
-/// guard lock for one lookup and allocates nothing under it.
-pub(crate) fn aliased(at: usize, len: usize) -> bool {
-    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
-    guards().alias_of.range(first..last).next().is_some()
+/// The byte ranges that show `[at, at + len)` at other addresses, as
+/// reported by the runtime when it mapped each page. A title copy here
+/// changes the same byte offsets in each of those mappings.
+pub(crate) fn alias_ranges(at: usize, len: usize) -> Vec<(usize, usize)> {
+    let end = at.saturating_add(len);
+    if at == end {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    let g = guards();
+    for (&page, others) in g.alias_of.range(at / PAGE..end.div_ceil(PAGE)) {
+        let base = page * PAGE;
+        let from = at.saturating_sub(base);
+        let to = (end - base).min(PAGE);
+        ranges.extend(others.iter().map(|other| {
+            let base = other * PAGE;
+            (base + from, base.saturating_add(to))
+        }));
+    }
+    ranges
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -1782,25 +1794,31 @@ pub(crate) mod tests {
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + PAGE)]);
     }
 
-    /// Pages are reported aliased while the runtime says they are shown
-    /// twice, and not after either mapping changes.
+    /// A byte range projects onto each alias at the same offset in the
+    /// page. Changing a mapping removes just that page's links.
     #[test]
-    fn aliased_pages_are_found_by_range() {
+    fn aliases_follow_byte_offsets_and_remaps() {
         let (a, b) = twin_views(3);
-        assert!(
-            aliased(a, 1) && aliased(b + 2 * PAGE + 5, 10),
-            "either view, any byte"
+        assert_eq!(alias_ranges(a, 1), [(b, b + 1)]);
+        assert_eq!(
+            alias_ranges(b + 2 * PAGE + 5, 10),
+            [(a + 2 * PAGE + 5, a + 2 * PAGE + 15)]
         );
-        assert!(aliased(a + PAGE - 1, 2), "a range that reaches a page");
-        assert!(!aliased(a, 0), "no bytes");
+        assert_eq!(
+            alias_ranges(a + PAGE - 1, 2),
+            [(b + PAGE - 1, b + PAGE), (b + PAGE, b + PAGE + 1)]
+        );
+        assert!(alias_ranges(a + 1, 0).is_empty());
         let plain = pool(1);
-        assert!(!aliased(plain, PAGE));
+        assert!(alias_ranges(plain, PAGE).is_empty());
         free(plain);
         // One page shown once only again: its link goes, the others stay.
         title_memory_remapped(b + PAGE, PAGE);
-        assert!(!aliased(a + PAGE, PAGE) && !aliased(b + PAGE, PAGE));
-        assert!(aliased(a, PAGE) && aliased(b + 2 * PAGE, PAGE));
-        assert!(aliased(a, usize::MAX), "no overflow");
+        assert!(alias_ranges(a + PAGE, PAGE).is_empty());
+        assert!(alias_ranges(b + PAGE, PAGE).is_empty());
+        assert_eq!(alias_ranges(a, PAGE), [(b, b + PAGE)]);
+        assert_eq!(alias_ranges(b + 2 * PAGE, PAGE), [(a + 2 * PAGE, a + 3 * PAGE)]);
+        assert!(alias_ranges(a, usize::MAX).contains(&(b, b + PAGE)));
     }
 
     /// A tracker of one mapping going away leaves the guard its page shares
