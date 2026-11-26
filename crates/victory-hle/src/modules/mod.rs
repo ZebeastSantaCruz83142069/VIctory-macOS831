@@ -73,6 +73,10 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(rpcrt4::module());
     #[cfg(windows)]
     all.push(xmem::module());
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if victory_gpu::sparse_physical_buffers() {
+        all.push(xmem::virtual_memory_module());
+    }
     #[cfg(windows)]
     all.push(xsystem::module());
     #[cfg(windows)]

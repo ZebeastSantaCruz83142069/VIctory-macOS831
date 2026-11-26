@@ -175,6 +175,17 @@ pub extern "system" fn XMemVirtualAlloc(
             );
         }
     }
+    #[cfg(feature = "diagnostics")]
+    if placeholder
+        && !at.is_null()
+        && victory_gpu::sparse_physical_buffers()
+        && let Some(end) = (at as usize).checked_add(size)
+    {
+        let mut physical = physical();
+        physical.next_reservation += 1;
+        let id = physical.next_reservation;
+        physical.reservations.insert(at as usize, (end, id));
+    }
     if !at.is_null()
         && victory_gpu::alias_buffers()
         && kind & MEM_COMMIT != 0
@@ -196,6 +207,26 @@ pub extern "system" fn XMemVirtualAlloc(
         );
     }
     at
+}
+
+#[cfg(feature = "diagnostics")]
+extern "system" fn free_virtual_memory(base: *mut c_void, size: usize, kind: u32) -> BOOL {
+    if kind != MEM_RELEASE {
+        // SAFETY: same arguments and validation as the host API.
+        return unsafe { VirtualFree(base, size, kind) };
+    }
+    let at = base as usize;
+    let mut physical = physical();
+    // SAFETY: same arguments and validation as the host API.
+    let freed = unsafe { VirtualFree(base, size, kind) };
+    if freed != 0
+        && let Some((&start, &(end, _))) = physical.reservations.range(..=at).next_back()
+        && at < end
+    {
+        physical.reservations.remove(&start);
+        victory_gpu::physical_layout_changed();
+    }
+    freed
 }
 
 /// `MEMORY_BASIC_INFORMATION` (the console's first 0x30 bytes are the
@@ -477,6 +508,11 @@ struct Slice {
 struct Physical {
     next_page: usize,
     pages: HashMap<usize, Slice>,
+    /// XMem placeholder ranges and their identities, including unmapped pages.
+    #[cfg(feature = "diagnostics")]
+    reservations: BTreeMap<usize, (usize, u64)>,
+    #[cfg(feature = "diagnostics")]
+    next_reservation: u64,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
     /// Where each slice (section, page index) is mapped: the addresses of
@@ -562,9 +598,14 @@ fn physical() -> MutexGuard<'static, Physical> {
 /// The physical runs currently mapped in a reserved GPU buffer. The gaps
 /// in the returned runs are unmapped tiles.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn physical_layout(base: usize, len: usize) -> Option<Vec<victory_gpu::PhysicalTiles>> {
+pub(crate) fn physical_layout(base: usize, len: usize) -> Option<victory_gpu::PhysicalLayout> {
     let end = base.checked_add(len)?;
     let physical = physical();
+    let reservation = physical
+        .reservations
+        .range(..=base)
+        .next_back()
+        .and_then(|(_, &(limit, id))| (end <= limit).then_some(id));
     let first = physical.views.range(..=base).next_back().map_or(base, |(&at, _)| at);
     let mut runs: Vec<victory_gpu::PhysicalTiles> = Vec::new();
     for (&at, (size, slice)) in physical.views.range(first..end) {
@@ -586,7 +627,10 @@ pub(crate) fn physical_layout(base: usize, len: usize) -> Option<Vec<victory_gpu
             runs.push(victory_gpu::PhysicalTiles { first, count, heap_tile, heap: heap.clone() });
         }
     }
-    Some(runs)
+    Some(victory_gpu::PhysicalLayout {
+        tiles: runs,
+        reservation,
+    })
 }
 
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
@@ -1299,6 +1343,20 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
+#[cfg(feature = "diagnostics")]
+pub(crate) fn virtual_memory_module() -> HleModule {
+    use crate::HleExport;
+
+    HleModule {
+        name: "xmem-reservations",
+        dlls: &["kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-*"],
+        exports: vec![HleExport {
+            name: "VirtualFree",
+            address: free_virtual_memory as *const () as usize,
+        }],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1579,7 +1637,9 @@ mod tests {
         assert_eq!(query(at(a, 2)).host.State, MEM_COMMIT);
         #[cfg(feature = "diagnostics")]
         if std::env::var("VICTORY_PHYSICAL_TILES").as_deref() == Ok("1") {
-            let runs = physical_layout(a as usize, 3 * PAGE).unwrap();
+            let layout = physical_layout(a as usize, 3 * PAGE).unwrap();
+            assert_eq!(layout.reservation.is_some(), victory_gpu::sparse_physical_buffers());
+            let runs = layout.tiles;
             let positions: Vec<_> = runs.iter().map(|r| (r.first, r.count, r.heap_tile)).collect();
             assert_eq!(positions, [(0, 1, 0), (2, 1, 2)]);
             assert!(Arc::ptr_eq(&runs[0].heap, &runs[1].heap));
@@ -1614,6 +1674,36 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    #[ignore = "requires Rosetta with VICTORY_PHYSICAL_SPARSE=1 and shared tiles"]
+    fn released_virtual_allocation_loses_its_physical_reservation_id() {
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            3 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        let layout = physical_layout(a as usize, 3 * PAGE).unwrap();
+        assert!(layout.tiles.is_empty() && layout.reservation.is_some());
+        assert!(physical_layout(a as usize, 4 * PAGE).unwrap().reservation.is_none());
+        assert_eq!(
+            crate::registry::lookup("api-ms-win-core-memory-l1-1-0.dll", "VirtualFree"),
+            Some(free_virtual_memory as *const () as usize)
+        );
+        assert_eq!(free_virtual_memory(a, PAGE, MEM_RELEASE), 0);
+        assert_eq!(physical_layout(a as usize, PAGE).unwrap().reservation, layout.reservation);
+        assert_ne!(free_virtual_memory(a, 0, MEM_RELEASE), 0);
+        // SAFETY: the address just released above, reserved and committed
+        // without XMem placeholders.
+        let ordinary = unsafe { VirtualAlloc(a, 3 * PAGE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
+        assert_eq!(ordinary, a);
+        assert!(physical_layout(a as usize, PAGE).unwrap().reservation.is_none());
+        assert_ne!(free_virtual_memory(a, 0, MEM_RELEASE), 0);
     }
 
     #[test]
