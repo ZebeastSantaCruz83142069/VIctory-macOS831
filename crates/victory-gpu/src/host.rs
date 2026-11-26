@@ -3243,9 +3243,20 @@ fn taken(from: usize, to: usize, memory: (usize, usize)) -> (usize, usize) {
     }
 }
 
-/// Reads the prefix covered by the runtime's own physical section view.
+/// The prefix of a title-memory refresh the runtime could identify.
 #[cfg(feature = "diagnostics")]
-type MappedReader = fn(usize, &mut [u8]) -> usize;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalRead {
+    /// Bytes already copied from the runtime's section view.
+    Copied(usize),
+    /// Bytes in an unmapped part of a tracked XMem placeholder.
+    Unmapped(usize),
+    /// Memory that still needs the ordinary kernel read.
+    Unknown,
+}
+
+#[cfg(feature = "diagnostics")]
+type MappedReader = fn(usize, &mut [u8]) -> PhysicalRead;
 #[cfg(feature = "diagnostics")]
 static MAPPED_READER: OnceLock<MappedReader> = OnceLock::new();
 
@@ -3257,15 +3268,26 @@ pub fn use_mapped_reader(read: MappedReader) {
 
 #[cfg(feature = "diagnostics")]
 fn read_mapped_prefix(read: MappedReader, at: usize, dst: *mut u8, len: usize) -> usize {
+    use crate::copystat::{C, add};
+
     let started = std::time::Instant::now();
     // SAFETY: the caller passes `len` writable bytes in a host buffer.
-    let copied = read(at, unsafe { std::slice::from_raw_parts_mut(dst, len) });
-    if copied != 0 {
-        use crate::copystat::{C, add};
-        add(C::PhysicalReadBytes, copied as u64);
-        add(C::PhysicalReadUs, started.elapsed().as_micros() as u64);
+    let destination = unsafe { std::slice::from_raw_parts_mut(dst, len) };
+    match read(at, destination) {
+        PhysicalRead::Copied(n) => {
+            add(C::PhysicalReadBytes, n as u64);
+            add(C::PhysicalReadUs, started.elapsed().as_micros() as u64);
+            n
+        }
+        PhysicalRead::Unmapped(n) => {
+            destination[..n].fill(0);
+            add(C::Unmapped, n as u64);
+            add(C::PhysicalZeroBytes, n as u64);
+            add(C::PhysicalZeroUs, started.elapsed().as_micros() as u64);
+            n
+        }
+        PhysicalRead::Unknown => 0,
     }
-    copied
 }
 
 /// Copies title memory at submission. The ranges were checked against their
@@ -3555,25 +3577,34 @@ mod title_copies {
     #[test]
     #[ignore = "requires Rosetta with VICTORY_PHYSICAL_READ=1"]
     fn physical_prefixes_fill_both_sides_of_a_sparse_copy() {
+        use super::PhysicalRead;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         static BASE: AtomicUsize = AtomicUsize::new(0);
         let src = holed(7);
+        let middle = src.wrapping_add(BLOCK);
+        // SAFETY: commit the fixture's middle block. Returning its bytes
+        // would show that the kernel read was used for a reported hole.
+        unsafe {
+            assert!(!VirtualAlloc(middle.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE).is_null());
+            middle.write_bytes(0xDD, BLOCK);
+        }
         BASE.store(src as usize, Ordering::Relaxed);
         super::use_mapped_reader(|at, dst| {
             let base = BASE.load(Ordering::Relaxed);
             if base == 0 {
-                return 0;
+                return PhysicalRead::Unknown;
             }
-            let Some(offset) = at.checked_sub(base) else { return 0 };
+            let Some(offset) = at.checked_sub(base) else { return PhysicalRead::Unknown };
+            let len = dst.len().min(BLOCK - offset % BLOCK);
             let fill = match offset / BLOCK {
                 0 => 24,
+                1 => return PhysicalRead::Unmapped(len),
                 2 => 42,
-                _ => return 0,
+                _ => return PhysicalRead::Unknown,
             };
-            let len = dst.len().min(BLOCK - offset % BLOCK);
             dst[..len].fill(fill);
-            len
+            PhysicalRead::Copied(len)
         });
         let mut dst = vec![0xEE; 3 * BLOCK - 100];
         copy_mapped(dst.as_mut_ptr(), src.wrapping_add(100), dst.len(), false);
