@@ -499,35 +499,6 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    #[test]
-    fn frame_report_includes_the_frames_before_the_last_caption() {
-        use super::FrameWindow;
-        use std::time::{Duration, Instant};
-
-        let start = Instant::now();
-        let sample = |seconds, frames, drawn| FrameWindow {
-            since: start + Duration::from_secs(seconds),
-            frames,
-            drawn,
-        };
-        let mut caption = sample(0, 0, 10);
-        let mut report = caption;
-        let second = Duration::from_secs(1);
-        let period = Duration::from_secs(5);
-        let early = sample(4, 120, 370);
-        assert_eq!(caption.sample(early, second).unwrap().fps, 30.0);
-        assert!(report.sample(early, period).is_none());
-
-        let end = sample(5, 125, 510);
-        let short = caption.sample(end, second).unwrap();
-        let full = report.sample(end, period).unwrap();
-        assert_eq!((short.fps, short.ms, short.draws), (5.0, 200.0, 28.0));
-        assert_eq!((full.frames, full.fps, full.ms, full.draws), (125.0, 25.0, 40.0, 4.0));
-        assert!(report.sample(end, period).is_none());
-        let following = report.sample(sample(10, 135, 530), period).unwrap();
-        assert_eq!((following.frames, following.fps, following.draws), (10.0, 2.0, 2.0));
-    }
-
     /// Run in isolation with VICTORY_PRESENT_MAX=1280x720. Exercise the
     /// real swap chain and its resize path without opening a visible window.
     #[test]
@@ -593,6 +564,35 @@ pub(crate) mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn frame_report_includes_the_frames_before_the_last_caption() {
+        use super::FrameWindow;
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let sample = |seconds, frames, drawn| FrameWindow {
+            since: start + Duration::from_secs(seconds),
+            frames,
+            drawn,
+        };
+        let mut caption = sample(0, 0, 10);
+        let mut report = caption;
+        let second = Duration::from_secs(1);
+        let period = Duration::from_secs(5);
+        let early = sample(4, 120, 370);
+        assert_eq!(caption.sample(early, second).unwrap().fps, 30.0);
+        assert!(report.sample(early, period).is_none());
+
+        let end = sample(5, 125, 510);
+        let short = caption.sample(end, second).unwrap();
+        let full = report.sample(end, period).unwrap();
+        assert_eq!((short.fps, short.ms, short.draws), (5.0, 200.0, 28.0));
+        assert_eq!((full.frames, full.fps, full.ms, full.draws), (125.0, 25.0, 40.0, 4.0));
+        assert!(report.sample(end, period).is_none());
+        let following = report.sample(sample(10, 135, 530), period).unwrap();
+        assert_eq!((following.frames, following.fps, following.draws), (10.0, 2.0, 2.0));
     }
 
     #[test]
@@ -3650,7 +3650,7 @@ struct Presenter {
 
 #[derive(Clone, Copy)]
 struct FrameWindow {
-    since: std::time::Instant,
+    since: Instant,
     frames: u64,
     drawn: u64,
 }
@@ -3664,7 +3664,7 @@ struct FrameRates {
 
 impl FrameWindow {
     /// Advances this window once its own interval has elapsed.
-    fn sample(&mut self, next: Self, interval: std::time::Duration) -> Option<FrameRates> {
+    fn sample(&mut self, next: Self, interval: Duration) -> Option<FrameRates> {
         let elapsed = next.since.duration_since(self.since);
         if elapsed < interval {
             return None;
@@ -3695,7 +3695,7 @@ struct Meter {
 impl Meter {
     fn new() -> Self {
         let start = FrameWindow {
-            since: std::time::Instant::now(),
+            since: Instant::now(),
             frames: 0,
             drawn: crate::draw::drawn(),
         };
@@ -3716,14 +3716,14 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
         let next = FrameWindow {
-            since: std::time::Instant::now(),
+            since: Instant::now(),
             frames: self.frames,
             drawn: crate::draw::drawn(),
         };
-        let Some(caption_rates) = self.caption_window.sample(next, std::time::Duration::from_secs(1)) else {
+        let Some(caption_rates) = self.caption_window.sample(next, Duration::from_secs(1)) else {
             return;
         };
-        if let Some(report) = self.report_window.sample(next, std::time::Duration::from_secs(5)) {
+        if let Some(report) = self.report_window.sample(next, Duration::from_secs(5)) {
             let FrameRates { frames: report_frames, fps, ms, draws } = report;
             let [cpu, gpu] = SUBMISSION_US.each_ref().map(|counter| {
                 counter.swap(0, Ordering::Relaxed) as f64 / 1000.0 / report_frames
