@@ -108,6 +108,24 @@ device and feature checks as the renderer, and needs no game files. It prints
 the result for each feature and exits successfully when the device reports
 both. A failed feature query appears as `query failed`.
 
+### Route A on M1 Max, 26 November 2026
+
+On an M1 Max with 64 GiB, macOS 26.6.2, CrossOver Preview 27.0.0.41069 and D3DMetal 4.0 beta 3, both synthetic Windows loader tests passed. The runtime created a D3D12 device and reported mesh shaders and Shader Model 6.6. The test for the indirect-argument shader compiled with DXC also passed on that device.
+
+The Series X build requested a 33.333 ms frame interval and presented a single 3840 × 2160 plane. On the tested revision `e5ed20a`, the title submitted three draws per frame and every sampled image through frame 16,384 was black. The host pipeline queue finished before the run ended at frame 17,707. A separate launch on the same Mac had displayed menus and reached the 500-draw world-loading threshold. Its first two sampled images past the threshold were also black. The title-bar rate alone cannot verify gameplay. [Test results and build revisions](https://github.com/ZebeastSantaCruz83142069/VIctory-macOS831/pull/8)
+
+A separate profile requested 60 FPS at 4K. The game still requested 33.333 ms at startup. The Windows x64 Pareto Residency release stopped in Rosetta before its first present. A locally rebuilt Series S composer displayed loading artwork at 9 and 24 FPS in two samples. During the transition to the opening scene, the process read over 1 GB of additional data and the renderer advanced to hundreds of draws per frame. Four reports took 4.33 to 7.53 seconds per frame and refreshed roughly 7 GB of buffers each. Player control at 60 FPS remains unverified. [Series S transition measurements](https://github.com/ZebeastSantaCruz83142069/VIctory-macOS831/pull/8#issuecomment-7189371408)
+
+In the Series S composer, the loading artwork gave way to the opening cutscene. At frame 4,273, the displayed capture had zero RGB across the entire frame. Intermediate scene and depth targets from that same frame contained identifiable buildings and foliage. In a separate run, six world-loading reports had a median frame time of 5.96 seconds and a median of 9.29 GB of buffer refreshes per frame. The tests have yet to establish visible, player-controlled gameplay. [Scene and depth capture findings](https://github.com/ZebeastSantaCruz83142069/VIctory-macOS831/pull/8#issuecomment-7189966624)
+
+The experimental Series S display subsequently showed a sky, tree silhouettes and the HUD after the title card. Its foreground remained black. At the matching 736-draw interval, the renderer measured 8.83 seconds per frame, 6.74 GB of buffer copies and 1.04 seconds on the GPU. This run used an intermediate lighting texture. Player control and the game's final lighting remain unverified. [Sky-frame measurements](https://github.com/ZebeastSantaCruz83142069/VIctory-macOS831/pull/8#issuecomment-7190796015)
+
+Two Series S runs on this Mac compared the first 20 opening-scene reports with at least 100 draws per frame. Median frame time fell from 7.86 to 5.01 seconds with the experimental vector-copy build (0.127 to 0.199 FPS). Median time spent copying buffers fell from 6.71 to 3.50 seconds per frame, with roughly 15 GB copied in each case. The runs had different draw counts, cache states and capture settings. The new build still showed dark silhouettes. [Opening-scene comparison and settings](https://github.com/ZebeastSantaCruz83142069/VIctory-macOS831/commit/48ff3a9e1e73bdc24092452bc5312d4362d50803)
+
+Readbacks around the atmospheric scattering pass showed that it erased the native 1280 × 720 HDR image on three opening frames. Skipping the pass preserved color in that texture, but the normal display plane remained nearly black. A separate compositor displayed the native HDR image immediately before scattering under the game's HUD. The opening showed buildings with colored lights, a skyline and rolling credits. On frame 3,259 only 414 of 259,200 pixels in the lower half reached luminance 8/255. The first 20 busy intervals had a median of 6.07 seconds per frame, including 4.66 seconds preparing buffer copies. A translated synthetic shader on this M1 Max passed both a color-preserving and a color-changing read and write of the same HDR texel. [Native scene and measurements](https://github.com/ZebeastSantaCruz83142069/VIctory-macOS831/commit/d190a4a1cc9aacd75a1c47638933a97d296d18d8) · [Shader and lighting checks](https://github.com/ZebeastSantaCruz83142069/VIctory-macOS831/pull/8#issuecomment-7192056870)
+
+On the same set of 50 game compute shaders, the Mac translator emitted 18 after it gained fixed-lane reads in the entry block. It emits 36 when all threads can also exchange a value after control flow rejoins. Microsoft's DXIL validator accepted all 36 and D3DMetal created all 36 pipelines on this Mac. The separate source-built Series S compositor already created all 50 pipelines in this set. [Initial shader comparison](https://github.com/ZebeastSantaCruz83142069/VIctory-macOS831/pull/8#issuecomment-7189751510)
+
 ## Route B: a native macOS host
 
 Later work replaces the Windows host underneath the title. That needs a Rosetta x86-64 process that maps the PE image, a macOS version of the host pass-through in `victory-hle`, a Metal backend for `victory-gpu`, and DXIL to Metal conversion with Apple's Metal shader converter. This only makes sense after Route A shows where things break.
@@ -136,7 +154,7 @@ In the loading freeze from #50 every thread stops logging, and `VICTORY_STACKS` 
 
 ## Presented planes
 
-On Series S the game presents two planes. Plane 0 is a 1920x1080 overlay and plane 1 is the 3840x2160 picture (#15). The window shows the plane whose first resource has the most pixels, and `VICTORY_PRESENT_PLANE=<n>` picks another one. With `VICTORY_PRESENT_COMPOSITE=1` the other plane is also blended over the shown one by a compute pass (`victory-gpu/src/composite.rs`), scaled to it and using its alpha as straight alpha. The blend is off by default until a run with the game shows that the overlay is clear where the picture should show.
+On Series S the game presents a 1920x1080 plane and a 3840x2160 plane (#15). In single-plane mode the window shows the plane whose first resource has the most pixels. `VICTORY_PRESENT_COMPOSITE=1` blends the second plane over the first in submission order, using premultiplied alpha and scaling to the output. `VICTORY_PRESENT_PLANE=<n>` can select a specific base plane in either mode.
 
 ## D3DMetal's shader cache needs unique shader hashes
 

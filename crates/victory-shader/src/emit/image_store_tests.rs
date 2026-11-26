@@ -90,7 +90,10 @@ fn program(dmask: u8, d16: bool, mip: Mip) -> NativeProgram {
     };
     words.extend(mimg_2d(op, 0, 4, 16, dmask, d16));
     words.push(S_ENDPGM);
+    with_image_layout(&words)
+}
 
+fn with_image_layout(words: &[u32]) -> NativeProgram {
     NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
@@ -173,8 +176,8 @@ fn lower(native: &NativeProgram) -> Result<HostShader, ShaderError> {
 }
 
 /// The program lowered and validated.
-fn build(dmask: u8, d16: bool, mip: Mip) -> HostShader {
-    let shader = lower(&program(dmask, d16, mip)).expect("lower");
+fn build(native: &NativeProgram) -> HostShader {
+    let shader = lower(native).expect("lower");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         let ours = copy[4..20].to_vec();
@@ -256,6 +259,18 @@ fn f16_to_f32(h: u16) -> f32 {
 /// integers.
 const FILL: [u32; 4] = [0x3F80_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000];
 
+fn user_data(shader: &HostShader, k: &[u32; 12]) -> Vec<u32> {
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        ud[u.index as usize] = match (u.root, u.slot) {
+            (RootType::Constants, 0) => k[u.dword as usize],
+            (RootType::Table, 1) => 0,
+            other => panic!("unexpected user data {other:?}"),
+        };
+    }
+    ud
+}
+
 fn run(cases: &[Case]) {
     run_with(cases, Mip::None);
 }
@@ -265,7 +280,10 @@ fn run(cases: &[Case]) {
 /// checks the whole texture.
 fn run_with(cases: &[Case], mip: Mip) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let shaders: Vec<_> = cases.iter().map(|c| build(c.dmask, c.d16, mip)).collect();
+    let shaders: Vec<_> = cases
+        .iter()
+        .map(|c| build(&program(c.dmask, c.d16, mip)))
+        .collect();
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
@@ -286,20 +304,12 @@ fn run_with(cases: &[Case], mip: Mip) {
             k[..4].copy_from_slice(&FILL);
             k[4..8].copy_from_slice(&case.data);
             k[8..10].copy_from_slice(&[1, 1]);
-            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-            for u in &shader.user_data {
-                ud[u.index as usize] = match (u.root, u.slot) {
-                    (RootType::Constants, 0) => k[u.dword as usize],
-                    (RootType::Table, 1) => 0,
-                    other => panic!("unexpected user data {other:?}"),
-                };
-            }
             let out = host
                 .dispatch(
                     &root,
                     &pso,
                     &Dispatch {
-                        roots: vec![(0, Root::Constants(ud))],
+                        roots: vec![(0, Root::Constants(user_data(shader, &k)))],
                         views: &[case.format.view()],
                         samplers: &[],
                         groups: [1, 1, 1],
@@ -356,6 +366,70 @@ fn d16_float_stores_of_some_channels_run_on_the_host() {
         })
         .collect();
     run(&cases);
+}
+
+/// A compute pass reads the existing HDR texel, multiplies its four
+/// components by transmittance, adds scattered light, and stores to the
+/// same RGBA16F UAV. The upload supplies the preceding pass's color.
+#[test]
+fn a_scattering_pass_reads_and_updates_an_existing_hdr_texel() {
+    let mut words = vec![s_mov_b32(13, 128)];
+    words.extend(s_load_dwordx8(16, 12, 0));
+    words.extend([v_mov_b32(0, 129), v_mov_b32(1, 129)]); // texel (1, 1)
+    words.extend(mimg_2d(0, 2, 0, 16, 0xF, false)); // image_load v[2:5]
+    for component in 2..6u8 {
+        words.push(v_mov_b32(6, 1)); // v6 = scattered light (s1)
+        // v_fmac_f32 v6, s0, vN: add the source component times transmittance.
+        words.push(0x2B << 25 | 6 << 17 | u32::from(component) << 9);
+        words.push(v_mov_b32(component, 256 + 6));
+    }
+    words.extend(mimg_2d(IMAGE_STORE, 2, 0, 16, 0xF, false));
+    words.push(S_ENDPGM);
+    let shader = build(&with_image_layout(&words));
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    // The first three texels detect accidental writes away from (1, 1).
+    // The last texel holds [1, 2, 4, 0], packed as little-endian halves.
+    let initial = [
+        0x3800_3C00,
+        0,
+        0,
+        0x4000_3800,
+        0x4400_0000,
+        0,
+        0x4000_3C00,
+        0x0000_4400,
+    ];
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("compute pipeline");
+        for (factor, light, expected) in [
+            (1.0f32, 0.0f32, [initial[6], initial[7]]),
+            (0.5, 0.25, [0x3D00_3A00, 0x3400_4080]), // [0.75, 1.25, 2.25, 0.25]
+        ] {
+            let mut constants = [0; 12];
+            constants[0] = factor.to_bits();
+            constants[1] = light.to_bits();
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(user_data(&shader, &constants)))],
+                        views: &[View::HalfTextureUav(2, 2, &initial)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .expect("dispatch");
+            let mut want = initial;
+            want[6..].copy_from_slice(&expected);
+            assert_eq!(out[0], want, "{label}, factor {factor}, light {light}");
+        }
+        eprintln!("verified RGBA16F read/modify/write on {label}");
+    }
 }
 
 /// Integer data: denormal, NaN and negative-zero bit patterns as floats.

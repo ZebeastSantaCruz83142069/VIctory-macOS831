@@ -20,7 +20,9 @@
 //!   console lane ([`Lower::console_lane`]);
 //! * across halves, refused: ballots (a mask read as data holds the other
 //!   half's lanes unless the whole group fits one host wave),
-//!   `v_readlane_b32` of a lane that may be in the other half
+//!   `v_readlane_b32` of a lane that may be in the other half, unless a
+//!   fixed, populated lane holds a value uniform across the console wave or
+//!   the whole group reaches its exchange exactly once before any loop
 //!   (SGPR spills read back are not lane reads), and whole-wave reductions
 //!   (unless an active reduction fits one host wave) and prefix sums;
 //! * `v_readfirstlane_b32` reads the host wave's first lane, which in the
@@ -122,6 +124,50 @@ impl Lower<'_> {
         self.s
             .threads
             .is_some_and(|t| t.iter().product::<u32>() <= HALF)
+    }
+
+    /// A fixed lane must exist in the group's last, possibly partial,
+    /// console wave as well as in its full waves.
+    pub(super) fn every_wave_has_lane(&self, lane: u32) -> bool {
+        self.s.threads.is_some_and(|threads| {
+            let group = threads.iter().product::<u32>();
+            group.checked_sub(1).is_some_and(|last| lane <= last % 64)
+        })
+    }
+
+    /// Broadcasts a populated, fixed lane from a block the group enters once.
+    /// Only the requested lane writes each wave's word. A separate word for
+    /// each instruction lets both halves read it without a second barrier.
+    pub(super) fn broadcast_fixed_lane(&mut self, offset: usize, value: V, lane: V) -> Result<V, Why> {
+        if self.one_host_wave() {
+            self.s.flags |= flags::WAVE_OPS;
+            return Ok(self.read_lane(value, lane));
+        }
+        let group = self
+            .s
+            .threads
+            .expect("compute in halves")
+            .iter()
+            .product::<u32>();
+        let words = group.div_ceil(64);
+        // D3D12 permits 32 KiB of thread-group shared memory.
+        if self.s.lds_dwords + self.lane_scratch_dwords + words > 8192 {
+            return Err("a cross-half lane read exceeds thread-group shared memory");
+        }
+        self.lane_scratch_dwords += words;
+        let flat = self.relabelled_flat();
+        let shift = self.s.m.i32(6);
+        let wave = self.s.m.bin(self.cur, Bin::LShr, flat, shift);
+        let ty = self.s.m.array(words, self.s.t.i32);
+        let shared = self.s.m.global(&format!("readlane_{offset}"), ty, 3);
+        let ptr = self.s.m.element(self.cur, shared, wave);
+        let this_lane = self.console_lane();
+        let selected = self.s.m.cmp(self.cur, pred::EQ, this_lane, lane);
+        let branch = self.begin_guarded(Some(selected));
+        self.s.m.store(self.cur, ptr, value);
+        self.end_guarded(branch, &[]);
+        self.group_barrier(false);
+        Ok(self.s.m.load(self.cur, ptr))
     }
 
     /// Refuses a read into the other half of the console wave in halves.

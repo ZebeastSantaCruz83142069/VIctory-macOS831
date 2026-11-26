@@ -1273,13 +1273,31 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
+    /// The time window for a diagnostic key. A timestamp gives the usual
+    /// 200 ms press. A start and end allow a slow game to sample a held key.
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn key_window(text: &str) -> Option<std::ops::Range<Duration>> {
+        let time = |s: &str| Duration::try_from_secs_f64(s.trim().parse().ok()?).ok();
+        if let Some(start) = time(text) {
+            return Some(start..start.checked_add(Duration::from_millis(200))?);
+        }
+        // A minus in a floating-point exponent belongs to the timestamp.
+        text.match_indices('-').find_map(|(at, _)| {
+            let start = time(&text[..at])?;
+            let end = time(&text[at + 1..])?;
+            (start < end).then_some(start..end)
+        })
+    }
+
+    /// Debugging aid: `VICTORY_KEYS=30:Enter,40-55:L` taps Enter at
+    /// 30 seconds and holds L from 40 to 55 seconds after input starts,
+    /// with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        type TimedKey = (std::ops::Range<Duration>, u8);
+        static SCRIPT: LazyLock<(Instant, Vec<TimedKey>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
@@ -1297,19 +1315,33 @@ mod host {
                     }
                     _ => return None,
                 };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
+                Some((key_window(at)?, vk))
             });
             (Instant::now(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
         keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
+            .filter(|(window, _)| window.contains(&now))
+            .map(|(_, vk)| *vk)
             .collect()
+    }
+
+    #[cfg(test)]
+    mod key_window_tests {
+        use super::{Duration, key_window};
+
+        #[test]
+        fn taps_and_holds_cover_the_requested_time() {
+            let ms = Duration::from_millis;
+            assert_eq!(key_window("1e-3"), Some(ms(1)..ms(201)));
+            let hold = key_window(" 1e-3 - 12.5 ").unwrap();
+            assert!(hold.contains(&ms(1)) && hold.contains(&ms(12_499)));
+            assert!(!hold.contains(&ms(0)) && !hold.contains(&ms(12_500)));
+            for invalid in ["-1", "1-", "1-1", "5-3", "NaN", "0-inf"] {
+                assert_eq!(key_window(invalid), None);
+            }
+        }
     }
 
     /// The foreground window is one of ours (the title's or our fallback).

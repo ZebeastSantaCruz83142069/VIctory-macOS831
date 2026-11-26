@@ -307,6 +307,10 @@ struct Lower<'a> {
     halves: bool,
     /// Why such a program cannot run in halves.
     halves_refused: Option<Why>,
+    /// Group-shared words used by fixed lane reads, in addition to guest LDS.
+    lane_scratch_dwords: u32,
+    /// Whether all threads reach a fixed-lane exchange in this IR block exactly once.
+    lane_sync_blocks: Map<usize, bool>,
     /// [`Lower::relabelled_flat`], once made.
     relabelled: Option<V>,
     /// In halves: VGPR values the same in every lane of the console wave
@@ -837,6 +841,8 @@ impl<'a> Lower<'a> {
             console_lanes,
             halves,
             halves_refused,
+            lane_scratch_dwords: 0,
+            lane_sync_blocks: Map::default(),
             relabelled: None,
             alike: if halves {
                 halves::lane_uniform(x)
@@ -1532,7 +1538,7 @@ impl<'a> Lower<'a> {
                     self.has_discard = true;
                 }
                 if self.split_barriers.contains(&(b, i)) {
-                    self.group_barrier();
+                    self.group_barrier(self.writes_uavs);
                 }
                 self.inst(b, i)?;
                 self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
@@ -1546,7 +1552,7 @@ impl<'a> Lower<'a> {
                 i += 1;
             }
             if self.split_barriers.contains(&(b, p.blocks[b].insts.len())) {
-                self.group_barrier();
+                self.group_barrier(self.writes_uavs);
             }
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
@@ -3751,11 +3757,10 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Thread-group sync with a shared-memory fence, and a UAV fence when
-    /// the program writes UAVs (the waits before an s_barrier make those
-    /// writes visible on the console).
-    fn group_barrier(&mut self) {
-        let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
+    /// Thread-group sync with a shared-memory fence. Guest barriers also
+    /// fence UAV writes, which the waits before an s_barrier make visible.
+    fn group_barrier(&mut self, fence_uavs: bool) {
+        let mode = if fence_uavs { 1 | 2 | 8 } else { 1 | 8 };
         let mode = self.s.m.i32(mode);
         let void = self.s.t.void;
         self.s
@@ -3794,7 +3799,7 @@ impl<'a> Lower<'a> {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
             Fields::Sopp { .. } if name == "s_barrier" => {
-                self.group_barrier();
+                self.group_barrier(self.writes_uavs);
                 Ok(())
             }
             Fields::Sopp { .. } => Ok(()),
@@ -7250,6 +7255,31 @@ impl<'a> Lower<'a> {
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
+                // If the named lane exists and every console lane holds the
+                // same VGPR value, either host half already has the answer.
+                if self.halves
+                    && let Some(index) = v.src.get(1).copied().and_then(crate::resource::lane_of)
+                    && self.every_wave_has_lane(index)
+                {
+                    if matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
+                        if inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)))
+                    {
+                        return int(self, a);
+                    }
+                    let block = self.cur_ir;
+                    let p = self.x.p;
+                    // Lowering bounds backwards edges and may exit a loop early.
+                    // Exchange only before any such edge can bypass the barrier.
+                    let together = self.lane_sync_blocks.entry(block).or_insert_with(|| {
+                        group_visits_once(p, block, |q| {
+                            p.blocks[q].exit.successors().iter().any(|&s| self.rpo[s] <= self.rpo[q])
+                        })
+                    });
+                    if *together {
+                        let r = self.broadcast_fixed_lane(inst.machine.offset, a, lane)?;
+                        return int(self, r);
+                    }
+                }
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
                 if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
@@ -11772,6 +11802,30 @@ impl<'a> Lower<'a> {
     }
 }
 
+/// Every entry-to-exit path visits `block`, and no cycle visits it again.
+/// `extra_exit` includes exits introduced by the caller's lowering.
+fn group_visits_once(p: &Program, block: usize, extra_exit: impl Fn(usize) -> bool) -> bool {
+    if block == 0 && p.blocks[0].preds.is_empty() {
+        return true;
+    }
+    let reachable = |mut stack: Vec<usize>, avoid: Option<usize>| {
+        let mut seen = vec![false; p.blocks.len()];
+        while let Some(b) = stack.pop() {
+            if Some(b) == avoid || std::mem::replace(&mut seen[b], true) {
+                continue;
+            }
+            stack.extend(p.blocks[b].exit.successors());
+        }
+        seen
+    };
+    if reachable(p.blocks[block].exit.successors(), None)[block] {
+        return false;
+    }
+    block == 0 || !reachable(vec![0], Some(block)).iter().enumerate().any(|(q, &seen)| {
+        seen && (p.blocks[q].exit.successors().is_empty() || extra_exit(q))
+    })
+}
+
 /// Where a compute group that is one console wave needs group barriers
 /// when the host splits it into narrower waves: (block, instruction) to
 /// sync before, instruction index = the block's length for its end.
@@ -11788,28 +11842,8 @@ impl<'a> Lower<'a> {
 pub(crate) fn split_wave_barriers(p: &Program) -> Option<Set<(usize, usize)>> {
     let n = p.blocks.len();
     let succ = |b: usize| p.blocks[b].exit.successors();
-    // Blocks reachable from `from`'s successors (or from `from` itself when
-    // `start`), never entering `avoid`.
-    let reach = |from: usize, start: bool, avoid: Option<usize>| {
-        let mut seen = vec![false; n];
-        let mut stack = if start { vec![from] } else { succ(from) };
-        while let Some(b) = stack.pop() {
-            if Some(b) == avoid || std::mem::replace(&mut seen[b], true) {
-                continue;
-            }
-            stack.extend(succ(b));
-        }
-        seen
-    };
     let uniform: Vec<bool> = (0..n)
-        .map(|b| {
-            let ends_around = b != 0
-                && reach(0, true, Some(b))
-                    .iter()
-                    .enumerate()
-                    .any(|(q, &r)| r && succ(q).is_empty());
-            !reach(b, false, None)[b] && !ends_around
-        })
+        .map(|b| group_visits_once(p, b, |_| false))
         .collect();
     let order = crate::ir::reverse_postorder(&p.blocks);
     let mut dirty_out = vec![false; n];
