@@ -432,7 +432,7 @@ impl HostPipeline {
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
             stages
         };
-        if mesh.is_some() && !host()?.mesh_shaders() {
+        if mesh.is_some() && !host()?.mesh_support().supported() {
             return refuse(
                 "the host GPU has no mesh shaders (or no shader model 6.6)",
                 shaders,

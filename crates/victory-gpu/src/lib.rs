@@ -90,7 +90,7 @@ pub use copystat::CountingAlloc;
 #[cfg(windows)]
 pub use alias::{alias_region, enabled as alias_buffers, unalias_region};
 #[cfg(windows)]
-pub use host::on_failure;
+pub use host::{MeshSupport, host_mesh_support, on_failure};
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, fault_tracking, rosetta, stores_need_patching, title_memory_aliased,

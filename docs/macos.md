@@ -103,6 +103,11 @@ The steps are as follows.
 3. Run the probe under Wine to test the loader and HLE layer without any game files.
 4. Add D3DMetal from Apple's Game Porting Toolkit and check that VIctory creates a D3D12 device with mesh shaders and shader model 6.6.
 
+After setup, run `tools/macos/victory.sh gpu-check`. It uses the same D3D12
+device and feature checks as the renderer, and needs no game files. It prints
+the result for each feature and exits successfully when the device reports
+both. A failed feature query appears as `query failed`.
+
 ## Route B: a native macOS host
 
 Later work replaces the Windows host underneath the title. That needs a Rosetta x86-64 process that maps the PE image, a macOS version of the host pass-through in `victory-hle`, a Metal backend for `victory-gpu`, and DXIL to Metal conversion with Apple's Metal shader converter. This only makes sense after Route A shows where things break.
