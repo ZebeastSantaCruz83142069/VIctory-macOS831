@@ -425,13 +425,19 @@ impl Drop for PhysicalHeap {
 }
 
 #[cfg(feature = "diagnostics")]
-pub(crate) fn physical_heaps_enabled() -> bool {
+pub(crate) fn physical_heaps_requested() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         crate::switch::on("VICTORY_PHYSICAL_TILES")
             && !crate::watch::fault_tracking()
-            && supported().is_some()
+            && crate::watch::rosetta()
+            && !crate::switch::on("VICTORY_D3D12_WARP")
     })
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn physical_heaps_enabled() -> bool {
+    physical_heaps_requested() && supported().is_some()
 }
 
 /// Allocates CPU-visible physical tiles for the Rosetta diagnostics trial.

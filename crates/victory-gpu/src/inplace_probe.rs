@@ -919,26 +919,46 @@ fn reserved_xmem_shadow_rebinds_for_a_recorded_list() {
 
     const BASE: usize = 0x1_9460_0000;
     const ALIAS: usize = BASE + 8 * K64;
+    const SPARSE: usize = ALIAS + 8 * K64;
     const BYTES: usize = 4 * K64;
     static HEAP: OnceLock<Arc<crate::alias::PhysicalHeap>> = OnceLock::new();
     static ORDER: Mutex<[Option<u32>; 4]> = Mutex::new([Some(0), Some(1), Some(2), Some(3)]);
+    static SPARSE_VIEW: Mutex<(u64, bool)> = Mutex::new((1, false));
     let host = crate::host::host().expect("D3D12 host");
     let rig = Rig::new(&host.device).unwrap();
-    let heap = HEAP.get_or_init(|| Arc::new(crate::alias::PhysicalHeap::new(&host.device, BYTES).unwrap()));
+    let heap = HEAP.get_or_init(|| Arc::new(crate::alias::PhysicalHeap::new(&host.device, BYTES + K64).unwrap()));
     crate::physical::use_physical_layout(|base, len| {
+        use crate::physical::{PhysicalLayout, PhysicalTiles};
+        let heap = HEAP.get().unwrap();
+        if base == SPARSE && len == K64 {
+            let (reservation, mapped) = *SPARSE_VIEW.lock().unwrap();
+            let tiles = mapped.then(|| PhysicalTiles {
+                first: 0,
+                count: 1,
+                heap_tile: 4,
+                heap: heap.clone(),
+            });
+            return Some(PhysicalLayout {
+                tiles: tiles.into_iter().collect(),
+                reservation: Some(reservation),
+            });
+        }
         if !matches!(base, BASE | ALIAS) || len != BYTES {
             return None;
         }
-        Some(ORDER.lock().unwrap().iter().enumerate().filter_map(|(first, &tile)| {
-            Some(crate::physical::PhysicalTiles {
-                first: first as u32,
-                count: 1,
-                heap_tile: tile?,
-                heap: HEAP.get().unwrap().clone(),
-            })
-        }).collect())
+        Some(PhysicalLayout {
+            tiles: ORDER.lock().unwrap().iter().enumerate().filter_map(|(first, &tile)| {
+                Some(PhysicalTiles {
+                    first: first as u32,
+                    count: 1,
+                    heap_tile: tile?,
+                    heap: heap.clone(),
+                })
+            }).collect(),
+            reservation: None,
+        })
     });
-    for (tile, value) in [0x11, 0x22, 0x33, 0x44].into_iter().enumerate() {
+    for (tile, value) in [0x11, 0x22, 0x33, 0x44, 0x55].into_iter().enumerate() {
         // SAFETY: each tile is inside the CPU view and idle.
         unsafe { (heap.cpu_address() as *mut u8).add(tile * K64).write_bytes(value, K64) };
     }
@@ -948,33 +968,50 @@ fn reserved_xmem_shadow_rebinds_for_a_recorded_list() {
     crate::shadow::register(ALIAS, ALIAS as u64, BYTES as u64);
     let overlapping = crate::shadow::find(ALIAS as u64, BYTES as u64).unwrap();
     assert!(!overlapping.is_aliased(), "a second resource sharing these tiles keeps a copy");
+    crate::shadow::register(SPARSE, SPARSE as u64, K64 as u64);
+    let sparse = crate::shadow::find(SPARSE as u64, K64 as u64).unwrap();
+    assert!(sparse.is_aliased(), "the XMem reservation has no pages yet");
     let readback = rig.committed(
         D3D12_HEAP_TYPE_READBACK,
-        BYTES as u64,
+        (BYTES + K64) as u64,
         D3D12_RESOURCE_STATE_COPY_DEST,
     ).unwrap();
     let list = host.new_list().unwrap();
     // SAFETY: the list is open and both buffers are held across submissions.
-    unsafe { list.list.CopyBufferRegion(&readback, 0, &shadow.buffer, 0, BYTES as u64) };
+    unsafe {
+        list.list.CopyBufferRegion(&readback, 0, &shadow.buffer, 0, BYTES as u64);
+        list.list.CopyBufferRegion(&readback, BYTES as u64, &sparse.buffer, 0, K64 as u64);
+    }
     list.close();
     let mut data = std::ptr::null_mut();
     // SAFETY: the readback buffer is live, and only read after a completed submission.
     unsafe { readback.Map(0, None, Some(&mut data)).unwrap() };
-    for (order, expected) in [
-        ([Some(0), Some(1), Some(2), Some(3)], [0x11, 0x22, 0x33, 0x44]),
-        ([Some(2), Some(0), None, Some(1)], [0x33, 0x11, 0x00, 0x22]),
+    let original = [Some(0), Some(1), Some(2), Some(3)];
+    let remapped = [Some(2), Some(0), None, Some(1)];
+    for (order, sparse_view, expected) in [
+        (original, (1, false), [0x11, 0x22, 0x33, 0x44, 0x00]),
+        (remapped, (1, true), [0x33, 0x11, 0x00, 0x22, 0x55]),
+        ([None; 4], (1, false), [0x00; 5]),
+        (remapped, (1, true), [0x33, 0x11, 0x00, 0x22, 0x55]),
+        (remapped, (2, true), [0x33, 0x11, 0x00, 0x22, 0x00]),
     ] {
         *ORDER.lock().unwrap() = order;
+        *SPARSE_VIEW.lock().unwrap() = sparse_view;
         crate::physical::physical_layout_changed();
+        // SAFETY: the readback mapping is idle before the next submission.
+        unsafe { data.cast::<u8>().write_bytes(0xEE, BYTES + K64) };
         host.execute(&[&list]);
         // SAFETY: the completed submission wrote precisely these bytes.
-        let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), BYTES) };
-        for (tile, value) in bytes.as_chunks::<K64>().0.iter().zip(expected) {
-            assert!(tile.iter().all(|&byte| byte == value), "tile value {value:#x}");
+        let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), BYTES + K64) };
+        for (index, (tile, value)) in bytes.as_chunks::<K64>().0.iter().zip(expected).enumerate() {
+            if let Some(&actual) = tile.iter().find(|&&byte| byte != value) {
+                panic!("layout {sparse_view:?} tile {index}: expected {value:#x}, got {actual:#x}");
+            }
         }
     }
     // SAFETY: this test previously mapped the readback buffer.
     unsafe { readback.Unmap(0, None) };
     crate::shadow::unregister(BASE, BASE as u64);
     crate::shadow::unregister(ALIAS, ALIAS as u64);
+    crate::shadow::unregister(SPARSE, SPARSE as u64);
 }

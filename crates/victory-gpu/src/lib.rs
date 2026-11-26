@@ -96,7 +96,10 @@ pub use alias::{alias_region, enabled as alias_buffers, unalias_region};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use alias::{PhysicalHeap, physical_heap};
 #[cfg(all(windows, feature = "diagnostics"))]
-pub use physical::{PhysicalTiles, physical_layout_changed, use_physical_layout};
+pub use physical::{
+    PhysicalLayout, PhysicalTiles, physical_layout_changed, sparse_physical_buffers,
+    use_physical_layout,
+};
 #[cfg(windows)]
 pub use host::{MeshSupport, host_mesh_support, on_failure};
 #[cfg(windows)]
