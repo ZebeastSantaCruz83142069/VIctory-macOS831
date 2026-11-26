@@ -3243,10 +3243,9 @@ fn taken(from: usize, to: usize, memory: (usize, usize)) -> (usize, usize) {
     }
 }
 
-/// Reads through the runtime's own view of a mapped physical section.
-/// Returns false if the range is not covered by such a view.
+/// Reads the prefix covered by the runtime's own physical section view.
 #[cfg(feature = "diagnostics")]
-type MappedReader = fn(usize, &mut [u8]) -> bool;
+type MappedReader = fn(usize, &mut [u8]) -> usize;
 #[cfg(feature = "diagnostics")]
 static MAPPED_READER: OnceLock<MappedReader> = OnceLock::new();
 
@@ -3254,6 +3253,19 @@ static MAPPED_READER: OnceLock<MappedReader> = OnceLock::new();
 #[cfg(feature = "diagnostics")]
 pub fn use_mapped_reader(read: MappedReader) {
     let _ = MAPPED_READER.set(read);
+}
+
+#[cfg(feature = "diagnostics")]
+fn read_mapped_prefix(read: MappedReader, at: usize, dst: *mut u8, len: usize) -> usize {
+    let started = std::time::Instant::now();
+    // SAFETY: the caller passes `len` writable bytes in a host buffer.
+    let copied = read(at, unsafe { std::slice::from_raw_parts_mut(dst, len) });
+    if copied != 0 {
+        use crate::copystat::{C, add};
+        add(C::PhysicalReadBytes, copied as u64);
+        add(C::PhysicalReadUs, started.elapsed().as_micros() as u64);
+    }
+    copied
 }
 
 /// Copies title memory at submission. The ranges were checked against their
@@ -3284,22 +3296,38 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         return;
     }
     #[cfg(feature = "diagnostics")]
-    if !title_dst && len >= crate::watch::PAGE {
+    let physical = if !title_dst && len >= crate::watch::PAGE {
         static DIRECT: OnceLock<bool> = OnceLock::new();
-        if *DIRECT.get_or_init(|| crate::watch::rosetta() && crate::switch::on("VICTORY_PHYSICAL_READ"))
-            && let Some(read) = MAPPED_READER.get()
-        {
-            let started = std::time::Instant::now();
-            // SAFETY: the caller gives us `len` writable bytes in its own
-            // host buffer. The runtime's section is independent of it.
-            if read(src as usize, unsafe { std::slice::from_raw_parts_mut(dst, len) }) {
-                use crate::copystat::{C, add};
-                add(C::PhysicalReadBytes, len as u64);
-                add(C::PhysicalReadUs, started.elapsed().as_micros() as u64);
-                return;
-            }
+        if *DIRECT.get_or_init(|| crate::watch::rosetta() && crate::switch::on("VICTORY_PHYSICAL_READ")) {
+            MAPPED_READER.get().copied()
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
+    #[cfg(feature = "diagnostics")]
+    let (dst, src, len) = if let Some(read) = physical {
+        let mut copied = 0;
+        while copied < len {
+            let n = read_mapped_prefix(
+                read,
+                src as usize + copied,
+                dst.wrapping_add(copied),
+                len - copied,
+            );
+            if n == 0 {
+                break;
+            }
+            copied += n;
+        }
+        if copied == len {
+            return;
+        }
+        (dst.wrapping_add(copied), src.wrapping_add(copied), len - copied)
+    } else {
+        (dst, src, len)
+    };
     // The kernel writes the destination: it must not be guarded meanwhile.
     let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
     #[cfg(feature = "diagnostics")]
@@ -3329,6 +3357,14 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let (start, end) = (src as usize, src as usize + len);
     let mut at = start;
     while at < end {
+        #[cfg(feature = "diagnostics")]
+        if let Some(read) = physical {
+            let copied = read_mapped_prefix(read, at, dst.wrapping_add(at - start), end - at);
+            if copied != 0 {
+                at += copied;
+                continue;
+            }
+        }
         let (region_end, readable) = source_region(at);
         let next = region_end.min(end);
         let to = dst.wrapping_add(at - start);
@@ -3513,6 +3549,39 @@ mod title_copies {
         assert!(to[BLOCK..2 * BLOCK].iter().all(|&b| b == 0));
         assert!(to[2 * BLOCK..].iter().all(|&b| b == 7));
         release(holes);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    #[ignore = "requires Rosetta with VICTORY_PHYSICAL_READ=1"]
+    fn physical_prefixes_fill_both_sides_of_a_sparse_copy() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static BASE: AtomicUsize = AtomicUsize::new(0);
+        let src = holed(7);
+        BASE.store(src as usize, Ordering::Relaxed);
+        super::use_mapped_reader(|at, dst| {
+            let base = BASE.load(Ordering::Relaxed);
+            if base == 0 {
+                return 0;
+            }
+            let Some(offset) = at.checked_sub(base) else { return 0 };
+            let fill = match offset / BLOCK {
+                0 => 24,
+                2 => 42,
+                _ => return 0,
+            };
+            let len = dst.len().min(BLOCK - offset % BLOCK);
+            dst[..len].fill(fill);
+            len
+        });
+        let mut dst = vec![0xEE; 3 * BLOCK - 100];
+        copy_mapped(dst.as_mut_ptr(), src.wrapping_add(100), dst.len(), false);
+        BASE.store(0, Ordering::Relaxed);
+        release(src);
+        assert!(dst[..BLOCK - 100].iter().all(|&b| b == 24));
+        assert!(dst[BLOCK - 100..2 * BLOCK - 100].iter().all(|&b| b == 0));
+        assert!(dst[2 * BLOCK - 100..].iter().all(|&b| b == 42));
     }
 
     #[test]

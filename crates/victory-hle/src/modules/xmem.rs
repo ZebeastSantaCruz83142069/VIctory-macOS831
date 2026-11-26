@@ -435,34 +435,34 @@ impl Drop for Section {
     }
 }
 
-/// Joins a GPU refresh to the section behind a single mapped title view.
-/// Wine commits these sections whole. The section's own view stays alive
-/// through the copy, even if the title unmaps its view in the meantime.
+/// Copies the prefix of a GPU refresh covered by one physical view. The
+/// section's CPU view stays alive through the copy even if the title
+/// unmaps its view. Returns zero if the refresh starts outside a view.
 #[cfg(any(test, feature = "diagnostics"))]
-pub(crate) fn read_physical_view(at: usize, dst: &mut [u8]) -> bool {
+pub(crate) fn read_physical_view(at: usize, dst: &mut [u8]) -> usize {
     if !on_wine() {
-        return false;
+        return 0;
     }
-    let (section, offset) = {
+    let (section, offset, len) = {
         let physical = physical();
         let Some((&base, (size, slice))) = physical.views.range(..=at).next_back() else {
-            return false;
+            return 0;
         };
         let offset = at - base;
-        if offset > *size || dst.len() > size - offset {
-            return false;
+        if offset >= *size {
+            return 0;
         }
-        (slice.section.clone(), slice.index * PAGE + offset)
+        (slice.section.clone(), slice.index * PAGE + offset, dst.len().min(size - offset))
     };
     let Some(whole) = section.whole() else {
-        return false;
+        return 0;
     };
     // SAFETY: these bytes are in the section's committed view. Holding
     // the section keeps it mapped, and the destination is ours alone.
     unsafe {
-        std::ptr::copy_nonoverlapping((whole + offset) as *const u8, dst.as_mut_ptr(), dst.len())
+        std::ptr::copy_nonoverlapping((whole + offset) as *const u8, dst.as_mut_ptr(), len)
     };
-    true
+    len
 }
 
 /// Where a page lives, or what a view starts with: a section and a page
@@ -1560,10 +1560,13 @@ mod tests {
         assert_eq!(unsafe { at(b, 1).cast::<u8>().add(1).read() }, 9);
         if on_wine() {
             let mut bytes = [0xCC; 2];
-            assert!(read_physical_view(at(b, 1) as usize, &mut bytes));
+            assert_eq!(read_physical_view(at(b, 1) as usize, &mut bytes), 2);
             assert_eq!(bytes, [7, 9], "the view starts on the third section page");
-            assert!(!read_physical_view(at(b, 2) as usize - 1, &mut bytes));
-            assert_eq!(bytes, [7, 9], "a range crossing a hole falls back");
+            // SAFETY: the byte just before this hole is in the mapped view.
+            unsafe { at(b, 2).cast::<u8>().sub(1).write(0xE5) };
+            assert_eq!(read_physical_view(at(b, 2) as usize - 1, &mut bytes), 1);
+            assert_eq!(bytes, [0xE5, 9], "the prefix stops at the hole");
+            assert_eq!(read_physical_view(at(b, 2) as usize, &mut bytes), 0);
         }
 
         // Unmapping the middle page keeps its neighbours.
