@@ -3038,12 +3038,10 @@ impl Batch {
         let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
         // Only what is not current: most lists ask for a copy whole, after
         // a title copy took a few bytes of it.
-        let todo = match self.current.get(&key) {
-            Some((_, have)) => have.missing(address, end),
-            None if len > 0 => vec![(address, end)],
-            None => return,
-        };
-        if todo.is_empty() {
+        let empty = crate::ranges::Ranges::default();
+        let have = self.current.get(&key).map_or(&empty, |(_, have)| have);
+        let mut todo = have.missing(address, end).peekable();
+        if todo.peek().is_none() {
             return;
         }
         let i = *self.pending.entry(key).or_insert_with(|| {
