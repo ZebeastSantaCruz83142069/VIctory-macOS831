@@ -120,6 +120,8 @@ In the Series S composer, the loading artwork gave way to the opening cutscene. 
 
 The experimental Series S display subsequently showed a sky, tree silhouettes and the HUD after the title card. Its foreground remained black. At the matching 736-draw interval, the renderer measured 8.83 seconds per frame, 6.74 GB of buffer copies and 1.04 seconds on the GPU. This run used an intermediate lighting texture. Player control and the game's final lighting remain unverified. [Sky-frame measurements](https://github.com/ZebeastSantaCruz83142069/VIctory-macOS831/pull/8#issuecomment-7190796015)
 
+Two Series S runs on this Mac compared the first 20 opening-scene reports with at least 100 draws per frame. Median frame time fell from 7.86 to 5.01 seconds with the experimental vector-copy build (0.127 to 0.199 FPS). Median time spent copying buffers fell from 6.71 to 3.50 seconds per frame, with roughly 15 GB copied in each case. The runs had different draw counts, cache states and capture settings. The new build still showed dark silhouettes. [Opening-scene comparison and settings](https://github.com/ZebeastSantaCruz83142069/VIctory-macOS831/commit/48ff3a9e1e73bdc24092452bc5312d4362d50803)
+
 On the same set of 50 game compute shaders, the Mac translator emitted 18 after it gained fixed-lane reads in the entry block. It emits 36 when all threads can also exchange a value after control flow rejoins. Microsoft's DXIL validator accepted all 36 and D3DMetal created all 36 pipelines on this Mac. The separate source-built Series S compositor already created all 50 pipelines in this set. [Initial shader comparison](https://github.com/ZebeastSantaCruz83142069/VIctory-macOS831/pull/8#issuecomment-7189751510)
 
 ## Route B: a native macOS host
