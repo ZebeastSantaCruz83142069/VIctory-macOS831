@@ -108,6 +108,14 @@ device and feature checks as the renderer, and needs no game files. It prints
 the result for each feature and exits successfully when the device reports
 both. A failed feature query appears as `query failed`.
 
+### Route A on M1 Max, 26 November 2026
+
+On an M1 Max with 64 GiB, macOS 26.6.2, CrossOver Preview 27.0.0.41069 and D3DMetal 4.0 beta 3, both synthetic Windows loader tests passed. The runtime created a D3D12 device and reported mesh shaders and Shader Model 6.6. The test for the indirect-argument shader compiled with DXC also passed on that device.
+
+The Series X build requested a 33.333 ms frame interval and presented a single 3840 × 2160 plane. On the tested revision `e5ed20a`, the title submitted three draws per frame and every sampled image through frame 16,384 was black. The host pipeline queue finished before the run ended at frame 17,707. A separate launch on the same Mac had displayed menus and reached the 500-draw world-loading threshold. Its first two sampled images past the threshold were also black. The title-bar rate alone cannot verify gameplay. [Test results and build revisions](https://github.com/ZebeastSantaCruz83142069/VIctory-macOS831/pull/8)
+
+A separate profile requested 60 FPS at 4K. The game still requested 33.333 ms at startup. The Windows x64 Pareto Residency release stopped in Rosetta before its first present. A locally rebuilt Series S composer displayed loading artwork at 9 and 24 FPS in two samples. During the transition to the opening scene, the process read over 1 GB of additional data and the renderer advanced to hundreds of draws per frame. Four reports took 4.33 to 7.53 seconds per frame and refreshed roughly 7 GB of buffers each. Player control at 60 FPS remains unverified. [Series S transition measurements](https://github.com/ZebeastSantaCruz83142069/VIctory-macOS831/pull/8#issuecomment-7189371408)
+
 ## Route B: a native macOS host
 
 Later work replaces the Windows host underneath the title. That needs a Rosetta x86-64 process that maps the PE image, a macOS version of the host pass-through in `victory-hle`, a Metal backend for `victory-gpu`, and DXIL to Metal conversion with Apple's Metal shader converter. This only makes sense after Route A shows where things break.
