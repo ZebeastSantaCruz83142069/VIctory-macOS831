@@ -565,10 +565,9 @@ fn log_planes(frame: u64, planes: u32, found: &[Vec<This>], shown: usize) {
     }
 }
 
-/// The plane whose first resource is shown: `VICTORY_PRESENT_PLANE=<n>`
-/// (counted from 0) when that plane was found, else the plane whose first
-/// resource has the most pixels (#15: on Series S plane 0 is a 1920x1080
-/// overlay and plane 1 the 3840x2160 picture). Ties keep the earlier plane.
+/// The base plane for composition or the single plane to show. Composition
+/// follows the submitted order. A valid `VICTORY_PRESENT_PLANE` overrides
+/// selection.
 #[cfg(windows)]
 fn shown_plane(found: &[Vec<This>]) -> usize {
     static PLANE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
@@ -585,17 +584,20 @@ fn shown_plane(found: &[Vec<This>]) -> usize {
             })
         })
         .collect();
-    pick_plane(want, &areas)
+    pick_plane(want, &areas, crate::composite::wanted())
 }
 
-/// The plane to show given an override and each plane's first resource
-/// area (0 when unknown): the override when in range, else the largest.
+/// The base plane given an override and each plane's first resource area.
+/// With two usable planes, blend the second over the first.
 #[cfg(any(windows, test))]
-fn pick_plane(want: Option<usize>, areas: &[u64]) -> usize {
+fn pick_plane(want: Option<usize>, areas: &[u64], composite: bool) -> usize {
     if let Some(w) = want
         && w < areas.len()
     {
         return w;
+    }
+    if composite && matches!(areas, [first, second] if *first != 0 && *second != 0) {
+        return 0;
     }
     let mut best = 0;
     for (i, &a) in areas.iter().enumerate() {
@@ -606,11 +608,8 @@ fn pick_plane(want: Option<usize>, areas: &[u64]) -> usize {
     best
 }
 
-/// Shows the first resource of one plane in our window (the largest
-/// plane unless `VICTORY_PRESENT_PLANE` picks another).
-///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// Shows the selected plane in our window and blends the second plane
+/// when composition is enabled.
 extern "system" fn present(
     _: This,
     planes: u32,
@@ -676,8 +675,7 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        // The other plane's first resource, blended over the picture when
-        // `VICTORY_PRESENT_COMPOSITE=1` (#15: a 1080p overlay on Series S).
+        // The other plane's first resource, blended over the base plane.
         let other = (found.len() == 2)
             .then(|| found[1 - shown].first().copied())
             .flatten()
@@ -883,17 +881,25 @@ mod tests {
     /// host.
     #[test]
     fn the_largest_plane_is_shown_unless_one_is_named() {
-        // Series S: a 1080p overlay, then the 4K picture.
+        // Series S presents two planes at different resolutions.
         let series_s = [1920 * 1080, 3840 * 2160];
-        assert_eq!(pick_plane(None, &series_s), 1);
-        assert_eq!(pick_plane(Some(0), &series_s), 0);
+        assert_eq!(pick_plane(None, &series_s, false), 1);
+        assert_eq!(pick_plane(Some(0), &series_s, false), 0);
         // An override past the planes found falls back to the largest.
-        assert_eq!(pick_plane(Some(5), &series_s), 1);
+        assert_eq!(pick_plane(Some(5), &series_s, false), 1);
         // Series X: one plane. Ties and unknown sizes keep the first.
-        assert_eq!(pick_plane(None, &[3840 * 2160]), 0);
-        assert_eq!(pick_plane(None, &[0, 0]), 0);
-        assert_eq!(pick_plane(None, &[100, 100]), 0);
-        assert_eq!(pick_plane(None, &[]), 0);
+        assert_eq!(pick_plane(None, &[3840 * 2160], false), 0);
+        assert_eq!(pick_plane(None, &[0, 0], false), 0);
+        assert_eq!(pick_plane(None, &[100, 100], false), 0);
+        assert_eq!(pick_plane(None, &[], false), 0);
+    }
+
+    #[test]
+    fn composition_uses_submitted_order_and_honors_overrides() {
+        let series_s = [1920 * 1080, 3840 * 2160];
+        assert_eq!(pick_plane(None, &series_s, true), 0);
+        assert_eq!(pick_plane(Some(1), &series_s, true), 1);
+        assert_eq!(pick_plane(None, &[0, series_s[1]], true), 1);
     }
 
     /// Two planes 64 bytes apart (as a longer plane description would
