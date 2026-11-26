@@ -692,6 +692,47 @@ fn entry_lane_reads_cross_halves_and_keep_console_waves_separate() {
 }
 
 #[test]
+fn fixed_lane_reads_after_both_paths_rejoin_match_the_console() {
+    let mut words = PROLOGUE.to_vec();
+    words.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E04_0300, // v_mov_b32 v2, v0
+        0xBE80_047E, // s_mov_b64 s[0:1], exec
+        0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+        0xBF88_0001, // s_cbranch_execz to the join
+        0x7E04_02BF, // v_mov_b32 v2, 63
+        0xBEFE_0400, // join: s_mov_b64 exec, s[0:1]
+        0xD760_000C,
+        0x0001_0102, // v_readlane_b32 s12, v2, 0
+        0x7E02_020C, // v_mov_b32 v1, s12
+    ]);
+    words.extend(store(1, 0));
+    words.push(S_ENDPGM);
+    assert_eq!(refusal(&words, 128, 0), "translated");
+    let want: Vec<_> = (0..128).map(|i| if i < 64 { 63 } else { 64 }).collect();
+    let failed = differences(&words, 128, 1, &want);
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+#[test]
+fn a_fixed_lane_exchange_after_a_counted_loop_is_refused() {
+    let mut words = PROLOGUE.to_vec();
+    words.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xBE8A_0382, // s_mov_b32 s10, 2
+        0x808A_810A, // loop: s_sub_u32 s10, s10, 1
+        0xBF07_800A, // s_cmp_lg_u32 s10, 0
+        0xBF85_FFFD, // s_cbranch_scc1 loop
+        0xD760_000C,
+        0x0001_5100, // v_readlane_b32 s12, v0, 40
+        0x7E02_020C, // v_mov_b32 v1, s12
+    ]);
+    words.extend(store(1, 0));
+    words.push(S_ENDPGM);
+    assert!(refusal(&words, 64, 0).contains("a lane read that may cross"));
+}
+
+#[test]
 fn varying_lane_reads_under_a_branch_do_not_insert_a_group_barrier() {
     let mut words = PROLOGUE.to_vec();
     words.extend([

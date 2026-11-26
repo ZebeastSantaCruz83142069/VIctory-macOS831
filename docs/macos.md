@@ -118,7 +118,9 @@ A separate profile requested 60 FPS at 4K. The game still requested 33.333 ms at
 
 In the Series S composer, the loading artwork gave way to the opening cutscene. At frame 4,273, the displayed capture had zero RGB across the entire frame. Intermediate scene and depth targets from that same frame contained identifiable buildings and foliage. In a separate run, six world-loading reports had a median frame time of 5.96 seconds and a median of 9.29 GB of buffer refreshes per frame. The tests have yet to establish visible, player-controlled gameplay. [Scene and depth capture findings](https://github.com/ZebeastSantaCruz83142069/VIctory-macOS831/pull/8#issuecomment-7189966624)
 
-The Mac translator emitted 18 of 50 game compute shaders that the preceding release refused for reads between 32-lane halves. Microsoft's DXIL validator accepted all 18, and D3DMetal created all 18 pipelines on this Mac. [Shader comparison](https://github.com/ZebeastSantaCruz83142069/VIctory-macOS831/pull/8#issuecomment-7189751510)
+The experimental Series S display subsequently showed a sky, tree silhouettes and the HUD after the title card. Its foreground remained black. At the matching 736-draw interval, the renderer measured 8.83 seconds per frame, 6.74 GB of buffer copies and 1.04 seconds on the GPU. This run used an intermediate lighting texture. Player control and the game's final lighting remain unverified. [Sky-frame measurements](https://github.com/ZebeastSantaCruz83142069/VIctory-macOS831/pull/8#issuecomment-7190796015)
+
+On the same set of 50 game compute shaders, the Mac translator emitted 18 after it gained fixed-lane reads in the entry block. It emits 36 when all threads can also exchange a value after control flow rejoins. Microsoft's DXIL validator accepted all 36 and D3DMetal created all 36 pipelines on this Mac. The separate source-built Series S compositor already created all 50 pipelines in this set. [Initial shader comparison](https://github.com/ZebeastSantaCruz83142069/VIctory-macOS831/pull/8#issuecomment-7189751510)
 
 ## Route B: a native macOS host
 

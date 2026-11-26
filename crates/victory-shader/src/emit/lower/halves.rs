@@ -22,7 +22,7 @@
 //!   half's lanes unless the whole group fits one host wave),
 //!   `v_readlane_b32` of a lane that may be in the other half, unless a
 //!   fixed, populated lane holds a value uniform across the console wave or
-//!   the whole group can exchange it in the entry block
+//!   the whole group reaches its exchange exactly once before any loop
 //!   (SGPR spills read back are not lane reads), and whole-wave reductions
 //!   (unless an active reduction fits one host wave) and prefix sums;
 //! * `v_readfirstlane_b32` reads the host wave's first lane, which in the
@@ -138,7 +138,7 @@ impl Lower<'_> {
     /// Broadcasts a populated, fixed lane from a block the group enters once.
     /// Only the requested lane writes each wave's word. A separate word for
     /// each instruction lets both halves read it without a second barrier.
-    pub(super) fn read_entry_lane(&mut self, offset: usize, value: V, lane: V) -> Result<V, Why> {
+    pub(super) fn broadcast_fixed_lane(&mut self, offset: usize, value: V, lane: V) -> Result<V, Why> {
         if self.one_host_wave() {
             self.s.flags |= flags::WAVE_OPS;
             return Ok(self.read_lane(value, lane));

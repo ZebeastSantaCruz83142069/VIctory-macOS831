@@ -306,6 +306,8 @@ struct Lower<'a> {
     halves_refused: Option<Why>,
     /// Group-shared words used by fixed lane reads, in addition to guest LDS.
     lane_scratch_dwords: u32,
+    /// Whether all threads reach a fixed-lane exchange in this IR block exactly once.
+    lane_sync_blocks: Map<usize, bool>,
     /// [`Lower::relabelled_flat`], once made.
     relabelled: Option<V>,
     /// In halves: VGPR values the same in every lane of the console wave
@@ -837,6 +839,7 @@ impl<'a> Lower<'a> {
             halves,
             halves_refused,
             lane_scratch_dwords: 0,
+            lane_sync_blocks: Map::default(),
             relabelled: None,
             alike: if halves {
                 halves::lane_uniform(x)
@@ -7157,9 +7160,17 @@ impl<'a> Lower<'a> {
                     {
                         return int(self, a);
                     }
-                    // All threads enter this block together, exactly once.
-                    if self.cur_ir == 0 && self.x.p.blocks[0].preds.is_empty() {
-                        let r = self.read_entry_lane(inst.machine.offset, a, lane)?;
+                    let block = self.cur_ir;
+                    let p = self.x.p;
+                    // Lowering bounds backwards edges and may exit a loop early.
+                    // Exchange only before any such edge can bypass the barrier.
+                    let together = self.lane_sync_blocks.entry(block).or_insert_with(|| {
+                        group_visits_once(p, block, |q| {
+                            p.blocks[q].exit.successors().iter().any(|&s| self.rpo[s] <= self.rpo[q])
+                        })
+                    });
+                    if *together {
+                        let r = self.broadcast_fixed_lane(inst.machine.offset, a, lane)?;
                         return int(self, r);
                     }
                 }
@@ -11685,6 +11696,30 @@ impl<'a> Lower<'a> {
     }
 }
 
+/// Every entry-to-exit path visits `block`, and no cycle visits it again.
+/// `extra_exit` includes exits introduced by the caller's lowering.
+fn group_visits_once(p: &Program, block: usize, extra_exit: impl Fn(usize) -> bool) -> bool {
+    if block == 0 && p.blocks[0].preds.is_empty() {
+        return true;
+    }
+    let reachable = |mut stack: Vec<usize>, avoid: Option<usize>| {
+        let mut seen = vec![false; p.blocks.len()];
+        while let Some(b) = stack.pop() {
+            if Some(b) == avoid || std::mem::replace(&mut seen[b], true) {
+                continue;
+            }
+            stack.extend(p.blocks[b].exit.successors());
+        }
+        seen
+    };
+    if reachable(p.blocks[block].exit.successors(), None)[block] {
+        return false;
+    }
+    block == 0 || !reachable(vec![0], Some(block)).iter().enumerate().any(|(q, &seen)| {
+        seen && (p.blocks[q].exit.successors().is_empty() || extra_exit(q))
+    })
+}
+
 /// Where a compute group that is one console wave needs group barriers
 /// when the host splits it into narrower waves: (block, instruction) to
 /// sync before, instruction index = the block's length for its end.
@@ -11701,28 +11736,8 @@ impl<'a> Lower<'a> {
 pub(crate) fn split_wave_barriers(p: &Program) -> Option<Set<(usize, usize)>> {
     let n = p.blocks.len();
     let succ = |b: usize| p.blocks[b].exit.successors();
-    // Blocks reachable from `from`'s successors (or from `from` itself when
-    // `start`), never entering `avoid`.
-    let reach = |from: usize, start: bool, avoid: Option<usize>| {
-        let mut seen = vec![false; n];
-        let mut stack = if start { vec![from] } else { succ(from) };
-        while let Some(b) = stack.pop() {
-            if Some(b) == avoid || std::mem::replace(&mut seen[b], true) {
-                continue;
-            }
-            stack.extend(succ(b));
-        }
-        seen
-    };
     let uniform: Vec<bool> = (0..n)
-        .map(|b| {
-            let ends_around = b != 0
-                && reach(0, true, Some(b))
-                    .iter()
-                    .enumerate()
-                    .any(|(q, &r)| r && succ(q).is_empty());
-            !reach(b, false, None)[b] && !ends_around
-        })
+        .map(|b| group_visits_once(p, b, |_| false))
         .collect();
     let order = crate::ir::reverse_postorder(&p.blocks);
     let mut dirty_out = vec![false; n];
