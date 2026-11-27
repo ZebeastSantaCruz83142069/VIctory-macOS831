@@ -4168,7 +4168,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     let start = src as usize;
     let hint = (!title_dst && len >= 64 << 10 && sparse_copy_hints())
-        .then(|| ((start >> 16) ^ (start >> 22) ^ (len >> 16)) & (SPARSE_COPY_HINTS - 1));
+        .then_some(((start >> 16) ^ (start >> 22) ^ (len >> 16)) & (SPARSE_COPY_HINTS - 1));
     let walk_first = hint.is_some_and(|slot| {
         SPARSE_COPIES.with_borrow(|hints| hints[slot] == (start, len))
     });
