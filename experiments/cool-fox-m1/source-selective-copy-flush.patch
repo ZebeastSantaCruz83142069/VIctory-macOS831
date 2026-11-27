@@ -1,0 +1,100 @@
+From a10735eb06ef47437120918851c0a9ecc2dca7cf Mon Sep 17 00:00:00 2001
+From: ZebeastSantaCruz83142069
+ <361184274+ZebeastSantaCruz83142069@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 18:49:16 -0800
+Subject: [PATCH] Keep disjoint buffer refreshes queued across private title
+ copies
+
+Adapt the selective-flush approach from VIctory-macOS #452 by gdemontalivet to the experimental Series S renderer.
+---
+ crates/victory-gpu/src/host.rs | 60 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 59 insertions(+), 1 deletion(-)
+
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index cbef1d2..0190a05 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -7356,7 +7356,7 @@ impl HostList {
+                         copies += 1;
+                     }
+                     batch.fill();
+-                    batch.title_written();
++                    batch.title_copied(dst, len);
+                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                     // With the submission's one asking: the journal learns it.
+                     crate::watch::wrote(dst, len);
+@@ -8064,6 +8064,36 @@ impl Batch {
+         self.textures.clear();
+     }
+ 
++    /// Keep disjoint buffer requests pending across a copy to private
++    /// memory. A mapped destination may change bytes at another address.
++    fn title_copied(&mut self, address: usize, len: usize) {
++        static ENABLED: OnceLock<bool> = OnceLock::new();
++        if !*ENABLED.get_or_init(|| crate::switch::on("VICTORY_SELECTIVE_COPY_FLUSH"))
++            || self.refreshes.len() < 2
++            || !crate::inplace::private_whole(address, len)
++        {
++            self.title_written();
++            return;
++        }
++        self.refresh_textures();
++        self.textures.clear();
++        self.ahead.clear();
++        let from = address / crate::watch::PAGE * crate::watch::PAGE;
++        let Some(to) = address.saturating_add(len).checked_next_multiple_of(crate::watch::PAGE) else {
++            self.title_written();
++            return;
++        };
++        let overlaps: Vec<_> = self
++            .refreshes
++            .iter()
++            .filter(|r| r.ranges().any(|(a, b)| a < to && b > from))
++            .map(|r| r.shadow.clone())
++            .collect();
++        for shadow in overlaps {
++            self.flush_one(&shadow);
++        }
++    }
++
+     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
+     /// submission beginning at each of `parts`.
+     fn refresh_front(&mut self, runs: &[&HostList], parts: &[usize]) {
+@@ -10697,6 +10727,34 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at
+     use super::Batch;
+     use std::sync::Arc;
+ 
++    #[test]
++    fn private_copy_preserves_unrelated_pending_refreshes() {
++        use crate::shadow::Shadow;
++        use crate::watch::PAGE;
++        let mut title = vec![7u8; 16 * PAGE];
++        let mut near = vec![0u8; PAGE];
++        let mut far = vec![0u8; PAGE];
++        let address = title.as_mut_ptr() as usize;
++        let other = address + 8 * PAGE;
++        let a = Shadow::unbacked(address as u64, near.as_mut_ptr(), PAGE as u64, false);
++        let b = Shadow::unbacked(other as u64, far.as_mut_ptr(), PAGE as u64, false);
++        let mut batch = Batch::default();
++        batch.add(&a, address, PAGE);
++        batch.add(&b, other, PAGE);
++        batch.title_copied(address, PAGE);
++        let selective = crate::switch::on("VICTORY_SELECTIVE_COPY_FLUSH");
++        assert_eq!(batch.refreshes.len(), usize::from(selective));
++        assert_eq!(batch.index.len(), usize::from(selective));
++        assert!(near.iter().all(|&byte| byte == 7));
++        assert!(far.iter().all(|&byte| byte == if selective { 0 } else { 7 }));
++
++        title[..PAGE].fill(19);
++        batch.add(&a, address, PAGE);
++        batch.flush();
++        assert!(near.iter().all(|&byte| byte == 19));
++        assert!(far.iter().all(|&byte| byte == 7));
++    }
++
+     #[test]
+     fn disjoint_refreshes_copy_only_the_requested_ranges() {
+         use crate::shadow::Shadow;
+-- 
+2.50.1 (Apple Git-155)
+
