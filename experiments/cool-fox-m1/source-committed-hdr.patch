@@ -1,0 +1,778 @@
+diff --git a/crates/victory-gpu/src/capture.rs b/crates/victory-gpu/src/capture.rs
+index e0d47d0..f08f737 100644
+--- a/crates/victory-gpu/src/capture.rs
++++ b/crates/victory-gpu/src/capture.rs
+@@ -3,6 +3,8 @@
+ //! two (the frames the log reports) is saved as `frame-<n>.png`, at half
+ //! size. Only in builds with diagnostics.
+ 
++pub(crate) mod lighting;
++
+ use std::path::PathBuf;
+ 
+ use windows::Win32::Graphics::Direct3D12::*;
+diff --git a/crates/victory-gpu/src/capture/lighting.rs b/crates/victory-gpu/src/capture/lighting.rs
+new file mode 100644
+index 0000000..19a0275
+--- /dev/null
++++ b/crates/victory-gpu/src/capture/lighting.rs
+@@ -0,0 +1,252 @@
++//! Bounded readbacks of the opening scene's HDR target at the dispatch itself.
++use super::*;
++use std::sync::OnceLock;
++use std::sync::atomic::{AtomicU32, Ordering};
++
++#[derive(Clone, Copy)]
++pub(crate) struct Probe {
++    pub pass: &'static str,
++    pub table: usize,
++    pub word: u32,
++    pub occurrence: u32,
++    pub frame: u64,
++}
++
++pub(crate) fn enabled() -> bool {
++    static ENABLED: OnceLock<bool> = OnceLock::new();
++    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_TRACE_WORLD_COLOR").is_some_and(|v| v == "1"))
++}
++
++pub(crate) fn select(hash: &str) -> Option<Probe> {
++    static HITS: [AtomicU32; 5] = [const { AtomicU32::new(0) }; 5];
++    if !enabled() {
++        return None;
++    }
++    // UAV table and dword offset observed in the Series S command lists.
++    let (i, pass, table, word) = match hash {
++        "f0c91b4d2578f5bf" => (0, "tiled_lighting", 1, 56),
++        "348e1e8c414c7eca" => (1, "sky", 1, 72),
++        "577248728544d74b" => (2, "scattering", 1, 48),
++        "6a6c7b7fde59134f" => (3, "upscale_6a6c", 0, 24),
++        "fdce2a0a9fb1521a" => (4, "upscale_fdce", 0, 8),
++        _ => return None,
++    };
++    let occurrence = HITS[i].fetch_add(1, Ordering::Relaxed) + 1;
++    matches!(occurrence, 1 | 6 | 21).then(|| Probe {
++        pass,
++        table,
++        word,
++        occurrence,
++        frame: crate::queue::presented() + 1,
++    })
++}
++
++pub(crate) struct Sample {
++    pub(crate) buffer: ID3D12Resource,
++    footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
++}
++
++#[derive(Debug)]
++pub(crate) struct Counts {
++    positive_rgb: usize,
++    bottom_positive_rgb: usize,
++    nonfinite_rgb: usize,
++    bottom_above: [usize; 3],
++    rgba_hash: blake3::Hash,
++}
++
++// Only called on a recording list. Return the texture to its incoming state.
++pub(crate) fn record(
++    device: &ID3D12Device,
++    list: &ID3D12GraphicsCommandList,
++    texture: &ID3D12Resource,
++    original: D3D12_RESOURCE_STATES,
++) -> Option<Sample> {
++    let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
++    // SAFETY: a live texture on this list; the caller retains both resources.
++    unsafe {
++        let d = texture.GetDesc();
++        if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
++            || d.Format != DXGI_FORMAT_R16G16B16A16_FLOAT
++            || d.MipLevels != 1
++            || d.DepthOrArraySize != 1
++            || d.SampleDesc.Count != 1
++        {
++            return None;
++        }
++        if original != copy {
++            list.ResourceBarrier(&[crate::host::transition(texture, original, copy)]);
++        }
++        let back = super::read_back(device, list, texture);
++        if original != copy {
++            list.ResourceBarrier(&[crate::host::transition(texture, copy, original)]);
++        }
++        back.map(|(buffer, footprint)| Sample { buffer, footprint })
++    }
++}
++
++impl Sample {
++    // The submission fence has completed when the caller maps the buffer.
++    pub(crate) fn counts(&self) -> Option<Counts> {
++        let f = self.footprint.Footprint;
++        let mut data = std::ptr::null_mut();
++        unsafe {
++            self.buffer.Map(0, None, Some(&mut data)).ok()?;
++            if data.is_null() {
++                self.buffer.Unmap(0, None);
++                return None;
++            }
++            let mut hasher = blake3::Hasher::new();
++            let (mut positive_rgb, mut bottom_positive_rgb, mut nonfinite_rgb) = (0, 0, 0);
++            let mut bottom_above = [0; 3];
++            for y in 0..f.Height as usize {
++                let offset = self.footprint.Offset as usize + y * f.RowPitch as usize;
++                let row =
++                    std::slice::from_raw_parts(data.cast::<u8>().add(offset), f.Width as usize * 8);
++                hasher.update(row);
++                for pixel in row.chunks_exact(8) {
++                    let rgb = [0, 2, 4].map(|i| u16::from_le_bytes([pixel[i], pixel[i + 1]]));
++                    if rgb.iter().any(|h| h & 0x7c00 == 0x7c00) {
++                        nonfinite_rgb += 1;
++                    }
++                    if rgb.iter().any(|&h| h > 0 && h < 0x7c00) {
++                        positive_rgb += 1;
++                        if y >= f.Height as usize / 2 {
++                            bottom_positive_rgb += 1;
++                            let peak = rgb.iter().copied().filter(|&v| v < 0x7c00).max().unwrap_or(0);
++                            // Positive binary16 encodings are ordered by brightness.
++                            for (count, cutoff) in bottom_above.iter_mut().zip([0x1400, 0x2400, 0x3400]) {
++                                *count += usize::from(peak >= cutoff);
++                            }
++                        }
++                    }
++                }
++            }
++            let untouched = D3D12_RANGE { Begin: 0, End: 0 };
++            self.buffer.Unmap(0, Some(&untouched));
++            Some(Counts {
++                positive_rgb,
++                bottom_positive_rgb,
++                nonfinite_rgb,
++                bottom_above,
++                rgba_hash: hasher.finalize(),
++            })
++        }
++    }
++
++    pub(crate) fn report(&self, probe: Probe, side: &'static str) {
++        if let Some(c) = self.counts() {
++            let f = self.footprint.Footprint;
++            tracing::info!(pass=probe.pass, occurrence=probe.occurrence, frame=probe.frame, side,
++                width=f.Width, height=f.Height, positive_rgb=c.positive_rgb,
++                bottom_positive_rgb=c.bottom_positive_rgb, nonfinite_rgb=c.nonfinite_rgb,
++                bottom_above=?c.bottom_above, rgba_hash=%c.rgba_hash, "lighting dispatch HDR readback");
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn captures_hdr_before_and_after_a_gpu_write() {
++        let host = crate::host::host().expect("D3D12 device");
++        let list = host.new_list().expect("command list");
++        let state = D3D12_RESOURCE_STATE_RENDER_TARGET;
++        let desc = D3D12_RESOURCE_DESC {
++            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
++            Width: 3,
++            Height: 2,
++            DepthOrArraySize: 1,
++            MipLevels: 1,
++            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
++            SampleDesc: DXGI_SAMPLE_DESC {
++                Count: 1,
++                Quality: 0,
++            },
++            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
++            ..Default::default()
++        };
++        let heap = D3D12_HEAP_PROPERTIES {
++            Type: D3D12_HEAP_TYPE_DEFAULT,
++            CreationNodeMask: 1,
++            VisibleNodeMask: 1,
++            ..Default::default()
++        };
++        let mut surface: Option<ID3D12Resource> = None;
++        unsafe {
++            host.device.CreateCommittedResource(
++                &heap,
++                D3D12_HEAP_FLAG_NONE,
++                &desc,
++                state,
++                None,
++                &mut surface,
++            )
++        }
++        .unwrap();
++        let surface = surface.unwrap();
++        let rtv = host.rtv(Some(&surface), None);
++        unsafe {
++            list.list
++                .ClearRenderTargetView(rtv, &[0., 0., 0., 1.], None)
++        };
++        let before = record(&host.device, &list.list, &surface, state).expect("before readback");
++        let bottom = windows::Win32::Foundation::RECT {
++            left: 0,
++            top: 1,
++            right: 3,
++            bottom: 2,
++        };
++        unsafe {
++            list.list
++                .ClearRenderTargetView(rtv, &[0.5, 0., 0., 1.], Some(&[bottom]))
++        };
++        let after = record(&host.device, &list.list, &surface, state).expect("after readback");
++        let snapshot = list.snapshot_scene_texture(
++            &host.device, &surface, DXGI_FORMAT_R16G16B16A16_FLOAT, state,
++        ).expect("snapshot of the colored pixels");
++        unsafe { list.list.ClearRenderTargetView(rtv, &[0.; 4], None) };
++        let preserved = record(&host.device, &list.list, &snapshot, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
++            .expect("snapshot readback after overwriting the original");
++        let cleared = record(&host.device, &list.list, &surface, state).expect("original after clear");
++        list.close();
++        host.execute(&[&list]);
++        let a = before.counts().unwrap();
++        let b = after.counts().unwrap();
++        assert_eq!(
++            (a.positive_rgb, a.bottom_positive_rgb, a.nonfinite_rgb),
++            (0, 0, 0)
++        );
++        assert_eq!(
++            (b.positive_rgb, b.bottom_positive_rgb, b.nonfinite_rgb),
++            (3, 3, 0)
++        );
++        assert_eq!(a.bottom_above, [0; 3]);
++        assert_eq!(b.bottom_above, [3; 3]);
++        assert_ne!(a.rgba_hash, b.rgba_hash);
++        assert_eq!(preserved.counts().unwrap().rgba_hash, b.rgba_hash);
++        assert_eq!(cleared.counts().unwrap().positive_rgb, 0);
++
++        // The upscaler reads the scene as an SRV. Snapshot in that state,
++        // restore the state, then reuse the original as a render target.
++        let list = host.new_list().unwrap();
++        let sampled = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++        unsafe {
++            list.list.ClearRenderTargetView(rtv, &[0.25, 0., 0., 1.], None);
++            list.list.ResourceBarrier(&[crate::host::transition(&surface, state, sampled)]);
++        }
++        let copy = list.snapshot_scene_texture(&host.device, &surface, DXGI_FORMAT_R16G16B16A16_FLOAT, sampled).unwrap();
++        unsafe {
++            list.list.ResourceBarrier(&[crate::host::transition(&surface, sampled, state)]);
++            list.list.ClearRenderTargetView(rtv, &[0.; 4], None);
++        }
++        let result = record(&host.device, &list.list, &copy, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE).unwrap();
++        let original = record(&host.device, &list.list, &surface, state).unwrap();
++        list.close();
++        host.execute(&[&list]);
++        assert_eq!(result.counts().unwrap().positive_rgb, 6);
++        assert_eq!(original.counts().unwrap().positive_rgb, 0);
++    }
++}
+diff --git a/crates/victory-gpu/src/compose.rs b/crates/victory-gpu/src/compose.rs
+index 46a6aad..34db193 100644
+--- a/crates/victory-gpu/src/compose.rs
++++ b/crates/victory-gpu/src/compose.rs
+@@ -14,9 +14,37 @@ use crate::host::Host;
+ /// Hold only completed captures. A menu or a movie ages the last scene out.
+ static SCENE_COLOR: std::sync::Mutex<Option<(u64, ID3D12Resource)>> = std::sync::Mutex::new(None);
+ 
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum SceneSource {
++    DisplayPlane,
++    Radiance,
++    BeforeScattering,
++    UpscalerInput,
++}
++
++pub(crate) fn scene_source() -> SceneSource {
++    static SOURCE: std::sync::OnceLock<SceneSource> = std::sync::OnceLock::new();
++    *SOURCE.get_or_init(|| match std::env::var("VICTORY_PRESENT_SCENE_COLOR").as_deref() {
++        Ok("1") => SceneSource::Radiance,
++        Ok("before-scattering") => SceneSource::BeforeScattering,
++        Ok("upscaler-input") => SceneSource::UpscalerInput,
++        _ => SceneSource::DisplayPlane,
++    })
++}
++
+ pub(crate) fn scene_color_enabled() -> bool {
+-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+-    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_PRESENT_SCENE_COLOR").is_some_and(|v| v == "1"))
++    scene_source() != SceneSource::DisplayPlane
++}
++
++/// Exposure for the optional HDR preview, in photographic stops.
++pub(crate) fn scene_exposure() -> f32 {
++    static EXPOSURE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
++    *EXPOSURE.get_or_init(|| {
++        std::env::var("VICTORY_SCENE_EXPOSURE_EV").ok()
++            .and_then(|s| s.parse::<f32>().ok())
++            .filter(|v| v.is_finite() && (-12.0..=12.0).contains(v))
++            .unwrap_or(0.0).exp2()
++    })
+ }
+ 
+ pub(crate) fn finish_scene_color(texture: ID3D12Resource) {
+@@ -38,7 +66,7 @@ const SOURCE: &str = r#"
+ Texture2D<float4> scene : register(t0);
+ Texture2D<float4> over : register(t1);
+ SamplerState smooth_ : register(s0);
+-cbuffer Display : register(b0) { uint linear_scene; };
++cbuffer Display : register(b0) { float exposure; };
+ 
+ float to_srgb(float value) {
+     float x = saturate(value);
+@@ -54,7 +82,8 @@ V vs(uint id : SV_VertexID) {
+ }
+ float4 ps(V v) : SV_Target {
+     float4 s = scene.SampleLevel(smooth_, v.uv, 0);
+-    if (linear_scene != 0) {
++    if (exposure > 0) {
++        s.rgb *= exposure;
+         s.rgb = float3(to_srgb(s.r), to_srgb(s.g), to_srgb(s.b));
+     }
+     float4 o = over.SampleLevel(smooth_, v.uv, 0);
+@@ -209,7 +238,7 @@ impl Composer {
+         slot: usize,
+         list: &ID3D12GraphicsCommandList,
+         planes: [(&ID3D12Resource, DXGI_FORMAT); 2],
+-        linear_scene: bool,
++        exposure: Option<f32>,
+         back: &ID3D12Resource,
+         (width, height): (u32, u32),
+     ) -> windows::core::Result<()> {
+@@ -257,7 +286,7 @@ impl Composer {
+             list.SetGraphicsRootSignature(&self.root);
+             list.SetPipelineState(&self.pso);
+             list.SetGraphicsRootDescriptorTable(0, gpu);
+-            list.SetGraphicsRoot32BitConstant(1, u32::from(linear_scene), 0);
++            list.SetGraphicsRoot32BitConstant(1, exposure.unwrap_or(0.0).to_bits(), 0);
+             list.IASetPrimitiveTopology(
+                 windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+             );
+@@ -303,7 +332,7 @@ pub(crate) fn view(d: &D3D12_RESOURCE_DESC) -> Option<DXGI_FORMAT> {
+ mod tests {
+     use super::*;
+ 
+-    fn composite(host: &Host, scene_format: DXGI_FORMAT, colors: &[[f32; 4]], ui: &[[f32; 4]], linear_scene: bool) -> Vec<u8> {
++    fn composite(host: &Host, scene_format: DXGI_FORMAT, colors: &[[f32; 4]], ui: &[[f32; 4]], exposure: Option<f32>) -> Vec<u8> {
+         let format = DXGI_FORMAT_R8G8B8A8_UNORM;
+         let mut compositor = Composer::new(host, format).unwrap();
+         let list = host.new_list().unwrap();
+@@ -366,7 +395,7 @@ mod tests {
+                     0,
+                     cmds,
+                     [(&base, scene_format), (&overlay, format)],
+-                    linear_scene,
++                    exposure,
+                     &output,
+                     (ui.len() as u32, 1),
+                 )
+@@ -397,13 +426,24 @@ mod tests {
+             return;
+         };
+         let ui = [[0.0; 4], [0.0, 0.5, 0.0, 0.5], [0.0, 0.0, 1.0, 1.0]];
+-        let pixels = composite(host, DXGI_FORMAT_R8G8B8A8_UNORM, &[[0.5, 0.0, 0.0, 1.0]], &ui, false);
++        let pixels = composite(host, DXGI_FORMAT_R8G8B8A8_UNORM, &[[0.5, 0.0, 0.0, 1.0]], &ui, None);
+         for (actual, expected) in pixels.iter().zip([128, 0, 0, 255, 64, 128, 0, 255, 0, 0, 255, 255]) {
+             assert!(actual.abs_diff(expected) <= 1, "unexpected composite {pixels:?}");
+         }
+         eprintln!("D3D12 display-plane readback RGBA: {pixels:?}");
+     }
+ 
++    #[test]
++    fn preview_exposure_lifts_scene_without_changing_hud_on_gpu() {
++        let host = crate::host::host().expect("D3D12 device");
++        let colors = [[0.0, 0.0, 0.0, 1.0], [1.0/64.0, 0.0, 0.0, 1.0], [1.0; 4]];
++        let ui = [[0.; 4], [0.; 4], [0.0, 0.5, 0.0, 1.0]];
++        let pixels = composite(host, DXGI_FORMAT_R16G16B16A16_FLOAT, &colors, &ui, Some(16.0));
++        for (actual, expected) in pixels.iter().zip([0u8,0,0,255,137,0,0,255,0,128,0,255]) {
++            assert!(actual.abs_diff(expected) <= 2, "exposed scene and HUD: {pixels:?}");
++        }
++    }
++
+     #[test]
+     fn encodes_linear_scene_before_blending_sdr_ui_on_gpu() {
+         let Some(host) = crate::host::host() else {
+@@ -415,15 +455,17 @@ mod tests {
+         let mut ui = [[0.0; 4]; 10];
+         ui[8] = [0.25, 0.0, 0.0, 0.5];
+         ui[9] = [0.25, 0.5, 0.75, 1.0];
+-        let pixels = composite(host, DXGI_FORMAT_R11G11B10_FLOAT, &colors, &ui, true);
+-        let mut expected = [0u8, 6, 13, 34, 118, 188, 255, 255, 0, 0].map(|v| [v, v, v, 255]);
+-        expected[8] = [158, 94, 94, 255];
+-        expected[9] = [64, 128, 191, 255];
+-        for (actual, reference) in pixels.chunks_exact(4).zip(expected) {
+-            for (v, r) in actual.iter().zip(reference) {
+-                assert!(v.abs_diff(r) <= 2, "unexpected SDR ramp {pixels:?}");
++        for format in [DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT] {
++            let pixels = composite(host, format, &colors, &ui, Some(1.0));
++            let mut expected = [0u8, 6, 13, 34, 118, 188, 255, 255, 0, 0].map(|v| [v, v, v, 255]);
++            expected[8] = [158, 94, 94, 255];
++            expected[9] = [64, 128, 191, 255];
++            for (actual, reference) in pixels.chunks_exact(4).zip(expected) {
++                for (v, r) in actual.iter().zip(reference) {
++                    assert!(v.abs_diff(r) <= 2, "unexpected SDR ramp {pixels:?}");
++                }
+             }
++            eprintln!("D3D12 {format:?} scene ramp and HUD readback RGBA: {pixels:?}");
+         }
+-        eprintln!("D3D12 radiance ramp and HUD readback RGBA: {pixels:?}");
+     }
+ }
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index a76c8ff..2eadf87 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -17,7 +17,7 @@ use crate::descriptor::View;
+ use windows::Win32::Foundation::RECT;
+ use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
+ use windows::Win32::Graphics::Direct3D12::*;
+-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
++use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT};
+ use windows::core::Interface;
+ 
+ use crate::host::HostList;
+@@ -3153,19 +3153,63 @@ impl State {
+                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
+             }
+         }
++        // Snapshot the real HDR scene before the atmosphere shader reads and writes it.
++        // The title still runs that dispatch and every later render pass.
++        if crate::compose::scene_source() == crate::compose::SceneSource::BeforeScattering
++            && p.stages.first().is_some_and(|stage| stage.shader.hash == "577248728544d74b")
++            && let Some(Root::Table(table)) = self.roots_ref(true).get(1)
++            && let Some(View::Unordered(resource, ..)) = crate::descriptor::view(table + 48 * 4)
++        {
++            list.copy_scene_color(resource as This, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++        }
++        // This dispatch samples the title's resolved scene. Its command list
++        // establishes the sampling order, including work on earlier lists.
++        let upscale_input = || {
++            let Root::Table(table) = self.roots_ref(true).get(1)? else { return None };
++            match crate::descriptor::view(table + 24 * 4) {
++                Some(View::Shader(resource, _)) => Some(resource as This),
++                _ => None,
++            }
++        };
++        if crate::compose::scene_source() == crate::compose::SceneSource::UpscalerInput
++            && p.stages.first().is_some_and(|s| s.shader.hash == "6a6c7b7fde59134f")
++            && let Some(resource) = upscale_input()
++        {
++            list.copy_scene_color(resource, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++        }
++        #[cfg(feature = "diagnostics")]
++        let world_color = p.stages.first()
++            .and_then(|stage| crate::capture::lighting::select(&stage.shader.hash))
++            .and_then(|probe| {
++                let Root::Table(table) = self.roots_ref(true).get(probe.table)? else { return None };
++                match crate::descriptor::view(table + u64::from(probe.word) * 4) {
++                    Some(View::Unordered(resource, ..)) => Some((resource as This, probe)),
++                    _ => None,
++                }
++            });
++        #[cfg(feature = "diagnostics")]
++        if let Some((resource, probe)) = world_color {
++            if probe.table == 0 && let Some(input) = upscale_input() {
++                list.probe_world_color(input, probe, "input", D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++            }
++            list.probe_world_color(resource, probe, "before", D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++        }
+         // SAFETY: an open list with everything set.
+         unsafe { list.list.Dispatch(x, y, z) };
++        #[cfg(feature = "diagnostics")]
++        if let Some((resource, probe)) = world_color {
++            list.probe_world_color(resource, probe, "after", D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++        }
+         self.buffers_written();
+         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+-        if crate::compose::scene_color_enabled()
++        if crate::compose::scene_source() == crate::compose::SceneSource::Radiance
+             && p.stages.first().and_then(|s| s.shader.ambient) == Some(crate::ambient::Role::Radiance)
+         {
+             let (slot, offset) = crate::ambient::RADIANCE;
+             if let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot))
+                 && let Some(View::Unordered(resource, ..)) = crate::descriptor::view(table + u64::from(offset) * 4)
+-                && let Some(source) = crate::resource::host_copy(resource as This)
+             {
+-                list.copy_scene_color(&source);
++                list.copy_scene_color(resource as This, DXGI_FORMAT_R11G11B10_FLOAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+             }
+         }
+         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 092cc22..1d8e106 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -1119,6 +1119,48 @@ mod tests {
+         }
+     }
+ 
++    /// Times repeated refreshes of a buffer with a long committed prefix.
++    /// Both strategies must copy fresh edge bytes and recover a newly filled hole.
++    #[test]
++    #[ignore = "CrossOver buffer-copy measurement"]
++    fn repeated_sparse_prefix_cost() {
++        use windows_sys::Win32::System::Memory::*;
++        const SIZE: usize = 16 << 20;
++        const BLOCK: usize = 64 << 10;
++        unsafe {
++            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
++            assert!(!base.is_null());
++            let hole = SIZE - 2 * BLOCK;
++            for (offset, len) in [(0, hole), (hole + BLOCK, BLOCK)] {
++                let p = base.add(offset);
++                assert_eq!(VirtualAlloc(p.cast(), len, MEM_COMMIT, PAGE_READWRITE), p.cast());
++                p.write_bytes(0x6b, len);
++            }
++            let mut output = vec![0u8; SIZE];
++            super::copy_mapped(output.as_mut_ptr(), base, SIZE, false);
++            let mut times = Vec::new();
++            for round in 1..=21u8 {
++                base.write(round);
++                base.add(SIZE - 1).write(round);
++                let start = std::time::Instant::now();
++                super::copy_mapped(output.as_mut_ptr(), base, SIZE, false);
++                times.push(start.elapsed().as_micros());
++                assert_eq!((output[0], output[SIZE - 1]), (round, round));
++            }
++            assert!(output[1..hole].iter().all(|&v| v == 0x6b));
++            assert!(output[hole..hole + BLOCK].iter().all(|&v| v == 0));
++            assert!(output[hole + BLOCK..SIZE - 1].iter().all(|&v| v == 0x6b));
++            let p = base.add(hole);
++            assert_eq!(VirtualAlloc(p.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE), p.cast());
++            p.write_bytes(0xab, BLOCK);
++            super::copy_mapped(output.as_mut_ptr(), base, SIZE, false);
++            assert!(output[hole..hole + BLOCK].iter().all(|&v| v == 0xab));
++            times.sort_unstable();
++            eprintln!("median sparse refresh (16 MiB, 21 copies): {} us", times[10]);
++            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
++        }
++    }
++
+     use super::*;
+ 
+     #[test]
+@@ -2161,6 +2203,8 @@ enum Step {
+ #[derive(Default)]
+ struct Deferred {
+     scene_color: Option<ID3D12Resource>,
++    #[cfg(feature = "diagnostics")]
++    lighting: Vec<(crate::capture::lighting::Probe, &'static str, crate::capture::lighting::Sample)>,
+     /// Destination, source, bytes.
+     copies: Vec<Step>,
+     uploads: Vec<ID3D12Resource>,
+@@ -3758,6 +3802,13 @@ pub(crate) fn walls_trace() -> bool {
+ /// without it, so the title read a buffer nobody wrote, as before read-backs
+ /// were made (the exposure metering's two small float targets, every frame).
+ fn read_backs(list: &HostList) {
++    #[cfg(feature = "diagnostics")]
++    if crate::capture::lighting::enabled() {
++        let samples = std::mem::take(&mut list.deferred().lighting);
++        for (probe, side, pixels) in samples {
++            pixels.report(probe, side);
++        }
++    }
+     if crate::compose::scene_color_enabled()
+         && let Some(texture) = list.deferred().scene_color.clone()
+     {
+@@ -7137,16 +7188,61 @@ impl HostList {
+         self.deferred().indirect_readable = scratch.as_raw() as usize;
+     }
+ 
+-    /// Snapshot the shaded scene on the producing command list, after the title's
+-    /// radiance dispatch. The presenter only receives it when this list finishes.
+-    pub(crate) fn copy_scene_color(&self, source: &crate::resource::HostTexture) {
++
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn probe_world_color(
++        &self,
++        resource: crate::object::This,
++        probe: crate::capture::lighting::Probe,
++        side: &'static str,
++        binding_state: D3D12_RESOURCE_STATES,
++    ) {
++        let Some(source) = crate::resource::host_copy(resource) else { return };
++        let key = std::sync::Arc::as_ptr(&source) as usize;
++        let state = self.states.lock().unwrap_or_else(|e| e.into_inner())
++            .get(&key).map(|entry| entry.1);
++        // On first use the submission prelude establishes the binding state.
++        let state = state.unwrap_or(binding_state.0 as u32);
++        self.transition(resource, state);
+         let Some(host) = host() else { return };
++        if let Some(sample) = crate::capture::lighting::record(
++            &host.device, &self.list, &source.texture, D3D12_RESOURCE_STATES(state as i32),
++        ) {
++            // Lists may be submitted again after the first fence was read.
++            self.keep(&sample.buffer);
++            self.deferred().lighting.push((probe, side, sample));
++        }
++    }
++
++    /// Snapshot a bound scene UAV at its place in the producing list.
++    /// The presenter receives the copy after the submission fence completes.
++    pub(crate) fn copy_scene_color(&self, resource: crate::object::This, format: DXGI_FORMAT, binding_state: D3D12_RESOURCE_STATES) {
++        let Some(source) = crate::resource::host_copy(resource) else { return };
++        let Some(host) = host() else { return };
++        let key = std::sync::Arc::as_ptr(&source) as usize;
++        let state = self.states.lock().unwrap_or_else(|e| e.into_inner())
++            .get(&key).map_or(binding_state.0 as u32, |entry| entry.1);
++        self.transition(resource, state);
++        if let Some(copy) = self.snapshot_scene_texture(
++            &host.device, &source.texture, format, D3D12_RESOURCE_STATES(state as i32),
++        ) {
++            self.deferred().scene_color = Some(copy);
++        }
++    }
++
++    pub(crate) fn snapshot_scene_texture(
++        &self,
++        device: &ID3D12Device,
++        source: &ID3D12Resource,
++        format: DXGI_FORMAT,
++        state: D3D12_RESOURCE_STATES,
++    ) -> Option<ID3D12Resource> {
+         // SAFETY: the source is a live texture retained by this command list.
+-        let mut desc = unsafe { source.texture.GetDesc() };
+-        if desc.Format != DXGI_FORMAT_R11G11B10_FLOAT || desc.MipLevels != 1
++        let mut desc = unsafe { source.GetDesc() };
++        if desc.Format != format || desc.MipLevels != 1
+             || desc.DepthOrArraySize != 1 || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1
+         {
+-            return;
++            return None;
+         }
+         desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+         desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+@@ -7156,22 +7252,21 @@ impl HostList {
+         // SAFETY: matching texture shape and format. Restore the title texture's
+         // tracked state, and retain both resources until GPU completion.
+         unsafe {
+-            if host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut copy).is_err() {
+-                return;
++            if device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut copy).is_err() {
++                return None;
+             }
+-            let Some(copy) = copy else { return };
+-            let state = D3D12_RESOURCE_STATES(source.state.load(Ordering::Relaxed) as i32);
++            let Some(copy) = copy else { return None };
+             if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+-                self.list.ResourceBarrier(&[transition(&source.texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
++                self.list.ResourceBarrier(&[transition(source, state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+             }
+-            self.list.CopyResource(&copy, &source.texture);
++            self.list.CopyResource(&copy, source);
+             self.list.ResourceBarrier(&[transition(&copy, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)]);
+             if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+-                self.list.ResourceBarrier(&[transition(&source.texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state)]);
++                self.list.ResourceBarrier(&[transition(source, D3D12_RESOURCE_STATE_COPY_SOURCE, state)]);
+             }
+-            self.keep(&source.texture);
++            self.keep(source);
+             self.keep(&copy);
+-            self.deferred().scene_color = Some(copy);
++            Some(copy)
+         }
+     }
+ 
+@@ -8222,7 +8317,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
+     let since = crate::watch::changes();
+     // (A title destination that is away only while the runtime changes a
+     // mapping beside it is written when that is done.)
+-    let whole = read(src, dst, len) || title_dst && crate::watch::again_after_change(since, || read(src, dst, len));
++    let range = (src as usize, len);
++    let predict = !title_dst && len >= 64 << 10 && sparse_hints_enabled();
++    let slot = ((range.0 >> 16) ^ (range.0 >> 22) ^ (len >> 16)) & 63;
++    let walk_first = predict && SPARSE_HINTS.with_borrow(|hints| hints[slot] == range);
++    let whole = !walk_first && (read(src, dst, len) || title_dst && crate::watch::again_after_change(since, || read(src, dst, len)));
+     #[cfg(feature = "diagnostics")]
+     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
+     if whole {
+@@ -8240,7 +8339,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
+     #[cfg(feature = "diagnostics")]
+     let sparse = std::time::Instant::now();
+     if !title_dst && len >= 64 << 10 {
+-        read_sparse(src, dst, len);
++        let sparse = read_sparse(src, dst, len);
++        if predict {
++            SPARSE_HINTS.with_borrow_mut(|hints| hints[slot] = if sparse { range } else { (0, 0) });
++        }
+     } else {
+         read_pieces(src, dst, len);
+     }
+@@ -8248,13 +8350,26 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
+     crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
+ }
+ 
+-/// After a failed bulk read into host memory, skip contiguous holes. Never
+-/// cache the query across copies: the title may remap the same address.
+-fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
++// Only the preferred read strategy survives a copy. The next copy queries
++// current protections and reads current bytes even on an exact hit.
++thread_local! {
++    static SPARSE_HINTS: std::cell::RefCell<[(usize, usize); 64]> =
++        const { std::cell::RefCell::new([(0, 0); 64]) };
++}
++
++fn sparse_hints_enabled() -> bool {
++    static ENABLED: OnceLock<bool> = OnceLock::new();
++    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_SPARSE_HINTS").is_some_and(|v| v == "1"))
++}
++
++/// Walk current regions. Report whether a later copy should walk first to
++/// avoid copying a long readable prefix twice before reaching the first hole.
++fn read_sparse(src: *const u8, dst: *mut u8, len: usize) -> bool {
+     use windows_sys::Win32::System::Memory::{
+         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
+     };
+     let mut offset = 0;
++    let mut sparse = false;
+     while offset < len {
+         let at = src.wrapping_add(offset);
+         let to = dst.wrapping_add(offset);
+@@ -8266,19 +8381,22 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
+             .saturating_sub(at as usize).min(remaining);
+         if size != size_of_val(&info) || n == 0 {
+             read_pieces(at, to, remaining);
+-            break;
++            return true;
+         }
+         if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
++            sparse = true;
+             #[cfg(feature = "diagnostics")]
+             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+             // SAFETY: this path is only used with a writable host destination.
+             unsafe { to.write_bytes(0, n) };
+         } else if !read(at, to, n) {
++            sparse = true;
+             // A mapping may change between query and read.
+             read_pieces(at, to, n);
+         }
+         offset += n;
+     }
++    sparse
+ }
+ 
+ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
+@@ -9053,9 +9171,10 @@ impl Host {
+                 let early = crate::compose::scene_color_enabled().then(|| crate::compose::scene_color(frame)).flatten();
+                 let (texture, state, base_fmt) = if let Some(ref scene) = early {
+                     static LOGGED: std::sync::Once = std::sync::Once::new();
+-                    LOGGED.call_once(|| tracing::info!(frame, "presenting the title's scene radiance with sRGB encoding under its UI"));
++                    let format = scene.GetDesc().Format;
++                    LOGGED.call_once(|| tracing::info!(frame, ?format, source = ?crate::compose::scene_source(), "presenting the completed scene texture under the title UI"));
+                     copy.keep(scene);
+-                    (scene, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, DXGI_FORMAT_R11G11B10_FLOAT)
++                    (scene, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, format)
+                 } else {
+                     (texture, state, base_fmt)
+                 };
+@@ -9076,7 +9195,7 @@ impl Host {
+                         compose_slot,
+                         list,
+                         [(texture, base_fmt), (over, over_fmt)],
+-                        early.is_some(),
++                        early.as_ref().map(|_| crate::compose::scene_exposure()),
+                         &back,
+                         (width, height),
+                     ) {
