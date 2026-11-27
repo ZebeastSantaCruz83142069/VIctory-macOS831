@@ -4166,11 +4166,17 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if len == 0 {
         return;
     }
+    let start = src as usize;
+    let hint = (!title_dst && len >= 64 << 10 && sparse_copy_hints())
+        .then(|| ((start >> 16) ^ (start >> 22) ^ (len >> 16)) & (SPARSE_COPY_HINTS - 1));
+    let walk_first = hint.is_some_and(|slot| {
+        SPARSE_COPIES.with_borrow(|hints| hints[slot] == (start, len))
+    });
     // The kernel writes the destination: it must not be guarded meanwhile.
     let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let whole = !walk_first && read(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::MoveUs,
@@ -4191,11 +4197,12 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     COPY_MAPPED_FALLBACKS.with(|n| n.set(n.get() + 1));
     #[cfg(feature = "diagnostics")]
     let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FallbackUs);
-    // The whole copy failed. Copy each readable region in one call and
-    // zero the holes. In particular, a hole that starts inside a 64 KiB
-    // block does not require a faulting read of each remaining 4 KiB page.
-    let (start, end) = (src as usize, src as usize + len);
+    // A bulk read failed, or an earlier copy of this range found a hole.
+    // Copy each readable region in one call and zero the holes. A hole
+    // starting inside a 64 KiB block needs no read of each remaining page.
+    let end = start + len;
     let mut at = start;
+    let mut sparse = false;
     while at < end {
         let (region_end, readable) = source_region(at);
         let next = region_end.min(end);
@@ -4208,11 +4215,13 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
                 at = piece;
                 continue;
             }
+            sparse = true;
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, (next - at) as u64);
             // SAFETY: inside the destination, which is mapped.
             unsafe { to.write_bytes(0, next - at) };
         } else if !read(at as *const u8, to, next - at) {
+            sparse = true;
             // Protection can change after the query. Keep trying smaller
             // pieces and zero only the pages the kernel cannot read.
             for_pieces(at, next - at, 64 << 10, |block, len| {
@@ -4232,6 +4241,22 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         }
         at = next;
     }
+    if let Some(slot) = hint {
+        SPARSE_COPIES.with_borrow_mut(|hints| hints[slot] = if sparse { (start, len) } else { (0, 0) });
+    }
+}
+
+// Only an exact range and its preferred copy strategy survive between copies.
+// The next copy queries current protections and reads current bytes.
+const SPARSE_COPY_HINTS: usize = 64;
+thread_local! {
+    static SPARSE_COPIES: std::cell::RefCell<[(usize, usize); SPARSE_COPY_HINTS]> =
+        const { std::cell::RefCell::new([(0, 0); SPARSE_COPY_HINTS]) };
+}
+
+fn sparse_copy_hints() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| crate::switch::on("VICTORY_SPARSE_HINTS"))
 }
 
 #[cfg(test)]
@@ -4458,6 +4483,57 @@ mod title_copies {
             assert_eq!(byte, expected, "byte {i:#x}");
         }
         release(base);
+    }
+
+    #[test]
+    fn repeated_sparse_refreshes_read_current_bytes_and_mappings() {
+        const SIZE: usize = 16 << 20;
+        const HOLE: usize = SIZE - 2 * BLOCK;
+        // SAFETY: a fresh reservation, released below.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS) }.cast::<u8>();
+        assert!(!base.is_null());
+        let commit = |offset: usize, len: usize, value: u8| {
+            // SAFETY: these ranges are wholly inside the test reservation.
+            unsafe {
+                let at = base.add(offset);
+                assert_eq!(VirtualAlloc(at.cast(), len, MEM_COMMIT, PAGE_READWRITE), at.cast());
+                at.write_bytes(value, len);
+            }
+        };
+        commit(0, HOLE, 7);
+        commit(HOLE + BLOCK, BLOCK, 9);
+
+        let mut output = vec![0xee; SIZE + 2];
+        let refresh = |output: &mut [u8]| copy_mapped(output.as_mut_ptr().wrapping_add(1), base, SIZE, false);
+        refresh(&mut output);
+        let mut samples = [0; 21];
+        for (i, elapsed) in samples.iter_mut().enumerate() {
+            let value = i as u8 + 1;
+            // SAFETY: both edge bytes are committed by the test.
+            unsafe {
+                base.write(value);
+                base.add(SIZE - 1).write(value);
+            }
+            let start = std::time::Instant::now();
+            refresh(&mut output);
+            *elapsed = start.elapsed().as_micros();
+            assert_eq!((output[1], output[SIZE]), (value, value));
+        }
+        assert!(output[2..HOLE + 1].iter().all(|&byte| byte == 7));
+        assert!(output[HOLE + 1..HOLE + BLOCK + 1].iter().all(|&byte| byte == 0));
+        assert!(output[HOLE + BLOCK + 1..SIZE].iter().all(|&byte| byte == 9));
+        commit(HOLE, BLOCK, 11);
+        refresh(&mut output);
+        assert!(output[HOLE + 1..HOLE + BLOCK + 1].iter().all(|&byte| byte == 11));
+        assert_eq!((output[0], output[SIZE + 1]), (0xee, 0xee));
+        release(base);
+
+        samples.sort_unstable();
+        eprintln!(
+            "16 MiB sparse refresh median: {} us (hints: {})",
+            samples[10],
+            super::sparse_copy_hints()
+        );
     }
 
     #[test]
