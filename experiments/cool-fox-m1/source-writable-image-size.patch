@@ -1,0 +1,119 @@
+diff --git a/crates/victory-gpu/src/shader_cache.rs b/crates/victory-gpu/src/shader_cache.rs
+index b291e11..e4d9a0f 100644
+--- a/crates/victory-gpu/src/shader_cache.rs
++++ b/crates/victory-gpu/src/shader_cache.rs
+@@ -75,6 +75,7 @@ fn build() -> [u8; 32] {
+             "VICTORY_MESH_OUTPUT_STRICT",
+             "VICTORY_BVH_FENCES",
+             "VICTORY_BVH_BOUNDS",
++            "VICTORY_UAV_SIZE_LEVEL0",
+         ] {
+             bytes.extend_from_slice(name.as_bytes());
+             bytes.push(b'=');
+@@ -115,13 +116,42 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
+ /// The translation of a console shader container, from the cache when
+ /// there is one.
+ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
++    let translate = if uav_size_level0(container) {
++        victory_shader::emit::translate_with_uav_size_level0
++    } else {
++        victory_shader::emit::translate
++    };
++    let translate = |c: &[u8]| translate(c).map_err(|e| e.to_string());
+     match CACHE.get() {
+         Some(cache) => cached(cache, &build(), container, translate),
+         None => translate(container),
+     }
+ }
+ 
++/// Explicit mip zero for every shader or selected container hashes.
++fn uav_size_level0(container: &[u8]) -> bool {
++    static RULE: OnceLock<(bool, Vec<String>)> = OnceLock::new();
++    let (all, hashes) = RULE.get_or_init(|| {
++        let value = std::env::var("VICTORY_UAV_SIZE_LEVEL0").unwrap_or_default();
++        let value = value.trim();
++        if value == "1" {
++            tracing::info!("writable image size queries use level zero");
++            return (true, Vec::new());
++        }
++        let hashes: Vec<_> = value.split(',').map(|entry| entry.trim().to_ascii_lowercase()).collect();
++        if hashes.iter().all(|hash| hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit())) {
++            tracing::info!(programs = ?hashes, "selected writable image size queries use level zero");
++            (false, hashes)
++        } else {
++            (false, Vec::new())
++        }
++    });
++    *all || (!hashes.is_empty() && {
++        let hash = blake3::hash(container).to_hex();
++        hashes.iter().any(|candidate| candidate == &hash[..16])
++    })
++}
++
+ /// The cache entry's converter: the build and the container in, the
+ /// encoded translation out. `ran` tells a miss from a hit.
+ struct Translate<F> {
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 72af2be..7ff200f 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -27,6 +27,22 @@ pub(super) mod intersect;
+ 
+ type Why = &'static str;
+ 
++thread_local! {
++    static UAV_SIZE_LEVEL0: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++}
++
++pub(super) fn with_uav_size_level0<T>(translate: impl FnOnce() -> T) -> T {
++    struct Restore(bool);
++    impl Drop for Restore {
++        fn drop(&mut self) {
++            UAV_SIZE_LEVEL0.set(self.0);
++        }
++    }
++
++    let _restore = Restore(UAV_SIZE_LEVEL0.replace(true));
++    translate()
++}
++
+ /// How an interpolation evaluates an input channel.
+ #[derive(Debug, Clone, Copy)]
+ enum Eval {
+@@ -6548,7 +6564,7 @@ impl<'a> Lower<'a> {
+         let c = self.cur;
+         let i32t = self.s.t.i32;
+         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+-        let mip = if image.is_some() && !uav {
++        let mip = if image.is_some() && (!uav || UAV_SIZE_LEVEL0.get()) {
+             self.s.m.i32(0)
+         } else {
+             self.s.m.undef(i32t)
+@@ -11009,7 +11025,9 @@ impl<'a> Lower<'a> {
+             // in the first address: DXIL's dimensions; a channel DXIL leaves
+             // out reads 1 (UAVs: one level).
+             let h = self.handle(site, src, false, props)?;
+-            let mip = if uav {
++            let mip = if uav && UAV_SIZE_LEVEL0.get() {
++                self.s.m.i32(0)
++            } else if uav {
+                 self.s.m.undef(self.s.t.i32)
+             } else {
+                 addr_val(self, 0)?
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index 9aeeaf5..63be8a3 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -401,6 +401,11 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+     }
+ }
+ 
++/// Translates writable image size queries with an explicit level zero.
++pub fn translate_with_uav_size_level0(container: &[u8]) -> Result<HostShader, ShaderError> {
++    lower::with_uav_size_level0(|| translate(container))
++}
++
+ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
+     let c = Container::parse(container)?;
+     let dxil = c
