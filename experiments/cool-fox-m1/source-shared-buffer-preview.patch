@@ -1,0 +1,1304 @@
+From 6562af09a1f21724ea3429c12198dc9db11c3048 Mon Sep 17 00:00:00 2001
+From: Codex <codex@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 04:39:09 -0800
+Subject: [PATCH 1/2] Test shared physical tiles on the visible Series S
+ renderer
+
+---
+ crates/victory-gpu/src/host.rs           |   2 +
+ crates/victory-gpu/src/lib.rs            |   8 +
+ crates/victory-gpu/src/physical.rs       | 302 +++++++++++++++++++
+ crates/victory-gpu/src/shadow.rs         |  16 +
+ crates/victory-gpu/src/shared_pages.rs   | 364 +++++++++++++++++++++++
+ crates/victory-gpu/src/watch.rs          |   4 +
+ crates/victory-hle/src/modules/d3d12x.rs |   2 +
+ crates/victory-hle/src/modules/xmem.rs   |  63 ++++
+ 8 files changed, 761 insertions(+)
+ create mode 100644 crates/victory-gpu/src/physical.rs
+ create mode 100644 crates/victory-gpu/src/shared_pages.rs
+
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 0190a05..5020d05 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -5465,6 +5465,8 @@ impl Host {
+         }
+         #[cfg(feature = "diagnostics")]
+         ahead.part(13);
++        #[cfg(feature = "diagnostics")]
++        let _physical_tiles = crate::physical::prepare(&self.queue);
+         // Descriptors the title copied into placed heaps directly, before
+         // command lists that index those slots are submitted.
+         let heaps_synced = crate::descriptor::begin_sync_heaps();
+diff --git a/crates/victory-gpu/src/lib.rs b/crates/victory-gpu/src/lib.rs
+index 5983f53..ff43fc4 100644
+--- a/crates/victory-gpu/src/lib.rs
++++ b/crates/victory-gpu/src/lib.rs
+@@ -43,6 +43,10 @@ mod host;
+ mod indirect;
+ #[cfg(windows)]
+ mod inplace;
++#[cfg(all(windows, feature = "diagnostics"))]
++mod physical;
++#[cfg(all(windows, feature = "diagnostics"))]
++mod shared_pages;
+ #[cfg(windows)]
+ mod land;
+ pub mod list;
+@@ -96,6 +100,10 @@ mod texback;
+ 
+ #[cfg(windows)]
+ pub use host::on_failure;
++#[cfg(all(windows, feature = "diagnostics"))]
++pub use physical::{PhysicalTiles, use_physical_layout};
++#[cfg(all(windows, feature = "diagnostics"))]
++pub use shared_pages::{PhysicalHeap, physical_heap};
+ 
+ /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
+ /// off while the title runs (`ab`).
+diff --git a/crates/victory-gpu/src/physical.rs b/crates/victory-gpu/src/physical.rs
+new file mode 100644
+index 0000000..5d151fe
+--- /dev/null
++++ b/crates/victory-gpu/src/physical.rs
+@@ -0,0 +1,302 @@
++//! Reserved GPU buffers over XMem physical heaps on Rosetta. A buffer's
++//! GPU address survives the title remapping its CPU view.
++
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++use std::sync::{Arc, Mutex, OnceLock, Weak};
++
++use windows::Win32::Graphics::Direct3D12::*;
++use windows::core::Interface;
++
++use crate::shared_pages::PhysicalHeap;
++const PAGE: usize = 64 << 10;
++
++/// A span of consecutive tiles in an XMem view and its physical heap.
++pub struct PhysicalTiles {
++    pub first: u32,
++    pub count: u32,
++    pub heap_tile: u32,
++    pub heap: Arc<PhysicalHeap>,
++}
++
++type Layout = fn(usize, usize) -> Option<Vec<PhysicalTiles>>;
++static LAYOUT: OnceLock<Layout> = OnceLock::new();
++static CHANGED: AtomicBool = AtomicBool::new(false);
++static QUEUE: AtomicUsize = AtomicUsize::new(0);
++static BUFFERS: Mutex<Vec<Weak<ReservedBuffer>>> = Mutex::new(Vec::new());
++
++/// An ExecuteCommandLists call can contain several lists. Keep its
++/// reserved buffers physically disjoint so none needs a barrier between
++/// accesses to two different resources inside that call.
++fn overlapping_owners<'a>(layouts: impl IntoIterator<Item = &'a [PhysicalTiles]>) -> bool {
++    let mut spans: Vec<_> = layouts
++        .into_iter()
++        .enumerate()
++        .flat_map(|(owner, runs)| {
++            runs.iter().map(move |run| {
++                (
++                    Arc::as_ptr(&run.heap) as usize,
++                    run.heap_tile,
++                    run.heap_tile + run.count,
++                    owner,
++                )
++            })
++        })
++        .collect();
++    spans.sort_unstable();
++    let mut rightmost: Option<(usize, u32, usize)> = None;
++    for (heap, from, to, owner) in spans {
++        if let Some((last_heap, last_end, last_owner)) = rightmost
++            && heap == last_heap
++            && from < last_end
++        {
++            if owner != last_owner {
++                return true;
++            }
++            if to <= last_end {
++                continue;
++            }
++        }
++        rightmost = Some((heap, to, owner));
++    }
++    false
++}
++
++/// Sets the runtime callback that snapshots mappings of an XMem buffer.
++pub fn use_physical_layout(layout: Layout) {
++    if crate::shared_pages::physical_heaps_enabled() {
++        let _ = LAYOUT.set(layout);
++    }
++}
++
++/// The runtime completed an XMem remap. The next host submission uses it.
++pub fn physical_layout_changed() {
++    if LAYOUT.get().is_some() {
++        CHANGED.store(true, Ordering::Release);
++    }
++}
++
++pub(crate) struct ReservedBuffer {
++    pub(crate) resource: ID3D12Resource,
++    base: usize,
++    len: usize,
++    count: u32,
++    guard: PhysicalHeap,
++    mapped: Mutex<Vec<PhysicalTiles>>,
++}
++
++impl ReservedBuffer {
++    pub(crate) fn new(base: usize, len: usize) -> Option<Arc<Self>> {
++        if len == 0 || !base.is_multiple_of(PAGE) || !len.is_multiple_of(PAGE) {
++            return None;
++        }
++        let count = u32::try_from(len / PAGE).ok()?;
++        let snapshot = LAYOUT.get()?;
++        let layout = snapshot(base, len)?;
++        if layout.iter().map(|run| run.count).sum::<u32>() != count {
++            return None;
++        }
++        let mut registry = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
++        let others = registry
++            .iter()
++            .filter_map(Weak::upgrade)
++            .map(|other| snapshot(other.base, other.len))
++            .collect::<Option<Vec<_>>>()?;
++        if overlapping_owners(
++            std::iter::once(layout.as_slice()).chain(others.iter().map(Vec::as_slice)),
++        ) {
++            return None;
++        }
++        let host = crate::host::host()?;
++        let desc = super::shared_pages::physical_buffer_desc(
++            len.checked_add(PAGE)?,
++            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
++        );
++        let mut resource: Option<ID3D12Resource> = None;
++        // SAFETY: ordinary resource creation with a sized output slot.
++        unsafe {
++            host.device.CreateReservedResource(
++                &desc,
++                D3D12_RESOURCE_STATE_COMMON,
++                None,
++                &mut resource,
++            )
++        }
++        .ok()?;
++        let buffer = Arc::new(Self {
++            resource: resource?,
++            base,
++            len,
++            count,
++            guard: PhysicalHeap::new(&host.device, PAGE).ok()?,
++            mapped: Mutex::new(Vec::new()),
++        });
++        registry.push(Arc::downgrade(&buffer));
++        physical_layout_changed();
++        if len >= 16 << 20 {
++            tracing::info!(
++                base = format_args!("{base:#x}"),
++                len,
++                "title buffer uses shared tiles"
++            );
++        }
++        Some(buffer)
++    }
++
++    pub(crate) fn placed(&self) -> crate::inplace::Placed {
++        crate::inplace::Placed {
++            buffer: self.resource.clone(),
++            heap: self.guard.heap.clone(),
++            // SAFETY: the registered resource retains its GPU virtual address.
++            gpu: unsafe { self.resource.GetGPUVirtualAddress() },
++            bias: 0,
++        }
++    }
++
++    /// Under the host submission lock. Keeps the old heaps until mapping
++    /// updates and the lists that follow them have completed.
++    fn bind(
++        &self,
++        queue: &ID3D12CommandQueue,
++        layout: Vec<PhysicalTiles>,
++        new_queue: bool,
++    ) -> Vec<PhysicalTiles> {
++        let mut mapped = self.mapped.lock().unwrap_or_else(|e| e.into_inner());
++        if !new_queue
++            && mapped.len() == layout.len()
++            && mapped.iter().zip(&layout).all(|(a, b)| {
++                a.first == b.first
++                    && a.count == b.count
++                    && a.heap_tile == b.heap_tile
++                    && Arc::ptr_eq(&a.heap, &b.heap)
++            })
++        {
++            return Vec::new();
++        }
++        let start = D3D12_TILED_RESOURCE_COORDINATE::default();
++        let size = D3D12_TILE_REGION_SIZE {
++            NumTiles: self.count,
++            ..Default::default()
++        };
++        // SAFETY: the coordinate and region cover exactly this buffer.
++        unsafe {
++            queue.UpdateTileMappings(
++                &self.resource,
++                1,
++                Some(&start),
++                Some(&size),
++                None::<&ID3D12Heap>,
++                1,
++                Some(&D3D12_TILE_RANGE_FLAG_NULL),
++                None,
++                Some(&self.count),
++                D3D12_TILE_MAPPING_FLAG_NONE,
++            );
++        }
++        if layout.is_empty() {
++            // D3DMetal can retain stale mappings when a buffer loses its
++            // last tile. Bind the extra tile outside the title-visible range.
++            let guard = D3D12_TILED_RESOURCE_COORDINATE {
++                X: self.count,
++                ..Default::default()
++            };
++            let one = D3D12_TILE_REGION_SIZE {
++                NumTiles: 1,
++                ..Default::default()
++            };
++            // SAFETY: this resource has one extra tile and owns its heap.
++            unsafe {
++                queue.UpdateTileMappings(
++                    &self.resource,
++                    1,
++                    Some(&guard),
++                    Some(&one),
++                    &self.guard.heap,
++                    1,
++                    Some(&D3D12_TILE_RANGE_FLAG_NONE),
++                    Some(&0),
++                    Some(&1),
++                    D3D12_TILE_MAPPING_FLAG_NONE,
++                );
++            }
++        }
++        for run in &layout {
++            let start = D3D12_TILED_RESOURCE_COORDINATE {
++                X: run.first,
++                ..Default::default()
++            };
++            let size = D3D12_TILE_REGION_SIZE {
++                NumTiles: run.count,
++                ..Default::default()
++            };
++            // SAFETY: the runtime cut each run to this buffer and its host
++            // heap. The new and old heap owners stay alive until the fence.
++            unsafe {
++                queue.UpdateTileMappings(
++                    &self.resource,
++                    1,
++                    Some(&start),
++                    Some(&size),
++                    &run.heap.heap,
++                    1,
++                    Some(&D3D12_TILE_RANGE_FLAG_NONE),
++                    Some(&run.heap_tile),
++                    Some(&run.count),
++                    D3D12_TILE_MAPPING_FLAG_NONE,
++                );
++            }
++        }
++        std::mem::replace(&mut *mapped, layout)
++    }
++}
++
++pub(crate) struct InFlightTiles {
++    _buffers: Vec<Arc<ReservedBuffer>>,
++    _prior: Vec<PhysicalTiles>,
++}
++
++/// Updates mappings on the very queue that is about to use the buffers.
++pub(crate) fn prepare(queue: &ID3D12CommandQueue) -> Option<InFlightTiles> {
++    let snapshot = LAYOUT.get()?;
++    let address = queue.as_raw() as usize;
++    let new_queue = QUEUE.swap(address, Ordering::Relaxed) != address;
++    if !CHANGED.swap(false, Ordering::AcqRel) && !new_queue {
++        return None;
++    }
++    let buffers = {
++        let mut registry = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
++        let mut live = Vec::with_capacity(registry.len());
++        registry.retain(|buffer| match buffer.upgrade() {
++            Some(buffer) => {
++                live.push(buffer);
++                true
++            }
++            None => false,
++        });
++        live
++    };
++    let layouts: Vec<_> = buffers
++        .iter()
++        .map(|buffer| {
++            snapshot(buffer.base, buffer.len).unwrap_or_else(|| {
++                crate::host::fail(format_args!(
++                    "XMem lost the layout for GPU buffer {:#x}",
++                    buffer.base
++                ))
++            })
++        })
++        .collect();
++    if overlapping_owners(layouts.iter().map(Vec::as_slice)) {
++        crate::host::fail(format_args!(
++            "XMem remapped two reserved GPU buffers onto the same tiles"
++        ));
++    }
++    let prior = buffers
++        .iter()
++        .zip(layouts)
++        .flat_map(|(buffer, layout)| buffer.bind(queue, layout, new_queue))
++        .collect();
++    Some(InFlightTiles {
++        _buffers: buffers,
++        _prior: prior,
++    })
++}
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+index 14dc160..9b632f6 100644
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -102,6 +102,8 @@ pub(crate) struct Shadow {
+     /// and the bytes from the buffer's first byte to `start` (the heap
+     /// begins on a 64 KiB line; a title buffer need not).
+     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
++    #[cfg(feature = "diagnostics")]
++    physical: Option<Arc<crate::physical::ReservedBuffer>>,
+ }
+ 
+ /// What a copy in the card's memory ([`cards`]) has beside the buffer
+@@ -2956,6 +2958,10 @@ impl Shadow {
+ 
+     /// The bytes of the host buffer.
+     pub(crate) fn width(&self) -> u64 {
++        #[cfg(feature = "diagnostics")]
++        if self.physical.is_some() {
++            return self.len;
++        }
+         // SAFETY: a live buffer.
+         *self.width.get_or_init(|| unsafe { self.buffer.GetDesc() }.Width)
+     }
+@@ -2994,6 +3000,8 @@ impl Shadow {
+             changes_only: Default::default(),
+             mapped: false,
+             place: None,
++            #[cfg(feature = "diagnostics")]
++            physical: None,
+         }
+     }
+ 
+@@ -4968,6 +4976,14 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+     let entry = map.get_mut(&key)?;
+     if entry.shadow.is_none() {
+         let len = entry.end - key.0;
++        #[cfg(feature = "diagnostics")]
++        if let Some(physical) = crate::physical::ReservedBuffer::new(key.0 as usize, len as usize) {
++            let mut shadow = Shadow::placed(physical.placed(), key.0, len, false);
++            shadow.physical = Some(physical);
++            let shadow = Arc::new(shadow);
++            entry.shadow = Some(shadow.clone());
++            return Some(shadow);
++        }
+         // Rounded up so that views ending in the buffer's last 256 bytes fit.
+         // Shaders write some buffers (unordered access), so not upload memory.
+         let size = len.next_multiple_of(1 << 16);
+diff --git a/crates/victory-gpu/src/shared_pages.rs b/crates/victory-gpu/src/shared_pages.rs
+new file mode 100644
+index 0000000..d5e52e1
+--- /dev/null
++++ b/crates/victory-gpu/src/shared_pages.rs
+@@ -0,0 +1,364 @@
++//! CPU-visible D3DMetal heaps backing the title's physical pages.
++
++use std::sync::{Arc, OnceLock};
++
++use windows::Win32::Graphics::Direct3D12::*;
++
++const PAGE: usize = 64 << 10;
++
++#[cfg(target_arch = "x86_64")]
++mod mach {
++    use core::arch::asm;
++    use std::sync::{Mutex, OnceLock};
++
++    const MACH: u64 = 0x0100_0000;
++    const TRAP_REPLY_PORT: u64 = 26;
++    const TRAP_TASK_SELF: u64 = 28;
++    /// `mach_msg2_trap` (8 arguments). `mach_msg_trap` (31) is fatal on
++    /// macOS 27+ for kernel-object calls (`EXC_GUARD`).
++    const TRAP_MSG2: u64 = 47;
++    const MACH64_SEND_KOBJECT_CALL: u64 = 0x0000_0002_0000_0000;
++
++    pub const VM_FLAGS_FIXED: i32 = 0;
++    pub const VM_FLAGS_OVERWRITE: i32 = 0x4000;
++
++    unsafe fn trap(n: u64, a: [u64; 6]) -> u64 {
++        // SAFETY: forwarded to `trap8`.
++        unsafe { trap8(n, a, 0, 0) }
++    }
++
++    unsafe fn trap8(n: u64, a: [u64; 6], a7: u64, a8: u64) -> u64 {
++        let ret: u64;
++        // SAFETY: x86-64 XNU Mach trap ABI under Rosetta 2; 7th and 8th args
++        // sit at `[rsp + 8]` and `[rsp + 16]`.
++        unsafe {
++            asm!(
++                "sub rsp, 32",
++                "mov qword ptr [rsp], 0",
++                "mov qword ptr [rsp + 8], {a7}",
++                "mov qword ptr [rsp + 16], {a8}",
++                "syscall",
++                "add rsp, 32",
++                inlateout("rax") MACH | n => ret,
++                in("rdi") a[0],
++                in("rsi") a[1],
++                in("rdx") a[2],
++                in("r10") a[3],
++                in("r8") a[4],
++                in("r9") a[5],
++                a7 = in(reg) a7,
++                a8 = in(reg) a8,
++                lateout("rcx") _,
++                lateout("r11") _,
++            );
++        }
++        ret
++    }
++
++    pub fn task_self() -> u32 {
++        // SAFETY: argument-less Mach trap.
++        unsafe { trap(TRAP_TASK_SELF, [0; 6]) as u32 }
++    }
++
++    fn reply_port() -> u32 {
++        static PORT: OnceLock<u32> = OnceLock::new();
++        *PORT.get_or_init(|| {
++            // SAFETY: argument-less Mach trap.
++            unsafe { trap(TRAP_REPLY_PORT, [0; 6]) as u32 }
++        })
++    }
++
++    #[repr(C, packed(4))]
++    #[derive(Default, Clone, Copy)]
++    struct Header {
++        bits: u32,
++        size: u32,
++        remote: u32,
++        local: u32,
++        voucher: u32,
++        id: i32,
++    }
++
++    /// `mach_vm_remap` MIG request (`msgh_id = 4813`, `#pragma pack(4)`).
++    #[repr(C, packed(4))]
++    #[derive(Default, Clone, Copy)]
++    struct RemapRequest {
++        head: Header,
++        descriptors: u32,
++        src_task: u32,
++        pad1: u32,
++        disp_type: u32,
++        ndr: [u8; 8],
++        target_address: u64,
++        size: u64,
++        mask: u64,
++        flags: i32,
++        src_address: u64,
++        copy: u32,
++        inheritance: u32,
++    }
++
++    #[repr(C, packed(4))]
++    #[derive(Clone, Copy)]
++    struct RemapReply {
++        head: Header,
++        ndr: [u8; 8],
++        ret: i32,
++        target_address: u64,
++        cur_protection: i32,
++        max_protection: i32,
++        trailer: [u8; 128],
++    }
++
++    #[derive(Debug)]
++    pub struct Remapped {
++        pub msg: u32,
++        pub kr: i32,
++        pub address: u64,
++    }
++
++    static REMAP_LOCK: Mutex<()> = Mutex::new(());
++
++    /// Maps `[src, src + size)` of this task at `target`, sharing physical
++    /// pages (`copy = FALSE`).
++    ///
++    /// # Safety
++    /// Replaces whatever is mapped at `target`; both ranges must be page
++    /// aligned and owned by the caller.
++    pub unsafe fn remap_shared(target: u64, src: u64, size: u64, flags: i32) -> Remapped {
++        let _guard = REMAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
++        let task = task_self();
++        let reply = reply_port();
++        let mut msg = [0u8; size_of::<RemapReply>()];
++        let req = RemapRequest {
++            head: Header {
++                // MACH_MSGH_BITS(COPY_SEND=19, MAKE_SEND_ONCE=21) | MACH_MSGH_BITS_COMPLEX
++                bits: 19 | (21 << 8) | 0x8000_0000,
++                size: size_of::<RemapRequest>() as u32,
++                remote: task,
++                local: reply,
++                voucher: 0,
++                id: 4813,
++            },
++            descriptors: 1,
++            src_task: task,
++            pad1: 0,
++            disp_type: 19 << 16,
++            ndr: [0, 0, 0, 0, 1, 0, 0, 0],
++            target_address: target,
++            size,
++            mask: 0,
++            flags,
++            src_address: src,
++            copy: 0,
++            inheritance: 1,
++        };
++        // SAFETY: `req` and `msg` are plain-old-data structs of known size.
++        unsafe {
++            std::ptr::copy_nonoverlapping(
++                (&raw const req).cast::<u8>(),
++                msg.as_mut_ptr(),
++                size_of::<RemapRequest>(),
++            );
++        }
++        let pack = |lo: u32, hi: u32| (u64::from(hi) << 32) | u64::from(lo);
++        let args = [
++            msg.as_mut_ptr() as u64,
++            3 | MACH64_SEND_KOBJECT_CALL,
++            pack(req.head.bits, size_of::<RemapRequest>() as u32),
++            pack(task, reply),
++            pack(0, 4813),
++            pack(1, reply),
++        ];
++        // SAFETY: `msg` holds the request and space for the reply and trailer.
++        let r = unsafe { trap8(TRAP_MSG2, args, pack(msg.len() as u32, 0), 0) } as u32;
++        // SAFETY: the kernel wrote at most `msg.len()` bytes into `msg`.
++        let rep: RemapReply = unsafe { std::ptr::read_unaligned(msg.as_ptr().cast()) };
++        Remapped {
++            msg: r,
++            kr: rep.ret,
++            address: rep.target_address,
++        }
++    }
++}
++
++#[cfg(not(target_arch = "x86_64"))]
++mod mach {
++    pub const VM_FLAGS_FIXED: i32 = 0;
++    pub const VM_FLAGS_OVERWRITE: i32 = 0x4000;
++
++    #[derive(Debug)]
++    pub struct Remapped {
++        pub msg: u32,
++        pub kr: i32,
++        pub address: u64,
++    }
++
++    pub fn task_self() -> u32 {
++        0
++    }
++
++    pub unsafe fn remap_shared(_target: u64, _src: u64, _size: u64, _flags: i32) -> Remapped {
++        Remapped {
++            msg: 1,
++            kr: -1,
++            address: 0,
++        }
++    }
++}
++
++#[cfg(any(test, feature = "diagnostics"))]
++pub struct PhysicalHeap {
++    backing: ID3D12Resource,
++    pub(crate) heap: ID3D12Heap,
++    address: usize,
++    len: usize,
++}
++
++#[cfg(any(test, feature = "diagnostics"))]
++pub(crate) fn physical_buffer_desc(len: usize, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
++    D3D12_RESOURCE_DESC {
++        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
++        Width: len as u64,
++        Height: 1,
++        DepthOrArraySize: 1,
++        MipLevels: 1,
++        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
++            Count: 1,
++            Quality: 0,
++        },
++        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
++        Flags: flags,
++        ..Default::default()
++    }
++}
++
++#[cfg(any(test, feature = "diagnostics"))]
++impl PhysicalHeap {
++    pub(crate) fn new(device: &ID3D12Device, len: usize) -> windows::core::Result<Self> {
++        let desc = D3D12_HEAP_DESC {
++            SizeInBytes: len as u64,
++            Properties: D3D12_HEAP_PROPERTIES {
++                Type: D3D12_HEAP_TYPE_CUSTOM,
++                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
++                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
++                CreationNodeMask: 1,
++                VisibleNodeMask: 1,
++            },
++            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
++            ..Default::default()
++        };
++        let buffer = physical_buffer_desc(len, D3D12_RESOURCE_FLAG_NONE);
++        let mut heap = None;
++        let mut backing = None;
++        let mut address = std::ptr::null_mut();
++        // SAFETY: plain D3D12 creation with output slots on this stack.
++        let (heap, backing) = unsafe {
++            device.CreateHeap(&desc, &mut heap)?;
++            let heap: ID3D12Heap = heap.ok_or_else(windows::core::Error::empty)?;
++            device.CreatePlacedResource(
++                &heap,
++                0,
++                &buffer,
++                D3D12_RESOURCE_STATE_COMMON,
++                None,
++                &mut backing,
++            )?;
++            let backing: ID3D12Resource = backing.ok_or_else(windows::core::Error::empty)?;
++            backing.Map(0, None, Some(&mut address))?;
++            (heap, backing)
++        };
++        if address.is_null() {
++            return Err(windows::core::Error::empty());
++        }
++        Ok(Self {
++            backing,
++            heap,
++            address: address as usize,
++            len,
++        })
++    }
++
++    /// The CPU view, valid for the lifetime of this heap.
++    pub fn cpu_address(&self) -> usize {
++        self.address
++    }
++
++    /// Replaces a Windows file view with the corresponding heap pages.
++    ///
++    /// # Safety
++    /// The caller owns the destination view and keeps this heap alive as
++    /// long as the view is mapped.
++    pub unsafe fn alias_view(&self, at: usize, offset: usize, len: usize) -> bool {
++        if at == 0
++            || len == 0
++            || [at, offset, len].iter().any(|n| !n.is_multiple_of(PAGE))
++            || offset.checked_add(len).is_none_or(|end| end > self.len)
++        {
++            return false;
++        }
++        // SAFETY: the caller owns the view; the source range is in the
++        // live placed buffer and checked above.
++        let remap = unsafe {
++            mach::remap_shared(
++                at as u64,
++                (self.address + offset) as u64,
++                len as u64,
++                mach::VM_FLAGS_FIXED | mach::VM_FLAGS_OVERWRITE,
++            )
++        };
++        remap.msg == 0 && remap.kr == 0 && remap.address == at as u64
++    }
++}
++
++#[cfg(any(test, feature = "diagnostics"))]
++impl Drop for PhysicalHeap {
++    fn drop(&mut self) {
++        // SAFETY: unmapped once, while the placed buffer still owns the view.
++        unsafe { self.backing.Unmap(0, None) };
++    }
++}
++
++/// Whether x86-64 code here runs under Rosetta: Wine on macOS, whose
++/// x86-64 Wine only runs that way on the Apple silicon Macs D3DMetal needs.
++fn rosetta() -> bool {
++    use std::ffi::{CStr, c_char};
++    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
++    type HostVersion = unsafe extern "C" fn(*mut *const c_char, *mut *const c_char);
++    // SAFETY: ntdll is always loaded and both names end with a NUL. Wine's
++    // `wine_get_host_version` (cdecl, two out pointers) sets them to static
++    // strings: the host's `uname` system name and release.
++    unsafe {
++        let Some(f) = GetProcAddress(
++            GetModuleHandleA(c"ntdll.dll".as_ptr().cast()),
++            c"wine_get_host_version".as_ptr().cast(),
++        ) else {
++            return false;
++        };
++        let f: HostVersion = std::mem::transmute(f);
++        let (mut sysname, mut release) = (std::ptr::null(), std::ptr::null());
++        f(&mut sysname, &mut release);
++        !sysname.is_null() && CStr::from_ptr(sysname) == c"Darwin"
++    }
++}
++
++pub(crate) fn physical_heaps_enabled() -> bool {
++    static ENABLED: OnceLock<bool> = OnceLock::new();
++    *ENABLED.get_or_init(|| {
++        crate::switch::on("VICTORY_PHYSICAL_TILES")
++            && !crate::watch::fault_tracking()
++            && !crate::host::late()
++            && !crate::switch::on("VICTORY_D3D12_WARP")
++            && rosetta()
++            && mach::task_self() != 0
++    })
++}
++
++/// Allocates physical pages with shared CPU and GPU backing.
++pub fn physical_heap(len: usize) -> windows::core::Result<Option<Arc<PhysicalHeap>>> {
++    if !physical_heaps_enabled() {
++        return Ok(None);
++    }
++    let host = crate::host::host().ok_or_else(windows::core::Error::empty)?;
++    PhysicalHeap::new(&host.device, len).map(|heap| Some(Arc::new(heap)))
++}
+diff --git a/crates/victory-gpu/src/watch.rs b/crates/victory-gpu/src/watch.rs
+index d8691af..6570d17 100644
+--- a/crates/victory-gpu/src/watch.rs
++++ b/crates/victory-gpu/src/watch.rs
+@@ -2454,6 +2454,8 @@ pub fn title_memory_reading_now() -> Option<Reading> {
+ /// neither guarded nor writable) and a kernel read into it fail, so the
+ /// write access is given back.
+ pub fn title_memory_remapped(at: usize, len: usize) {
++    #[cfg(feature = "diagnostics")]
++    crate::physical::physical_layout_changed();
+     crate::texback::remapped(at, len);
+     open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
+ }
+@@ -2464,6 +2466,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
+ /// before the unmapping would leave the address guarded, clean and known by
+ /// its bits ([`PUBLISHED`]) with no view behind it.
+ pub fn title_memory_unmapping(at: usize, len: usize) {
++    #[cfg(feature = "diagnostics")]
++    crate::physical::physical_layout_changed();
+     crate::texback::remapped(at, len);
+     let mut g = title_memory_changed(at, len);
+     if CHANGING.get().0 && len != 0 {
+diff --git a/crates/victory-hle/src/modules/d3d12x.rs b/crates/victory-hle/src/modules/d3d12x.rs
+index a5de7c4..804bcb4 100644
+--- a/crates/victory-hle/src/modules/d3d12x.rs
++++ b/crates/victory-hle/src/modules/d3d12x.rs
+@@ -20,6 +20,8 @@ extern "system" fn create_device(
+     victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
+     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
+     victory_gpu::resource::use_many_page_mapper(super::xmem::map_aliases);
++    #[cfg(all(windows, feature = "diagnostics"))]
++    victory_gpu::use_physical_layout(super::xmem::physical_layout);
+     #[cfg(windows)]
+     victory_gpu::on_failure(host_gpu_failed);
+     device::create(adapter, parameters, iid, out)
+diff --git a/crates/victory-hle/src/modules/xmem.rs b/crates/victory-hle/src/modules/xmem.rs
+index 5db6b90..f075b59 100644
+--- a/crates/victory-hle/src/modules/xmem.rs
++++ b/crates/victory-hle/src/modules/xmem.rs
+@@ -387,6 +387,8 @@ const PAGE: usize = 64 << 10;
+ struct Section {
+     handle: HANDLE,
+     pages: usize,
++    #[cfg(feature = "diagnostics")]
++    shared: Option<Arc<victory_gpu::PhysicalHeap>>,
+     /// A view of the whole section, kept ([`Section::window`]); 0 if the
+     /// host gave none.
+     window: std::sync::OnceLock<usize>,
+@@ -406,6 +408,11 @@ impl Section {
+     /// costs that once per page.
+     /// `VICTORY_SECTION_WINDOW=0`: a view for each write, as before.
+     fn window(&self, index: usize, n: usize) -> Option<usize> {
++        #[cfg(feature = "diagnostics")]
++        if let Some(shared) = &self.shared {
++            return (index.checked_add(n)? <= self.pages)
++                .then(|| shared.cpu_address() + index * PAGE);
++        }
+         use std::sync::atomic::Ordering;
+         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+         static ON: LazyLock<bool> =
+@@ -610,6 +617,34 @@ fn physical() -> MutexGuard<'static, Physical> {
+     PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
+ }
+ 
++#[cfg(feature = "diagnostics")]
++pub(crate) fn physical_layout(base: usize, len: usize) -> Option<Vec<victory_gpu::PhysicalTiles>> {
++    let end = base.checked_add(len)?;
++    let physical = physical();
++    let first = physical.views.range(..=base).next_back().map_or(base, |(&at, _)| at);
++    let mut runs: Vec<victory_gpu::PhysicalTiles> = Vec::new();
++    for (&at, (size, slice)) in physical.views.range(first..end) {
++        let (from, to) = (base.max(at), end.min(at.saturating_add(*size)));
++        if from >= to {
++            continue;
++        }
++        let first = u32::try_from((from - base) / PAGE).ok()?;
++        let count = u32::try_from((to - from) / PAGE).ok()?;
++        let heap_tile = u32::try_from(slice.index + (from - at) / PAGE).ok()?;
++        let heap = slice.section.shared.as_ref()?;
++        if let Some(last) = runs.last_mut()
++            && last.first + last.count == first
++            && last.heap_tile + last.count == heap_tile
++            && Arc::ptr_eq(&last.heap, heap)
++        {
++            last.count += count;
++        } else {
++            runs.push(victory_gpu::PhysicalTiles { first, count, heap_tile, heap: heap.clone() });
++        }
++    }
++    Some(runs)
++}
++
+ /// The title's pages. Apart from the views: DirectStorage looks pages up at
+ /// every request, from 24 workers, and used to wait there for the title's
+ /// mapping calls (12,000 waits of 1 to 170 ms in a load of 90 s). Written
+@@ -645,6 +680,16 @@ pub extern "system" fn XMemAllocatePhysicalPages(
+     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
+         return 0;
+     };
++    #[cfg(feature = "diagnostics")]
++    let shared = match victory_gpu::physical_heap(size) {
++        Ok(heap) => heap,
++        Err(error) => {
++            tracing::warn!(size, %error, "XMem physical tile heap allocation failed");
++            // SAFETY: checked non-null.
++            unsafe { count.write(0) };
++            return 0;
++        }
++    };
+     // A pagefile-backed section of `size` bytes, its pages committed when
+     // first mapped or written (`commit`): the title asks for 6.1
+     // GiB at once, which a busy host often cannot commit (error 1450).
+@@ -681,6 +726,8 @@ pub extern "system" fn XMemAllocatePhysicalPages(
+     let section = Arc::new(Section {
+         handle,
+         pages: n,
++        #[cfg(feature = "diagnostics")]
++        shared,
+         window: std::sync::OnceLock::new(),
+         committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+     });
+@@ -1664,6 +1711,16 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
+         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+         return false;
+     }
++    #[cfg(feature = "diagnostics")]
++    if let Some(heap) = &slice.section.shared {
++        // SAFETY: this operation owns the new placeholder view, and the
++        // section retains the heap until all its mapped views are gone.
++        if !unsafe { heap.alias_view(base, slice.index * PAGE, len) } {
++            // SAFETY: restore the placeholder on remapping failure.
++            unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
++            return false;
++        }
++    }
+     true
+ }
+ 
+@@ -2047,6 +2104,12 @@ mod tests {
+         assert!(!a.is_null() && !b.is_null());
+         let at = |p: *mut c_void, page: usize| p.wrapping_byte_add(page * PAGE);
+         assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
++        #[cfg(feature = "diagnostics")]
++        if std::env::var("VICTORY_PHYSICAL_TILES").as_deref() == Ok("1") {
++            let layout = physical_layout(a as usize, 3 * PAGE).expect("physical heap backing");
++            assert_eq!(layout.len(), 1);
++            assert_eq!((layout[0].first, layout[0].count), (0, 3));
++        }
+ 
+         // The same page at a second address shows the same bytes.
+         assert_eq!(
+-- 
+2.50.1 (Apple Git-155)
+
+
+From ed79c48f9cd73fde4b5e94191ffbeb1b37f0f6bf Mon Sep 17 00:00:00 2001
+From: Codex <codex@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 17:30:34 -0800
+Subject: [PATCH 2/2] Share registered title buffers backed by committed
+ graphics memory
+
+---
+ crates/victory-gpu/src/inplace.rs      |  56 ++++++++++
+ crates/victory-gpu/src/lib.rs          |   2 +
+ crates/victory-gpu/src/shadow.rs       | 149 +++++++++++++++++++++++--
+ crates/victory-gpu/src/shared_pages.rs |  33 ++++--
+ crates/victory-hle/src/modules/xmem.rs |  15 +++
+ 5 files changed, 237 insertions(+), 18 deletions(-)
+
+diff --git a/crates/victory-gpu/src/inplace.rs b/crates/victory-gpu/src/inplace.rs
+index 28f570e..9a48cef 100644
+--- a/crates/victory-gpu/src/inplace.rs
++++ b/crates/victory-gpu/src/inplace.rs
+@@ -1354,6 +1354,62 @@ mod tests {
+         }
+     }
+ 
++    #[cfg(feature = "diagnostics")]
++    #[test]
++    #[ignore = "requires D3DMetal with VICTORY_COMMITTED_ALIAS=1"]
++    fn committed_title_buffer_shares_a_subrange_until_release() {
++        use crate::shadow::{
++            find, free_committed_allocation, register, share_committed_allocation, unregister,
++        };
++        use std::sync::Arc;
++
++        let host = crate::host::host().expect("D3D12 host");
++        let mut rig = Rig::new(&host.device).unwrap();
++        // SAFETY: test-owned memory. The test releases it below.
++        let base = unsafe {
++            mem::VirtualAlloc(
++                std::ptr::null(),
++                2 * K64,
++                mem::MEM_COMMIT | mem::MEM_RESERVE,
++                mem::PAGE_READWRITE,
++            )
++        };
++        assert!(!base.is_null());
++        // SAFETY: exclusive, newly committed pages.
++        assert!(unsafe { share_committed_allocation(base as usize, 2 * K64) });
++        let bias = K64 + 256;
++        let address = base.wrapping_byte_add(bias);
++        let va = address as u64;
++        register(va as usize, va, 4096);
++        let shadow = find(va, 32).unwrap();
++        assert!(shadow.in_place());
++        assert_eq!(shadow.left(va), 4096);
++        assert_eq!(shadow.offset(va), bias as u64);
++        let fetch = |rig: &mut Rig| rig.fetch(&shadow.buffer, shadow.offset(va), 32).unwrap();
++        assert_eq!(fetch(&mut rig), [0; 32]);
++        // SAFETY: the first 32 bytes of the test view, with no GPU access in flight.
++        unsafe { address.cast::<u8>().write_bytes(0x5A, 32) };
++        assert_eq!(fetch(&mut rig), [0x5A; 32]);
++        rig.store(&shadow.buffer, shadow.offset(va), &[0xB7; 32]).unwrap();
++        // SAFETY: the preceding GPU submission was completed before this read.
++        assert_eq!(unsafe { address.cast::<[u8; 32]>().read() }, [0xB7; 32]);
++
++        // SAFETY: the test owns this allocation. A nonzero release size is invalid.
++        let failed = free_committed_allocation(base as usize, K64, || unsafe {
++            mem::VirtualFree(base, K64, mem::MEM_RELEASE)
++        });
++        assert_eq!(failed, 0);
++        assert!(Arc::ptr_eq(&shadow, &find(va, 32).unwrap()));
++        // SAFETY: release this test's whole allocation and keep the old GPU resource alive.
++        let released = free_committed_allocation(base as usize, 0, || unsafe {
++            mem::VirtualFree(base, 0, mem::MEM_RELEASE)
++        });
++        assert_ne!(released, 0);
++        assert!(crate::shadow::peek(va, 32).is_none());
++        assert_eq!(fetch(&mut rig), [0xB7; 32]);
++        unregister(va as usize, va);
++    }
++
+     pub(crate) fn warp() -> Option<ID3D12Device> {
+         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+         use windows::Win32::Graphics::Dxgi::*;
+diff --git a/crates/victory-gpu/src/lib.rs b/crates/victory-gpu/src/lib.rs
+index ff43fc4..7c447d4 100644
+--- a/crates/victory-gpu/src/lib.rs
++++ b/crates/victory-gpu/src/lib.rs
+@@ -104,6 +104,8 @@ pub use host::on_failure;
+ pub use physical::{PhysicalTiles, use_physical_layout};
+ #[cfg(all(windows, feature = "diagnostics"))]
+ pub use shared_pages::{PhysicalHeap, physical_heap};
++#[cfg(all(windows, feature = "diagnostics"))]
++pub use shadow::{free_committed_allocation, share_committed_allocation};
+ 
+ /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
+ /// off while the title runs (`ab`).
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+index 9b632f6..bf6bf58 100644
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -98,10 +98,10 @@ pub(crate) struct Shadow {
+     mapped: bool,
+     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
+     /// heap opened on the title memory itself, so shaders read and write
+-    /// the title's own bytes and nothing is copied either way. The heap,
+-    /// and the bytes from the buffer's first byte to `start` (the heap
+-    /// begins on a 64 KiB line; a title buffer need not).
+-    place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
++    /// the title's own bytes and nothing is copied either way. Holds the
++    /// explicit heap if there is one, and the offset from the buffer's
++    /// first byte to `start`.
++    place: Option<(Option<windows::Win32::Graphics::Direct3D12::ID3D12Heap>, u64)>,
+     #[cfg(feature = "diagnostics")]
+     physical: Option<Arc<crate::physical::ReservedBuffer>>,
+ }
+@@ -2939,14 +2939,23 @@ impl Shadow {
+     fn placed(placed: crate::inplace::Placed, start: u64, len: u64, window: bool) -> Shadow {
+         crate::host::name(&placed.buffer, || format!("title memory {start:#x}+{len:#x} in place"));
+         let mut shadow = Shadow::new(placed.buffer, start as *mut u8, placed.gpu, start, len);
++        shadow.keep_in_place(Some(placed.heap), placed.bias, window);
++        shadow
++    }
++
++    fn keep_in_place(
++        &mut self,
++        heap: Option<windows::Win32::Graphics::Direct3D12::ID3D12Heap>,
++        bias: u64,
++        window: bool,
++    ) {
+         // Not a copy: not counted with them, and nothing asks what the
+         // title wrote there.
+         LIVE[0].fetch_sub(1, Ordering::Relaxed);
+-        LIVE[1].fetch_sub(len, Ordering::Relaxed);
+-        *shadow.watched.get_mut() = NOT_WATCHED;
+-        shadow.window = window;
+-        shadow.place = Some((placed.heap, placed.bias));
+-        shadow
++        LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
++        *self.watched.get_mut() = NOT_WATCHED;
++        self.window = window;
++        self.place = Some((heap, bias));
+     }
+ 
+     /// Brings `len` bytes at `address` up to date when `list` is submitted,
+@@ -4977,6 +4986,13 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+     if entry.shadow.is_none() {
+         let len = entry.end - key.0;
+         #[cfg(feature = "diagnostics")]
++        if crate::shared_pages::committed_aliases_enabled()
++            && let Some(shadow) = committed_shadow(key.0, len)
++        {
++            entry.shadow = Some(shadow.clone());
++            return Some(shadow);
++        }
++        #[cfg(feature = "diagnostics")]
+         if let Some(physical) = crate::physical::ReservedBuffer::new(key.0 as usize, len as usize) {
+             let mut shadow = Shadow::placed(physical.placed(), key.0, len, false);
+             shadow.physical = Some(physical);
+@@ -5252,6 +5268,121 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
+ /// Copies of title memory outside buffers, by (start, length).
+ static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
+ 
++#[cfg(feature = "diagnostics")]
++struct CommittedAllocation {
++    buffer: ID3D12Resource,
++    cpu: usize,
++    gpu: u64,
++    len: u64,
++}
++
++#[cfg(feature = "diagnostics")]
++static COMMITTED: RwLock<BTreeMap<u64, CommittedAllocation>> = RwLock::new(BTreeMap::new());
++
++#[cfg(feature = "diagnostics")]
++fn committed_shadow(at: u64, len: u64) -> Option<Arc<Shadow>> {
++    let aliases = COMMITTED.read().unwrap_or_else(|e| e.into_inner());
++    let (&base, allocation) = aliases.range(..=at).next_back()?;
++    let bias = at - base;
++    if len > allocation.len.checked_sub(bias)? {
++        return None;
++    }
++    let mut shadow = Shadow::new(
++        allocation.buffer.clone(),
++        (allocation.cpu + bias as usize) as *mut u8,
++        allocation.gpu + bias,
++        at,
++        len,
++    );
++    shadow.keep_in_place(None, bias, false);
++    let _ = shadow.width.set(allocation.len.min(bias + len.next_multiple_of(PAGE as u64)));
++    Some(Arc::new(shadow))
++}
++
++/// Shares the backing of a newly committed title allocation with D3DMetal.
++///
++/// # Safety
++/// The range is exclusively owned, freshly committed and read-write.
++#[cfg(feature = "diagnostics")]
++pub unsafe fn share_committed_allocation(base: usize, len: usize) -> bool {
++    const GRANULE: usize = 64 << 10;
++    if !crate::shared_pages::committed_aliases_enabled()
++        || base == 0
++        || len == 0
++        || !base.is_multiple_of(GRANULE)
++        || !len.is_multiple_of(GRANULE)
++        || base.checked_add(len).is_none()
++    {
++        return false;
++    }
++    let Some((buffer, cpu)) = host().and_then(|host| host.shared_buffer(len as u64)) else {
++        return false;
++    };
++    // SAFETY: the fresh buffer is mapped for this length. Preserve the
++    // initial zeros that VirtualAlloc guarantees to the caller.
++    unsafe { cpu.write_bytes(0, len) };
++    // SAFETY: the destination is fresh and the registry retains the buffer.
++    if !unsafe { crate::shared_pages::overlay(base, cpu as usize, len) } {
++        return false;
++    }
++    // SAFETY: a live host buffer.
++    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
++    COMMITTED.write().unwrap_or_else(|e| e.into_inner()).insert(
++        base as u64,
++        CommittedAllocation {
++            buffer,
++            cpu: cpu as usize,
++            gpu,
++            len: len as u64,
++        },
++    );
++    if len >= 16 << 20 {
++        tracing::info!(base = format_args!("{base:#x}"), len, "committed title buffer uses shared memory");
++    }
++    true
++}
++
++/// Retires aliased views if the title successfully releases or decommits memory.
++#[cfg(feature = "diagnostics")]
++pub fn free_committed_allocation(base: usize, len: usize, free: impl FnOnce() -> i32) -> i32 {
++    if !crate::shared_pages::committed_aliases_enabled() {
++        return free();
++    }
++    let mut aliases = COMMITTED.write().unwrap_or_else(|e| e.into_inner());
++    let result = free();
++    if result == 0 {
++        return result;
++    }
++    let base = base as u64;
++    let released: Vec<_> = if len == 0 {
++        aliases.remove(&base).into_iter().map(|a| (base, a)).collect()
++    } else {
++        let end = base.saturating_add(len as u64);
++        let starts: Vec<_> = aliases.range(..end)
++            .filter(|&(&at, a)| at + a.len > base)
++            .map(|(&at, _)| at)
++            .collect();
++        starts.into_iter().filter_map(|at| aliases.remove(&at).map(|a| (at, a))).collect()
++    };
++    drop(aliases);
++    for (at, allocation) in released {
++        let end = at + allocation.len;
++        let mut retired = Vec::new();
++        {
++            let mut entries = buffers();
++            for (_, entry) in entries.range_mut((at, 0)..(end, 0)) {
++                if entry.shadow.as_ref().is_some_and(|shadow| shadow.buffer == allocation.buffer) {
++                    retired.extend(entry.shadow.take());
++                }
++            }
++        }
++        for shadow in retired {
++            crate::host::retire(shadow);
++        }
++    }
++    result
++}
++
+ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
+     let (cell, _) = window_of(address, end, WINDOW);
+     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
+diff --git a/crates/victory-gpu/src/shared_pages.rs b/crates/victory-gpu/src/shared_pages.rs
+index d5e52e1..0367c7b 100644
+--- a/crates/victory-gpu/src/shared_pages.rs
++++ b/crates/victory-gpu/src/shared_pages.rs
+@@ -299,15 +299,7 @@ impl PhysicalHeap {
+         }
+         // SAFETY: the caller owns the view; the source range is in the
+         // live placed buffer and checked above.
+-        let remap = unsafe {
+-            mach::remap_shared(
+-                at as u64,
+-                (self.address + offset) as u64,
+-                len as u64,
+-                mach::VM_FLAGS_FIXED | mach::VM_FLAGS_OVERWRITE,
+-            )
+-        };
+-        remap.msg == 0 && remap.kr == 0 && remap.address == at as u64
++        unsafe { overlay(at, self.address + offset, len) }
+     }
+ }
+ 
+@@ -354,6 +346,29 @@ pub(crate) fn physical_heaps_enabled() -> bool {
+     })
+ }
+ 
++pub(crate) fn committed_aliases_enabled() -> bool {
++    static ENABLED: OnceLock<bool> = OnceLock::new();
++    *ENABLED.get_or_init(|| {
++        crate::switch::on("VICTORY_COMMITTED_ALIAS") && physical_heaps_enabled()
++    })
++}
++
++/// # Safety
++/// The destination is the caller's view. The source and its owner are
++/// kept alive for all uses of the new mapping.
++pub(crate) unsafe fn overlay(at: usize, source: usize, len: usize) -> bool {
++    // SAFETY: the caller owns both mapped ranges and retains the source.
++    let remap = unsafe {
++        mach::remap_shared(
++            at as u64,
++            source as u64,
++            len as u64,
++            mach::VM_FLAGS_FIXED | mach::VM_FLAGS_OVERWRITE,
++        )
++    };
++    remap.msg == 0 && remap.kr == 0 && remap.address == at as u64
++}
++
+ /// Allocates physical pages with shared CPU and GPU backing.
+ pub fn physical_heap(len: usize) -> windows::core::Result<Option<Arc<PhysicalHeap>>> {
+     if !physical_heaps_enabled() {
+diff --git a/crates/victory-hle/src/modules/xmem.rs b/crates/victory-hle/src/modules/xmem.rs
+index f075b59..94629b7 100644
+--- a/crates/victory-hle/src/modules/xmem.rs
++++ b/crates/victory-hle/src/modules/xmem.rs
+@@ -179,6 +179,16 @@ pub extern "system" fn XMemVirtualAlloc(
+     }
+     if !at.is_null() && !placeholder {
+         victory_gpu::title_memory_allocated(at as usize, size);
++        #[cfg(feature = "diagnostics")]
++        if constrained
++            && kind == (MEM_COMMIT | MEM_RESERVE)
++            && flags & GRAPHICS == GRAPHICS
++            && protect == PAGE_READWRITE
++            && size >= 16 * MIB
++        {
++            // SAFETY: this is a fresh host allocation chosen for this call.
++            unsafe { victory_gpu::share_committed_allocation(at as usize, size) };
++        }
+     }
+     note_protection(asked, kind, flags, at as usize, size);
+     at
+@@ -1932,6 +1942,11 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
+     // Splitting and joining placeholders changes nothing they show.
+     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
+         victory_gpu::title_memory_freed(address as usize, size);
++        #[cfg(feature = "diagnostics")]
++        return victory_gpu::free_committed_allocation(address as usize, size, || {
++            // SAFETY: the title's own arguments.
++            unsafe { VirtualFree(address, size, kind) }
++        });
+     }
+     // SAFETY: the title's own arguments.
+     unsafe { VirtualFree(address, size, kind) }
+-- 
+2.50.1 (Apple Git-155)
+
