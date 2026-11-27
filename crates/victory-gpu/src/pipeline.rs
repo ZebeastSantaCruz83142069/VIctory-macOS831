@@ -290,7 +290,7 @@ impl Shader {
                         if let (Some(o), Some(bytes)) =
                             (mesh_outputs(&t.host.dxil), metal_mesh_output_bytes(&t.host.dxil))
                             && bytes > METAL_MESH_OUTPUT_BYTES
-                            && crate::shader_cache::under_wine()
+                            && crate::under_wine()
                         {
                             tracing::warn!(
                                 hash = %self.hash,
@@ -348,14 +348,24 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
 #[cfg(windows)]
 fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
     let (host, cached) = crate::shader_cache::host_shader(container);
-    (host.and_then(|host| with_resources(container, host)), cached)
+    let translated = host.and_then(|host| {
+        let found = crate::shader_resources::resources(container, analyze)?;
+        Ok(Translated {
+            host,
+            used: found.used,
+            used_written: found.used_written,
+            write_unknown: found.write_unknown,
+            threads: found.threads,
+        })
+    });
+    (translated, cached)
 }
 
+/// The console resources a container's program reads and writes, and a
+/// compute program's group size. Bump `shader_resources::RESOURCES_VERSION`
+/// when this analysis changes independently of the shader translator.
 #[cfg(windows)]
-fn with_resources(
-    container: &[u8],
-    host: victory_shader::emit::HostShader,
-) -> Result<Translated, String> {
+fn analyze(container: &[u8]) -> Result<crate::shader_resources::Resources, String> {
     use victory_shader::native::StageIo;
     use victory_shader::{Container, FourCC, HwStage};
     let c = Container::parse(container).map_err(|e| e.to_string())?;
@@ -381,8 +391,7 @@ fn with_resources(
         // Another stage in the container could store through a shared table.
         write_unknown = true;
     }
-    Ok(Translated {
-        host,
+    Ok(crate::shader_resources::Resources {
         used,
         used_written,
         write_unknown,
@@ -605,7 +614,7 @@ fn link_mesh_outputs() -> bool {
     // is made, draws nothing and its submission never completes (#172).
     *ON.get_or_init(|| match std::env::var_os("VICTORY_LINK_MESH_OUTPUTS") {
         Some(v) => crate::switch::value_is_on(Some(&v)),
-        None => crate::shader_cache::under_wine(),
+        None => crate::under_wine(),
     })
 }
 
@@ -689,7 +698,7 @@ pub(crate) fn refuse_over_limit_mesh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| match std::env::var_os("VICTORY_MESH_OVER_LIMIT") {
         Some(v) => !crate::switch::value_is_on(Some(&v)),
-        None => crate::shader_cache::under_wine(),
+        None => crate::under_wine(),
     })
 }
 
