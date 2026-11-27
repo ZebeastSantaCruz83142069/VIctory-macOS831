@@ -166,7 +166,7 @@ fn check_placed_store(
 
     let mut pipeline = std::ptr::null();
     assert_eq!(
-        hand_out(vec![store_shader()], None, &PIPELINE_IIDS[0], &mut pipeline),
+        hand_out(vec![store_shader()], None, &[], &PIPELINE_IIDS[0], &mut pipeline),
         S_OK
     );
     let pipeline = Guest(pipeline);

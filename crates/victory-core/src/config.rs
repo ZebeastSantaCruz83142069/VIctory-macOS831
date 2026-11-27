@@ -129,18 +129,17 @@ fn ensure_data_outside_cache(data_dir: &Path, cache_dir: &Path) -> Result<()> {
         resolve_path(data_dir).with_context(|| format!("resolving {}", data_dir.display()))?;
     let resolved_cache =
         resolve_path(cache_dir).with_context(|| format!("resolving {}", cache_dir.display()))?;
-    let inside_cache = resolved_data.starts_with(&resolved_cache);
-    // Wine can preserve the requested casing even when canonicalizing an
-    // existing directory. Compare directory identities on that path rather
-    // than folding names on volumes that distinguish case.
-    #[cfg(windows)]
-    let inside_cache = inside_cache
-        || same_file::Handle::from_path(&resolved_cache).is_ok_and(|cache| {
-            resolved_data.ancestors().any(|dir| {
-                same_file::Handle::from_path(dir).is_ok_and(|ancestor| ancestor == cache)
-            })
-        });
-    if inside_cache {
+    // Wine can keep the caller's spelling when canonicalizing an existing path.
+    // Ask the filesystem whether the ancestor at the cache depth is the cache.
+    let ancestor: PathBuf = resolved_data
+        .components()
+        .take(resolved_cache.components().count())
+        .collect();
+    if resolved_data.starts_with(&resolved_cache)
+        || (resolved_cache.try_exists()?
+            && ancestor.try_exists()?
+            && same_file::is_same_file(&ancestor, &resolved_cache)?)
+    {
         anyhow::bail!(
             "data_dir {} (resolved {}) is equal to or inside cache_dir {} (resolved {}); \
              cache cleanup may delete it, so persistent title saves would be lost — \
@@ -330,6 +329,11 @@ mod tests {
             cfg.cache_subdir("shaders").unwrap();
             assert!(cfg.data_subdir("saves").is_err());
             assert!(!new_cache.join("saves").exists());
+        } else {
+            let lower = tmp.path().join("caseprobe");
+            std::fs::create_dir(&lower).unwrap();
+            let cfg = resolve_with(probe_upper, lower.clone()).unwrap();
+            assert_eq!(cfg.data_subdir("saves").unwrap(), lower.join("saves"));
         }
 
         // If cache_dir lives inside data_dir, a data_subdir landing inside cache_dir is rejected.
