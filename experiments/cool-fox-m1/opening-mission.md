@@ -183,3 +183,25 @@ The Series S trial used source commit `5ce9f06`, CrossOver Preview and D3DMetal 
 The input is 1280×720 RGBA16F. Each output is 1920×1080 RGBA16F. On frame 2689 the second output had 76,052 lower-half pixels with at least one channel at or above 0.25. The input for that same dispatch had 1,925. These are samples of the individual surfaces, which have different resolutions and may have different encodings.
 
 Presenting the upscaler input in the game window still left the foreground mostly black. At +5 and +20 from the first busy frame, 222 and 2,012 of 259,200 lower-half SDR pixels reached 8/255 luminance. The two measured atmosphere-bypass runs used different display and ambient settings. The earlier normal-display run stayed black. The new readbacks establish that the dispatches can produce color and leave open what the later post-processing and display stages do with it. The first 20 reports at 100 or more draws had medians of 4,628.45 ms/frame and 3,458.3 ms in copy preparation. Changed settings and host activity prevent attributing those figures to a single change.
+
+## Upstream daylight fix and Series S startup on M1 Max
+
+I built upstream [`0c0d5ca7`](https://github.com/pragyaangaur/VIctory-macOS/commit/0c0d5ca7f990fa4dee5c088933f2d184fb2229aa) from source at the exact published tree. It includes the packed-format daylight fix in [#478](https://github.com/pragyaangaur/VIctory-macOS/pull/478). The Windows build SHA-256 was `f9f46871c7330eaf9310631c383f4b04a67eab09f29db98e2af2e451f7fbd142`. CrossOver Preview and D3DMetal on the Apple M1 Max reported mesh shaders and Shader Model 6.6.
+
+The included generated D3D12 capability query ran against the same device. All three format queries succeeded.
+
+| DXGI format | Render target | Typed UAV view | Typed UAV load | Typed UAV store |
+| --- | --- | --- | --- | --- |
+| B5G5R5A1_UNORM (86) | Yes | No | Yes | No |
+| B4G4R4A4_UNORM (115) | Yes | No | Yes | No |
+| R8G8B8A8_UNORM (28) | Yes | Yes | Yes | Yes |
+
+Series S reported 1280×720 and 3840×2160 presentation planes. On separate copies of the same saved profile, both planes stayed black in the observed startup samples. The readbacks are saved at half size.
+
+| Settings | Selected plane | Last sampled black frame | Readback size |
+| --- | ---: | ---: | --- |
+| Largest plane, compositing on | 1 | 4096 | 1920×1080 |
+| Plane 0, compositing off | 0 | 2048 | 640×360 |
+| Plane 0, compositing and aliasing off | 0 | 2048 | 640×360 |
+
+The title presented continuously with about one draw per frame. The live key file accepted Enter in the no-aliasing run. There was no opening world frame in these samples, so they do not exercise the sunlight fix in game or measure gameplay performance.
