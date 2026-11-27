@@ -176,7 +176,7 @@ pub(crate) fn widest() -> u32 {
         let wide = match std::env::var("VICTORY_INDIRECT_WIDE").as_deref() {
             Ok("0") => false,
             Ok("1") => true,
-            _ => crate::shader_cache::under_wine(),
+            _ => crate::under_wine(),
         };
         if wide { 1 << 20 } else { 65_535 }
     })

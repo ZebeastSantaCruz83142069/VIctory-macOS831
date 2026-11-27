@@ -452,7 +452,7 @@ pub fn warm(
 /// Opens the same translated-shader cache as a run.
 pub(crate) fn open_shader_cache() -> Result<PathBuf> {
     let shaders = victory_core::Config::load()?.cache_subdir("shaders")?;
-    victory_gpu::shader_cache::use_shader_cache(shaders.clone())
+    victory_gpu::use_shader_cache(shaders.clone())
         .with_context(|| format!("no shader cache in {}", shaders.display()))
 }
 
