@@ -1,0 +1,131 @@
+--- a/crates/victory-hle/src/modules/dstorage.rs
++++ b/crates/victory-hle/src/modules/dstorage.rs
+@@ -775,8 +775,14 @@
+     queue(this, Command::Status(Status { array, index }));
+ }
+ 
+-/// Adds a command to the queue; blocks while the queue is full, and
+-/// submits on its own once half of it is enqueued, as the console does.
++/// A half-full queue normally starts early. Disabling this leaves a
++/// batch intact until the title submits it or the queue fills.
++fn half_submits() -> bool {
++    static ENABLED: OnceLock<bool> = OnceLock::new();
++    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_HALF").is_none_or(|v| v != "0"))
++}
++
++/// Adds a command to the queue, blocking while it is full.
+ fn queue(this: QueueRef, command: Command) {
+     // SAFETY: a queue we created and the title still holds.
+     let id = unsafe { &*this }.state.id;
+@@ -801,6 +807,15 @@
+             }
+             lanes.submit(id);
+             scheduler.work.notify_all();
++        } else if !half_submits()
++            && !lane.unsubmitted.is_empty()
++            && lane.reads.is_empty()
++            && lane.running.is_empty()
++        {
++            // The caller cannot issue Submit while it sleeps in enqueue.
++            lanes.submit(id);
++            scheduler.work.notify_all();
++            continue;
+         }
+         lanes = scheduler
+             .finished
+@@ -811,7 +826,7 @@
+         return;
+     };
+     lane.unsubmitted.push(command);
+-    if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
++    if half_submits() && lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
+         let capacity = lane.capacity;
+         lanes.submit_as(id, false);
+         scheduler.work.notify_all();
+@@ -1183,11 +1198,15 @@
+     }
+ 
+     fn new_queue(source_type: u64) -> *mut c_void {
++        queue_with_capacity(source_type, 0x80)
++    }
++
++    fn queue_with_capacity(source_type: u64, capacity: u16) -> *mut c_void {
+         let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+             call(factory(), 0x50);
+         let desc = QueueDesc {
+             source_type,
+-            capacity: 0x80,
++            capacity,
+             priority: 0,
+             name: c"test".as_ptr(),
+             unknown: 1,
+@@ -1362,25 +1381,57 @@
+     #[test]
+     fn half_a_queue_submits_itself() {
+         let (_dir, file) = file_with(&pattern(64));
+-        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+-            call(factory(), 0x50);
+-        let desc = QueueDesc {
+-            source_type: 0,
+-            capacity: 4,
+-            priority: 1,
+-            name: c"small".as_ptr(),
+-            unknown: 1,
+-        };
+-        let mut queue = std::ptr::null_mut();
+-        assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
++        let queue = queue_with_capacity(0, 4);
+         let array = status_array(1);
+         let mut out = [0u8; 16];
+         enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 8, 16));
+-        enqueue_status(queue, array, 0); // the second of four: no submit needed
++        enqueue_status(queue, array, 0);
++        if !half_submits() {
++            assert_eq!(result(array, 0), E_PENDING);
++            assert_eq!(out, [0; 16]);
++            void(queue, 0x30);
++        }
+         assert_eq!(wait(array, 0), S_OK);
+         assert_eq!(out, pattern(64)[8..24]);
+     }
+ 
++    #[test]
++    fn full_queue_makes_progress_without_a_half_submit() {
++        if half_submits() {
++            return;
++        }
++        let bytes = pattern(64);
++        let (_dir, file) = file_with(&bytes);
++        let queue = queue_with_capacity(0, 4);
++        let array = status_array(2);
++        let mut buffers = [[0u8; 16]; 3];
++        for (i, out) in buffers.iter_mut().enumerate() {
++            enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, (16 * i) as u64, 16));
++            if i == 0 {
++                enqueue_status(queue, array, 0);
++            }
++        }
++        assert_eq!(wait(array, 0), S_OK);
++        enqueue_status(queue, array, 1);
++        void(queue, 0x30);
++        assert_eq!(wait(array, 1), S_OK);
++        for (i, out) in buffers.iter().enumerate() {
++            assert_eq!(out, &bytes[i * 16..(i + 1) * 16]);
++        }
++        // A batch of status entries completes synchronously. The enqueue
++        // that fills it must recheck capacity without waiting for a worker.
++        let statuses = status_array(4);
++        for i in 0..4 {
++            enqueue_status(queue, statuses, i);
++        }
++        for i in 0..3 {
++            assert_eq!(result(statuses, i), S_OK);
++        }
++        assert_eq!(result(statuses, 3), E_PENDING);
++        void(queue, 0x30);
++        assert_eq!(wait(statuses, 3), S_OK);
++    }
++
+     /// Lanes without workers: what `start` picks, and when statuses land.
+     fn lanes(staging: u64) -> Lanes {
+         Lanes {

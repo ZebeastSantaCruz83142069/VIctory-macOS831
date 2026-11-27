@@ -213,3 +213,18 @@ I rebuilt [`f988e7c`](https://github.com/pragyaangaur/VIctory-macOS/commit/f988e
 The Series S trial used `VICTORY_AMBIENT=1`, `VICTORY_OUTPUT=0`, `VICTORY_PRESENT_COMPOSITE=0` and a copy of the same saved profile. Its 1920×1080 readback of the largest plane was entirely black at frame 2048. The earlier `0c0d5ca7` run with the title's saved resolution also had a black readback at that frame. Both builds continued to present approximately one draw per frame during these samples. Neither produced a world-frame benchmark sample, so the in-game daylight and ambient-light checks remain open.
 
 In a separate run, the previously tested source build `5ce9f06` opened the same title files and showed the loading artwork and the opening street again. The window used that build's experimental upscaler-input preview, the atmosphere pass was bypassed, and ambient light used its constant estimate. This run reached its first busy frame at 4036. Frame 4056 showed windows and street lights, with 1,158 of the 259,200 lower-half pixels at 8/255 luminance or brighter. The first ten reports averaging at least 100 draws per frame had medians of 5,695.85 ms per frame and 3,240.50 ms preparing buffer copies. The foreground remained mostly black and player control was unverified. The source trees and launch settings differ, so this comparison cannot isolate a commit responsible for the upstream startup stall.
+
+## Latest main and DirectStorage timing on M1 Max
+
+On November 26, both repositories pointed to [7786ba7f](https://github.com/pragyaangaur/VIctory-macOS/commit/7786ba7fe82f59ef695051cd894a2c4b8911819f). I built that exact revision from source and tested it with the Series S profile on M1 Max under CrossOver Preview and D3DMetal. The revision includes selective refresh flushing [#452](https://github.com/pragyaangaur/VIctory-macOS/pull/452) and batched indirect argument clamps [#453](https://github.com/pragyaangaur/VIctory-macOS/pull/453). The D3D12 probe reported mesh shaders and Shader Model 6.6. The unmodified executable SHA-256 was `8019bf6d11300ea1100496314bb9a049a29b2ab847cc08805d6b9fa97501ccdb`.
+
+The source diagnostic adds `VICTORY_DSTORAGE_HALF=0` to wait for explicit submission while retaining the full-queue progress path. All 18 storage tests passed in each mode. The paired game runs used the same executable, copied profile and launch parameters, changing only this switch. The executable SHA-256 was `aed82449af247485686ed3fc325c0eb53deefc078aac346be703a8a4b9c1003e`.
+
+| Series S run | Half-full automatic submits logged | Frame 2048 | Draws per frame |
+| --- | ---: | --- | ---: |
+| Unmodified source, ambient estimate | 1 | RGB all zero | 1 |
+| Diagnostic, early submission enabled | 1 | RGB all zero | 1 |
+| Diagnostic, early submission disabled | 0 | RGB all zero | 1 |
+| Unmodified source, physical tiles and ray skip enabled | 1 | RGB all zero | 1 |
+
+The first three captures were byte-identical. The physical-tiles run was also black at frame 4096. The storage timing change did not advance startup on this hardware. These trials never reached a world frame, so they provide no measurement of the newer buffer flush or indirect dispatch changes in the opening street. The earlier world-visible source variant still provides the local comparison for that scene.
