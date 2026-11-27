@@ -212,6 +212,8 @@ Two counts of a mesh shader's outputs disagree. `MeshOutputs::bytes` counts four
 Under Wine, linking is now on by default, and a mesh pipeline that is still over 32 KiB after it, by either count, is refused: its draws are dropped and the queue keeps running. With that, the same run goes past the title card and into the world; 20 to 25 pipelines are refused per run. `VICTORY_LINK_MESH_OUTPUTS=0` turns linking off and `VICTORY_MESH_OVER_LIMIT=1` makes over-limit pipelines anyway.
 The diagnostics switch `VICTORY_PHYSICAL_TILES=1` lets XMem use CPU-visible D3D12 heaps for physical page allocations on Rosetta. Wine supplies its usual placeholder views, and the mapped view and DirectStorage share the heap's bytes. The XMem test checks page aliases, remapping, unmapping, and DirectStorage writes. The GPU probe also checks both directions of a copy through an aliased Windows view, including after that view is unmapped.
 
+`VICTORY_PHYSICAL_READ=1` enables an additional diagnostic on Rosetta. A GPU refresh can read mapped XMem bytes directly through the runtime's existing view of the physical section. Holes and sections without an existing CPU view use the ordinary read path. The copy log reports the bytes and time attributed to physical-section reads.
+
 A separate 6.10 GiB heap and reserved buffer worked on the same M1 Max. Readback matched data from four sampled tiles, including the last two in the heap. A GPU write reached the final tile's CPU mapping.
 
 ## Host presentation size
