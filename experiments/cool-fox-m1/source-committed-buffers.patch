@@ -1,0 +1,348 @@
+diff --git a/crates/victory-gpu/src/inplace.rs b/crates/victory-gpu/src/inplace.rs
+index 28f570e..9a48cef 100644
+--- a/crates/victory-gpu/src/inplace.rs
++++ b/crates/victory-gpu/src/inplace.rs
+@@ -1354,6 +1354,62 @@ mod tests {
+         }
+     }
+ 
++    #[cfg(feature = "diagnostics")]
++    #[test]
++    #[ignore = "requires D3DMetal with VICTORY_COMMITTED_ALIAS=1"]
++    fn committed_title_buffer_shares_a_subrange_until_release() {
++        use crate::shadow::{
++            find, free_committed_allocation, register, share_committed_allocation, unregister,
++        };
++        use std::sync::Arc;
++
++        let host = crate::host::host().expect("D3D12 host");
++        let mut rig = Rig::new(&host.device).unwrap();
++        // SAFETY: test-owned memory. The test releases it below.
++        let base = unsafe {
++            mem::VirtualAlloc(
++                std::ptr::null(),
++                2 * K64,
++                mem::MEM_COMMIT | mem::MEM_RESERVE,
++                mem::PAGE_READWRITE,
++            )
++        };
++        assert!(!base.is_null());
++        // SAFETY: exclusive, newly committed pages.
++        assert!(unsafe { share_committed_allocation(base as usize, 2 * K64) });
++        let bias = K64 + 256;
++        let address = base.wrapping_byte_add(bias);
++        let va = address as u64;
++        register(va as usize, va, 4096);
++        let shadow = find(va, 32).unwrap();
++        assert!(shadow.in_place());
++        assert_eq!(shadow.left(va), 4096);
++        assert_eq!(shadow.offset(va), bias as u64);
++        let fetch = |rig: &mut Rig| rig.fetch(&shadow.buffer, shadow.offset(va), 32).unwrap();
++        assert_eq!(fetch(&mut rig), [0; 32]);
++        // SAFETY: the first 32 bytes of the test view, with no GPU access in flight.
++        unsafe { address.cast::<u8>().write_bytes(0x5A, 32) };
++        assert_eq!(fetch(&mut rig), [0x5A; 32]);
++        rig.store(&shadow.buffer, shadow.offset(va), &[0xB7; 32]).unwrap();
++        // SAFETY: the preceding GPU submission was completed before this read.
++        assert_eq!(unsafe { address.cast::<[u8; 32]>().read() }, [0xB7; 32]);
++
++        // SAFETY: the test owns this allocation. A nonzero release size is invalid.
++        let failed = free_committed_allocation(base as usize, K64, || unsafe {
++            mem::VirtualFree(base, K64, mem::MEM_RELEASE)
++        });
++        assert_eq!(failed, 0);
++        assert!(Arc::ptr_eq(&shadow, &find(va, 32).unwrap()));
++        // SAFETY: release this test's whole allocation and keep the old GPU resource alive.
++        let released = free_committed_allocation(base as usize, 0, || unsafe {
++            mem::VirtualFree(base, 0, mem::MEM_RELEASE)
++        });
++        assert_ne!(released, 0);
++        assert!(crate::shadow::peek(va, 32).is_none());
++        assert_eq!(fetch(&mut rig), [0xB7; 32]);
++        unregister(va as usize, va);
++    }
++
+     pub(crate) fn warp() -> Option<ID3D12Device> {
+         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+         use windows::Win32::Graphics::Dxgi::*;
+diff --git a/crates/victory-gpu/src/lib.rs b/crates/victory-gpu/src/lib.rs
+index ff43fc4..7c447d4 100644
+--- a/crates/victory-gpu/src/lib.rs
++++ b/crates/victory-gpu/src/lib.rs
+@@ -104,6 +104,8 @@ pub use host::on_failure;
+ pub use physical::{PhysicalTiles, use_physical_layout};
+ #[cfg(all(windows, feature = "diagnostics"))]
+ pub use shared_pages::{PhysicalHeap, physical_heap};
++#[cfg(all(windows, feature = "diagnostics"))]
++pub use shadow::{free_committed_allocation, share_committed_allocation};
+ 
+ /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
+ /// off while the title runs (`ab`).
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+index 9b632f6..bf6bf58 100644
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -98,10 +98,10 @@ pub(crate) struct Shadow {
+     mapped: bool,
+     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
+     /// heap opened on the title memory itself, so shaders read and write
+-    /// the title's own bytes and nothing is copied either way. The heap,
+-    /// and the bytes from the buffer's first byte to `start` (the heap
+-    /// begins on a 64 KiB line; a title buffer need not).
+-    place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
++    /// the title's own bytes and nothing is copied either way. Holds the
++    /// explicit heap if there is one, and the offset from the buffer's
++    /// first byte to `start`.
++    place: Option<(Option<windows::Win32::Graphics::Direct3D12::ID3D12Heap>, u64)>,
+     #[cfg(feature = "diagnostics")]
+     physical: Option<Arc<crate::physical::ReservedBuffer>>,
+ }
+@@ -2939,14 +2939,23 @@ impl Shadow {
+     fn placed(placed: crate::inplace::Placed, start: u64, len: u64, window: bool) -> Shadow {
+         crate::host::name(&placed.buffer, || format!("title memory {start:#x}+{len:#x} in place"));
+         let mut shadow = Shadow::new(placed.buffer, start as *mut u8, placed.gpu, start, len);
++        shadow.keep_in_place(Some(placed.heap), placed.bias, window);
++        shadow
++    }
++
++    fn keep_in_place(
++        &mut self,
++        heap: Option<windows::Win32::Graphics::Direct3D12::ID3D12Heap>,
++        bias: u64,
++        window: bool,
++    ) {
+         // Not a copy: not counted with them, and nothing asks what the
+         // title wrote there.
+         LIVE[0].fetch_sub(1, Ordering::Relaxed);
+-        LIVE[1].fetch_sub(len, Ordering::Relaxed);
+-        *shadow.watched.get_mut() = NOT_WATCHED;
+-        shadow.window = window;
+-        shadow.place = Some((placed.heap, placed.bias));
+-        shadow
++        LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
++        *self.watched.get_mut() = NOT_WATCHED;
++        self.window = window;
++        self.place = Some((heap, bias));
+     }
+ 
+     /// Brings `len` bytes at `address` up to date when `list` is submitted,
+@@ -4977,6 +4986,13 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+     if entry.shadow.is_none() {
+         let len = entry.end - key.0;
+         #[cfg(feature = "diagnostics")]
++        if crate::shared_pages::committed_aliases_enabled()
++            && let Some(shadow) = committed_shadow(key.0, len)
++        {
++            entry.shadow = Some(shadow.clone());
++            return Some(shadow);
++        }
++        #[cfg(feature = "diagnostics")]
+         if let Some(physical) = crate::physical::ReservedBuffer::new(key.0 as usize, len as usize) {
+             let mut shadow = Shadow::placed(physical.placed(), key.0, len, false);
+             shadow.physical = Some(physical);
+@@ -5252,6 +5268,121 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
+ /// Copies of title memory outside buffers, by (start, length).
+ static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
+ 
++#[cfg(feature = "diagnostics")]
++struct CommittedAllocation {
++    buffer: ID3D12Resource,
++    cpu: usize,
++    gpu: u64,
++    len: u64,
++}
++
++#[cfg(feature = "diagnostics")]
++static COMMITTED: RwLock<BTreeMap<u64, CommittedAllocation>> = RwLock::new(BTreeMap::new());
++
++#[cfg(feature = "diagnostics")]
++fn committed_shadow(at: u64, len: u64) -> Option<Arc<Shadow>> {
++    let aliases = COMMITTED.read().unwrap_or_else(|e| e.into_inner());
++    let (&base, allocation) = aliases.range(..=at).next_back()?;
++    let bias = at - base;
++    if len > allocation.len.checked_sub(bias)? {
++        return None;
++    }
++    let mut shadow = Shadow::new(
++        allocation.buffer.clone(),
++        (allocation.cpu + bias as usize) as *mut u8,
++        allocation.gpu + bias,
++        at,
++        len,
++    );
++    shadow.keep_in_place(None, bias, false);
++    let _ = shadow.width.set(allocation.len.min(bias + len.next_multiple_of(PAGE as u64)));
++    Some(Arc::new(shadow))
++}
++
++/// Shares the backing of a newly committed title allocation with D3DMetal.
++///
++/// # Safety
++/// The range is exclusively owned, freshly committed and read-write.
++#[cfg(feature = "diagnostics")]
++pub unsafe fn share_committed_allocation(base: usize, len: usize) -> bool {
++    const GRANULE: usize = 64 << 10;
++    if !crate::shared_pages::committed_aliases_enabled()
++        || base == 0
++        || len == 0
++        || !base.is_multiple_of(GRANULE)
++        || !len.is_multiple_of(GRANULE)
++        || base.checked_add(len).is_none()
++    {
++        return false;
++    }
++    let Some((buffer, cpu)) = host().and_then(|host| host.shared_buffer(len as u64)) else {
++        return false;
++    };
++    // SAFETY: the fresh buffer is mapped for this length. Preserve the
++    // initial zeros that VirtualAlloc guarantees to the caller.
++    unsafe { cpu.write_bytes(0, len) };
++    // SAFETY: the destination is fresh and the registry retains the buffer.
++    if !unsafe { crate::shared_pages::overlay(base, cpu as usize, len) } {
++        return false;
++    }
++    // SAFETY: a live host buffer.
++    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
++    COMMITTED.write().unwrap_or_else(|e| e.into_inner()).insert(
++        base as u64,
++        CommittedAllocation {
++            buffer,
++            cpu: cpu as usize,
++            gpu,
++            len: len as u64,
++        },
++    );
++    if len >= 16 << 20 {
++        tracing::info!(base = format_args!("{base:#x}"), len, "committed title buffer uses shared memory");
++    }
++    true
++}
++
++/// Retires aliased views if the title successfully releases or decommits memory.
++#[cfg(feature = "diagnostics")]
++pub fn free_committed_allocation(base: usize, len: usize, free: impl FnOnce() -> i32) -> i32 {
++    if !crate::shared_pages::committed_aliases_enabled() {
++        return free();
++    }
++    let mut aliases = COMMITTED.write().unwrap_or_else(|e| e.into_inner());
++    let result = free();
++    if result == 0 {
++        return result;
++    }
++    let base = base as u64;
++    let released: Vec<_> = if len == 0 {
++        aliases.remove(&base).into_iter().map(|a| (base, a)).collect()
++    } else {
++        let end = base.saturating_add(len as u64);
++        let starts: Vec<_> = aliases.range(..end)
++            .filter(|&(&at, a)| at + a.len > base)
++            .map(|(&at, _)| at)
++            .collect();
++        starts.into_iter().filter_map(|at| aliases.remove(&at).map(|a| (at, a))).collect()
++    };
++    drop(aliases);
++    for (at, allocation) in released {
++        let end = at + allocation.len;
++        let mut retired = Vec::new();
++        {
++            let mut entries = buffers();
++            for (_, entry) in entries.range_mut((at, 0)..(end, 0)) {
++                if entry.shadow.as_ref().is_some_and(|shadow| shadow.buffer == allocation.buffer) {
++                    retired.extend(entry.shadow.take());
++                }
++            }
++        }
++        for shadow in retired {
++            crate::host::retire(shadow);
++        }
++    }
++    result
++}
++
+ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
+     let (cell, _) = window_of(address, end, WINDOW);
+     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
+diff --git a/crates/victory-gpu/src/shared_pages.rs b/crates/victory-gpu/src/shared_pages.rs
+index d5e52e1..0367c7b 100644
+--- a/crates/victory-gpu/src/shared_pages.rs
++++ b/crates/victory-gpu/src/shared_pages.rs
+@@ -299,15 +299,7 @@ impl PhysicalHeap {
+         }
+         // SAFETY: the caller owns the view; the source range is in the
+         // live placed buffer and checked above.
+-        let remap = unsafe {
+-            mach::remap_shared(
+-                at as u64,
+-                (self.address + offset) as u64,
+-                len as u64,
+-                mach::VM_FLAGS_FIXED | mach::VM_FLAGS_OVERWRITE,
+-            )
+-        };
+-        remap.msg == 0 && remap.kr == 0 && remap.address == at as u64
++        unsafe { overlay(at, self.address + offset, len) }
+     }
+ }
+ 
+@@ -354,6 +346,29 @@ pub(crate) fn physical_heaps_enabled() -> bool {
+     })
+ }
+ 
++pub(crate) fn committed_aliases_enabled() -> bool {
++    static ENABLED: OnceLock<bool> = OnceLock::new();
++    *ENABLED.get_or_init(|| {
++        crate::switch::on("VICTORY_COMMITTED_ALIAS") && physical_heaps_enabled()
++    })
++}
++
++/// # Safety
++/// The destination is the caller's view. The source and its owner are
++/// kept alive for all uses of the new mapping.
++pub(crate) unsafe fn overlay(at: usize, source: usize, len: usize) -> bool {
++    // SAFETY: the caller owns both mapped ranges and retains the source.
++    let remap = unsafe {
++        mach::remap_shared(
++            at as u64,
++            source as u64,
++            len as u64,
++            mach::VM_FLAGS_FIXED | mach::VM_FLAGS_OVERWRITE,
++        )
++    };
++    remap.msg == 0 && remap.kr == 0 && remap.address == at as u64
++}
++
+ /// Allocates physical pages with shared CPU and GPU backing.
+ pub fn physical_heap(len: usize) -> windows::core::Result<Option<Arc<PhysicalHeap>>> {
+     if !physical_heaps_enabled() {
+diff --git a/crates/victory-hle/src/modules/xmem.rs b/crates/victory-hle/src/modules/xmem.rs
+index f075b59..94629b7 100644
+--- a/crates/victory-hle/src/modules/xmem.rs
++++ b/crates/victory-hle/src/modules/xmem.rs
+@@ -179,6 +179,16 @@ pub extern "system" fn XMemVirtualAlloc(
+     }
+     if !at.is_null() && !placeholder {
+         victory_gpu::title_memory_allocated(at as usize, size);
++        #[cfg(feature = "diagnostics")]
++        if constrained
++            && kind == (MEM_COMMIT | MEM_RESERVE)
++            && flags & GRAPHICS == GRAPHICS
++            && protect == PAGE_READWRITE
++            && size >= 16 * MIB
++        {
++            // SAFETY: this is a fresh host allocation chosen for this call.
++            unsafe { victory_gpu::share_committed_allocation(at as usize, size) };
++        }
+     }
+     note_protection(asked, kind, flags, at as usize, size);
+     at
+@@ -1932,6 +1942,11 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
+     // Splitting and joining placeholders changes nothing they show.
+     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
+         victory_gpu::title_memory_freed(address as usize, size);
++        #[cfg(feature = "diagnostics")]
++        return victory_gpu::free_committed_allocation(address as usize, size, || {
++            // SAFETY: the title's own arguments.
++            unsafe { VirtualFree(address, size, kind) }
++        });
+     }
+     // SAFETY: the title's own arguments.
+     unsafe { VirtualFree(address, size, kind) }
