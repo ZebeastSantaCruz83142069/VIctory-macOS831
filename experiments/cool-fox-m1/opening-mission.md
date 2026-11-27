@@ -205,3 +205,11 @@ Series S reported 1280×720 and 3840×2160 presentation planes. On separate copi
 | Plane 0, compositing and aliasing off | 0 | 2048 | 640×360 |
 
 The title presented continuously with about one draw per frame. The live key file accepted Enter in the no-aliasing run. There was no opening world frame in these samples, so they do not exercise the sunlight fix in game or measure gameplay performance.
+
+## Series S control run and upstream ambient lighting on M1 Max
+
+I rebuilt [`f988e7c`](https://github.com/pragyaangaur/VIctory-macOS/commit/f988e7cd9bb2f5fb97b4631414b64aa8a501b114), which includes the packed-format fix, the structure-builder readiness change [#481](https://github.com/pragyaangaur/VIctory-macOS/pull/481) and the optional ambient-light pass [#482](https://github.com/pragyaangaur/VIctory-macOS/pull/482). The executable was `5e02b7508f3c9e277060f92a934d683e84366cec56e05b7d127ed6363f596408` (SHA-256). The D3D12 startup check reported mesh shaders and Shader Model 6.6.
+
+The Series S trial used `VICTORY_AMBIENT=1`, `VICTORY_OUTPUT=0`, `VICTORY_PRESENT_COMPOSITE=0` and a copy of the same saved profile. Its 1920×1080 readback of the largest plane was entirely black at frame 2048. The earlier `0c0d5ca7` run with the title's saved resolution also had a black readback at that frame. Both builds continued to present approximately one draw per frame during these samples. Neither produced a world-frame benchmark sample, so the in-game daylight and ambient-light checks remain open.
+
+In a separate run, the previously tested source build `5ce9f06` opened the same title files and showed the loading artwork and the opening street again. The window used that build's experimental upscaler-input preview, the atmosphere pass was bypassed, and ambient light used its constant estimate. This run reached its first busy frame at 4036. Frame 4056 showed windows and street lights, with 1,158 of the 259,200 lower-half pixels at 8/255 luminance or brighter. The first ten reports averaging at least 100 draws per frame had medians of 5,695.85 ms per frame and 3,240.50 ms preparing buffer copies. The foreground remained mostly black and player control was unverified. The source trees and launch settings differ, so this comparison cannot isolate a commit responsible for the upstream startup stall.
