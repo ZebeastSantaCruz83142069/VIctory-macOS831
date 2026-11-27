@@ -486,6 +486,41 @@ impl Drop for Section {
     }
 }
 
+/// Copies the part of a refresh covered by an existing section view.
+///
+/// # Safety
+/// The destination has room for `len` bytes and is independent of the
+/// section. It can be uninitialized.
+#[cfg(feature = "diagnostics")]
+pub(crate) unsafe fn read_physical_view(at: usize, dst: *mut u8, len: usize) -> usize {
+    let (section, offset, len) = {
+        let physical = physical();
+        let Some((&base, (size, slice))) = physical.views.range(..=at).next_back() else {
+            return 0;
+        };
+        let offset = at - base;
+        if offset >= *size {
+            return 0;
+        }
+        (
+            slice.section.clone(),
+            slice.index * PAGE + offset,
+            len.min(size - offset),
+        )
+    };
+    let whole = match &section.shared {
+        Some(heap) => heap.cpu_address(),
+        None => section.whole.get().copied().unwrap_or(0),
+    };
+    if whole == 0 {
+        return 0;
+    }
+    // SAFETY: the section keeps this mapped range alive and the caller
+    // owns the destination. We copied only the part covered by the view.
+    unsafe { std::ptr::copy_nonoverlapping((whole + offset) as *const u8, dst, len) };
+    len
+}
+
 /// Where a page lives, or what a view starts with: a section and a page
 /// index in it.
 #[derive(Clone)]
@@ -1585,6 +1620,27 @@ mod tests {
         assert!(write_physical(&pages[2..], 1, &[9]));
         // SAFETY: mapped read-write.
         assert_eq!(unsafe { at(b, 1).cast::<u8>().add(1).read() }, 9);
+
+        #[cfg(feature = "diagnostics")]
+        if on_wine() {
+            let mut bytes = [0xCC; 2];
+            let mapped = at(b, 1) as usize;
+            let hole = at(b, 2) as usize;
+            // SAFETY: both reads give the helper a writable two-byte buffer.
+            unsafe {
+                assert_eq!(
+                    read_physical_view(mapped, bytes.as_mut_ptr(), bytes.len()),
+                    2
+                );
+                assert_eq!(bytes, [7, 9], "read uses the section's third page");
+                assert_eq!(
+                    read_physical_view(hole - 1, bytes.as_mut_ptr(), bytes.len()),
+                    1
+                );
+                assert_eq!(bytes[1], 9, "a read cannot cross the end of the view");
+                assert_eq!(read_physical_view(hole, bytes.as_mut_ptr(), bytes.len()), 0);
+            }
+        }
 
         // Unmapping the middle page keeps its neighbours.
         assert_eq!(

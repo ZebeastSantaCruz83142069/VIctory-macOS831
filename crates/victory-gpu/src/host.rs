@@ -3800,6 +3800,44 @@ fn taken(from: usize, to: usize, memory: (usize, usize)) -> (usize, usize) {
     }
 }
 
+#[cfg(feature = "diagnostics")]
+type PhysicalReader = unsafe fn(usize, *mut u8, usize) -> usize;
+#[cfg(feature = "diagnostics")]
+static PHYSICAL_READER: OnceLock<PhysicalReader> = OnceLock::new();
+
+/// Registers a reader for title memory backed by a runtime-owned view.
+///
+/// # Safety
+/// Given any title address and a writable destination of the given
+/// length, the reader may only copy bytes from a live independent view.
+/// It returns the size of the copied prefix, at most the requested length.
+#[cfg(feature = "diagnostics")]
+pub unsafe fn use_physical_reader(reader: PhysicalReader) {
+    let _ = PHYSICAL_READER.set(reader);
+}
+
+#[cfg(feature = "diagnostics")]
+fn read_physical_prefix(read: PhysicalReader, at: usize, dst: *mut u8, len: usize) -> usize {
+    use crate::copystat::{C, add};
+
+    let mut copied = 0;
+    let started = std::time::Instant::now();
+    while copied < len {
+        // SAFETY: the destination is our host buffer and the remaining
+        // range is writable. The reader holds a reference to its source.
+        let n = unsafe { read(at + copied, dst.wrapping_add(copied), len - copied) };
+        if n == 0 {
+            break;
+        }
+        copied += n;
+    }
+    if copied != 0 {
+        add(C::PhysicalReadBytes, copied as u64);
+        add(C::PhysicalReadUs, started.elapsed().as_micros() as u64);
+    }
+    copied
+}
+
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
 /// them (tiled memory, page mappings), which read as zeros here; a title
@@ -3827,6 +3865,34 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if len == 0 {
         return;
     }
+    #[cfg(feature = "diagnostics")]
+    let physical = {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        if !title_dst
+            && len >= crate::watch::PAGE
+            && *ENABLED.get_or_init(|| {
+                crate::switch::on("VICTORY_PHYSICAL_READ") && crate::watch::rosetta()
+            })
+        {
+            PHYSICAL_READER.get().copied()
+        } else {
+            None
+        }
+    };
+    #[cfg(feature = "diagnostics")]
+    let (dst, src, len) = if let Some(read) = physical {
+        let copied = read_physical_prefix(read, src as usize, dst, len);
+        if copied == len {
+            return;
+        }
+        (
+            dst.wrapping_add(copied),
+            src.wrapping_add(copied),
+            len - copied,
+        )
+    } else {
+        (dst, src, len)
+    };
     // The kernel writes the destination: it must not be guarded meanwhile.
     let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
     #[cfg(feature = "diagnostics")]
@@ -3858,6 +3924,13 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let (start, end) = (src as usize, src as usize + len);
     let mut at = start;
     while at < end {
+        #[cfg(feature = "diagnostics")]
+        if let Some(read) = physical {
+            at += read_physical_prefix(read, at, dst.wrapping_add(at - start), end - at);
+            if at == end {
+                break;
+            }
+        }
         let (region_end, readable) = source_region(at);
         let next = region_end.min(end);
         let to = dst.wrapping_add(at - start);
