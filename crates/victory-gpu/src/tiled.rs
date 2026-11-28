@@ -75,17 +75,17 @@ pub(crate) fn make(start: u64, len: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     let missing = tiles.iter().filter(|t| t.is_none()).count();
-    // A page with no tile is either unmapped (reserved, nothing committed:
-    // a tile of zeros shows it, and mapping pages there later retiles the
-    // copy, `physical_retiled`) or memory of another kind, which must be
-    // copied. Only `VICTORY_PHYSICAL_TILES=partial` takes the first kind, and
-    // only beside at least one physical page.
-    if missing > 0
-        && (missing == pages
-            || !crate::alias::physical_tiles_partial()
-            || !unmapped(first, &tiles))
-    {
+    // A page with no tile is either reserved and unmapped (a tile of zeros
+    // shows it, and mapping physical pages there later retiles the copy,
+    // `physical_retiled`) or memory of another kind, which must be copied.
+    // Only `VICTORY_PHYSICAL_TILES=partial` takes the first kind: the title
+    // reserves its streaming buffers' ranges and maps their pages later, so
+    // their copies are made while all or most of their pages are unmapped.
+    if missing > 0 && (!crate::alias::physical_tiles_partial() || !unmapped(first, &tiles)) {
         return None;
+    }
+    if missing > 0 {
+        PARTIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     let host = crate::host::host()?;
     let desc = D3D12_RESOURCE_DESC {
@@ -130,10 +130,20 @@ pub(crate) fn make(start: u64, len: u64) -> Option<Arc<Shadow>> {
     Some(copy)
 }
 
+/// Copies made reading their pages in place with pages unmapped
+/// (`VICTORY_PHYSICAL_TILES=partial`), for the log.
+static PARTIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Copies [`make`] made with unmapped pages since the start.
+pub(crate) fn partial_made() -> u64 {
+    PARTIAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether every page of the title's from page `first` on that `tiles` has
-/// no tile for is unmapped: reserved or free, nothing committed there.
+/// no tile for is reserved and unmapped (nothing committed there; free
+/// memory, which no title buffer should cover, is not taken).
 fn unmapped(first: usize, tiles: &[Option<Tile>]) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery};
     let mut page = 0;
     while page < tiles.len() {
         if tiles[page].is_some() {
@@ -145,7 +155,7 @@ fn unmapped(first: usize, tiles: &[Option<Tile>]) -> bool {
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size; any address may be asked.
         let got = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-        if got == 0 || info.State == MEM_COMMIT {
+        if got == 0 || info.State != MEM_RESERVE {
             return false;
         }
         // The region the query names has one state: skip its pages.
