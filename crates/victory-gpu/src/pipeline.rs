@@ -109,6 +109,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 #[cfg(windows)]
                 crate::ray_skip::note_program(stage, &full.to_hex()[..16], bytes);
                 name_program(stage, &full.to_hex()[..16], bytes);
+                dump_program(&full.to_hex()[..16], bytes);
                 Arc::new(Shader::with_hash(stage, bytes, full))
             })
             .clone()
@@ -639,6 +640,33 @@ fn name_program(stage: &str, hash: &str, container: &[u8]) {
         })
         .collect();
     tracing::info!(stage, hash, names = %names.join(" "), "program named");
+}
+
+/// Diagnostics (`VICTORY_DUMP_PROGRAMS=<hash>,...`): writes the shader
+/// container of each listed program, as the title passes it, to
+/// `program-<hash>.bin` in the capture folder (`VICTORY_CAPTURE`), for
+/// `victory shader-info --disasm` and `victory translate`.
+fn dump_program(hash: &str, container: &[u8]) {
+    static LIST: OnceLock<Vec<String>> = OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_DUMP_PROGRAMS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_owned())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    if !list.iter().any(|h| h == hash) {
+        return;
+    }
+    let Some(dir) = crate::capture::folder() else {
+        return;
+    };
+    let path = dir.join(format!("program-{hash}.bin"));
+    match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, container)) {
+        Ok(()) => tracing::info!(path = %path.display(), "program container saved"),
+        Err(e) => tracing::warn!(error = %e, path = %path.display(), "program container not saved"),
+    }
 }
 
 /// Whether mesh+pixel pipelines whose pixel shader reads non-provoking vertex
