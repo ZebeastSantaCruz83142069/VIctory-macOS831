@@ -18,6 +18,15 @@
 //! the interval. A sample stops its thread for the context read and
 //! unwind (tens of microseconds plus the server round trips under Wine),
 //! so the profiled thread runs a little slower.
+//!
+//! It can freeze the game: never use it for a benchmark. On an M1 Max under
+//! CrossOver with `WINEMSYNC=1` (2026-11-28), two of five profiled runs
+//! stopped for good. In one, a texture worker that had taken part of a
+//! refresh job stopped answering samples (every suspend failed from then
+//! on), and the thread preparing the submission waited for that job
+//! forever. A thread suspended in the middle of Wine's fault handling or a
+//! wait seems never to resume, or loses its wake-up. Profile few threads,
+//! and expect to kill the run.
 
 use std::collections::HashMap;
 
