@@ -1704,11 +1704,21 @@ pub(crate) fn refresh_slots(
     // A run's tables name the same slots and ranges over and over (~38,000
     // slot steps a frame took ~18 ms on an M1 Max): each slot, and each
     // range, is asked for once a run. Nothing between a run's steps changes
-    // what an earlier ask of the same range brought up.
-    let mut asked: HashSet<u32, Hashing> = HashSet::with_capacity_and_hasher(indices.len().min(256), Hashing::Fold);
+    // what an earlier ask of the same range brought up. Most runs are a few
+    // slots (~2.5 in the world, ~21,000 runs a frame): those are told apart
+    // by a scan, with no set made (an allocation each under Wine's heap
+    // lock).
+    const FEW: usize = 16;
+    let mut asked: HashSet<u32, Hashing> =
+        HashSet::with_capacity_and_hasher(if indices.len() > FEW { indices.len().min(256) } else { 0 }, Hashing::Fold);
     let mut last: (usize, u64, u64) = (0, 0, 0);
-    for &index in indices {
-        if !asked.insert(index) {
+    for (n, &index) in indices.iter().enumerate() {
+        let again = if indices.len() <= FEW {
+            indices[..n].contains(&index)
+        } else {
+            !asked.insert(index)
+        };
+        if again {
             continue;
         }
         let Some(Seen::Buffer(shadow, address, len, _)) = inner.slots.get(&index) else {

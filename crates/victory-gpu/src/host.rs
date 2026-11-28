@@ -5736,17 +5736,21 @@ impl HostList {
         // heap's lock (`bindless::refresh_slots`) once another step (or the
         // end) comes: a world frame's lists read ~54,000 slots, in runs, each
         // of which took the lock on its own. The refreshes keep their place
-        // among the other steps.
+        // among the other steps. The runs are short (~2.5 slots in the world,
+        // ~21,000 a frame), so one buffer holds every run's indices.
         fn flush_slots(
-            run: &mut Option<(&std::sync::Arc<crate::bindless::Viewed>, Vec<u32>)>,
+            run: &mut Option<&std::sync::Arc<crate::bindless::Viewed>>,
+            indices: &mut Vec<u32>,
             batch: &mut Batch,
         ) {
-            if let Some((viewed, indices)) = run.take() {
+            if let Some(viewed) = run.take() {
                 let _step = StepTimer::start(8);
-                crate::bindless::refresh_slots(viewed, &indices, |s, a, l| batch.add(s, a, l));
+                crate::bindless::refresh_slots(viewed, indices, |s, a, l| batch.add(s, a, l));
+                indices.clear();
             }
         }
-        let mut slots: Option<(&std::sync::Arc<crate::bindless::Viewed>, Vec<u32>)> = None;
+        let mut slots: Option<&std::sync::Arc<crate::bindless::Viewed>> = None;
+        let mut slot_indices: Vec<u32> = Vec::new();
         let deferred = self.deferred();
         for step in &deferred.copies {
             if let Step::Slot(viewed, index) = step {
@@ -5754,17 +5758,14 @@ impl HostList {
                 if !batch.need_slot(viewed, *index) {
                     continue;
                 }
-                if let Some((run, indices)) = &mut slots
-                    && std::sync::Arc::ptr_eq(*run, viewed)
-                {
-                    indices.push(*index);
-                } else {
-                    flush_slots(&mut slots, batch);
-                    slots = Some((viewed, vec![*index]));
+                if !slots.is_some_and(|run| std::sync::Arc::ptr_eq(run, viewed)) {
+                    flush_slots(&mut slots, &mut slot_indices, batch);
+                    slots = Some(viewed);
                 }
+                slot_indices.push(*index);
                 continue;
             }
-            flush_slots(&mut slots, batch);
+            flush_slots(&mut slots, &mut slot_indices, batch);
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
             // The preparing report counts the copies' time only (the other
@@ -5905,7 +5906,7 @@ impl HostList {
                 COPY_KINDS[kind + 2].fetch_add(copied as u64, Ordering::Relaxed);
             }
         }
-        flush_slots(&mut slots, batch);
+        flush_slots(&mut slots, &mut slot_indices, batch);
     }
 }
 
