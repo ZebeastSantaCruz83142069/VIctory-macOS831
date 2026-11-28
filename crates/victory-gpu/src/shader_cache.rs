@@ -152,6 +152,17 @@ fn atomic_umax() -> bool {
 /// (`CS_VisHair`) costs ~158 ms of a ~517 ms GPU frame (leaving the pass
 /// out), and without the locks the frame took ~29 ms less GPU
 /// (docs/m1-max.md, 2026-11-27). Only with [`atomic_locks`].
+fn half_loops() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_HALF_LOOPS");
+        if on {
+            tracing::info!("VICTORY_HALF_LOOPS=1: lockstep loops with no barrier in them leave per 32-lane half");
+        }
+        on
+    })
+}
+
 fn racy_minmax() -> bool {
     static RACY: OnceLock<bool> = OnceLock::new();
     *RACY.get_or_init(|| {
@@ -304,6 +315,7 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     let apart = options.host_wave32 && !options.halves_rendezvous;
     let cap_barriers = victory_shader::emit::cap_barriers_refused();
     let limits = options.thread_limits;
+    let half_loops = options.host_wave32 && options.half_loops;
     if !locks
         && !bias
         && !narrow
@@ -312,10 +324,11 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         && !apart
         && !cap_barriers
         && !limits
+        && !half_loops
     {
         return build();
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 2048] = [const { OnceLock::new() }; 2048];
+    static BUILDS: [OnceLock<[u8; 32]>; 4096] = [const { OnceLock::new() }; 4096];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
@@ -326,7 +339,8 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         | usize::from(apart) << 7
         | usize::from(cap_barriers) << 8
         | usize::from(limits) << 9
-        | usize::from(racy) << 10;
+        | usize::from(racy) << 10
+        | usize::from(half_loops) << 11;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
@@ -341,6 +355,9 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         }
         if racy {
             h.update(b"racy minmax");
+        }
+        if half_loops {
+            h.update(b"half loops");
         }
         if bias {
             h.update(b"bias as gradients");
@@ -379,6 +396,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         atomic_lock_rounds: atomic_lock_rounds(),
         atomic_umax: atomic_umax(),
         racy_minmax: racy_minmax(),
+        half_loops: half_loops(),
         bias_as_gradients: bias_as_gradients(),
         host_wave32: host_wave32(),
         narrow_waves: narrow_waves(),
