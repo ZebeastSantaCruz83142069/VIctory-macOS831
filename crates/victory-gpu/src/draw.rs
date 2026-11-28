@@ -523,12 +523,39 @@ fn kind_skipped(i: usize) -> bool {
     skipped_kinds() & (1 << i) != 0
 }
 
+/// Switches between compute dispatches and draws within one host list
+/// since the last frame line: D3DMetal ends the render pass for a dispatch
+/// and starts another for the next draw, so each switch from a draw to a
+/// dispatch and back stores and loads the render targets.
+static CLASS_SWITCHES: AtomicU64 = AtomicU64::new(0);
+
+std::thread_local! {
+    /// The host list this thread last recorded a command into, and whether
+    /// that command was a dispatch.
+    static LAST_CLASS: std::cell::Cell<(usize, bool)> = const { std::cell::Cell::new((0, false)) };
+}
+
+/// Notes a dispatch (`compute`) or draw recorded into `list`.
+fn note_class(list: &HostList, compute: bool) {
+    let at = list as *const HostList as usize;
+    LAST_CLASS.with(|last| {
+        let (was_at, was) = last.replace((at, compute));
+        if was_at == at && was != compute {
+            CLASS_SWITCHES.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+}
+
 /// The commands per frame by kind since the last call, over `frames`.
 pub(crate) fn kinds_line(frames: f64) -> String {
     KINDS
         .iter()
         .zip(&KIND_COUNTS)
         .map(|(n, c)| format!("{n} {:.0}", c.swap(0, Ordering::Relaxed) as f64 / frames))
+        .chain(std::iter::once(format!(
+            "dispatch/draw switches {:.0}",
+            CLASS_SWITCHES.swap(0, Ordering::Relaxed) as f64 / frames
+        )))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -1614,6 +1641,7 @@ impl State {
         if kind_skipped(3) || crate::pipeline::left_out(self.pipeline as This) {
             return;
         }
+        note_class(list, true);
         if let Some(hash) = crate::pipeline::traced_dispatch(self.pipeline as This) {
             static N: AtomicU64 = AtomicU64::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 400 {
@@ -1959,6 +1987,7 @@ impl State {
         if kind_skipped(0) || crate::pipeline::left_out(self.pipeline as This) {
             return;
         }
+        note_class(list, false);
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = self.prepare(list, false, true)
@@ -2566,6 +2595,7 @@ impl State {
         if kind_skipped(1) || crate::pipeline::left_out(self.pipeline as This) {
             return;
         }
+        note_class(list, false);
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         // Rectangles: completed by the pipeline's geometry shader, else
@@ -2675,6 +2705,7 @@ impl State {
         if kind_skipped(2) || crate::pipeline::left_out(self.pipeline as This) {
             return;
         }
+        note_class(list, false);
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
@@ -2775,6 +2806,7 @@ impl State {
             if i.is_some_and(kind_skipped) || crate::pipeline::left_out(self.pipeline as This) {
                 return Some(true);
             }
+            note_class(list, kind == DISPATCH);
             if let Some(hash) = crate::pipeline::traced_dispatch(self.pipeline as This) {
                 static N: AtomicU64 = AtomicU64::new(0);
                 if N.fetch_add(1, Ordering::Relaxed) < 400 {
