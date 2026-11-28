@@ -808,12 +808,19 @@ impl Viewed {
         if updates.is_empty() {
             return;
         }
+        let resolving = std::time::Instant::now();
         let entries = if self.quick_maps {
             resolve_updates(updates, Hashing::Fold)
         } else {
             resolve_updates(updates, std::hash::RandomState::new())
         };
+        let locking = std::time::Instant::now();
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            use crate::descriptor::{SyncStat as S, sync_stat};
+            sync_stat(S::ViewedResolveUs, (locking - resolving).as_micros() as u64);
+            sync_stat(S::ViewedLockUs, locking.elapsed().as_micros() as u64);
+        }
         let (mut unordered_changed, mut hulls_changed) = (false, false);
         // Buffer ranges by their net change over the batch: the title
         // rewrites heap slots in runs where one slot lets go of a range
