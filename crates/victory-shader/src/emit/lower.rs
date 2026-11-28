@@ -844,6 +844,37 @@ impl<'a> Lower<'a> {
                         | (u8::from(first_needed && !super::first_lane_enter_alone()) * super::IN_HALVES_FIRST_LANE)
                         | (u8::from(lds) * super::IN_HALVES_LDS),
                 );
+                // Which reads of other lanes (diagnostics, logged with it).
+                let mut kinds = 0u16;
+                for i in insts() {
+                    let n = i.name();
+                    let dpp = match &i.fields {
+                        Fields::Valu(v) => v.dpp,
+                        _ => None,
+                    };
+                    let terms = [
+                        (n.starts_with("ds_swizzle"), super::LANES_SWIZZLE),
+                        (n.contains("permute"), super::LANES_PERMUTE),
+                        (n == "v_permlane16_b32" || n == "v_permlanex16_b32", super::LANES_PERMLANE),
+                        (n.starts_with("v_mbcnt"), super::LANES_MBCNT),
+                        (n == "v_readlane_b32" || n == "v_writelane_b32", super::LANES_READLANE),
+                        (matches!(dpp, Some(Dpp::Row { ctrl: 0..=0xFF, .. })), super::LANES_DPP_QUAD),
+                        (
+                            matches!(dpp, Some(Dpp::Row { ctrl: 0x100.., .. }) | Some(Dpp::Lanes { .. })),
+                            super::LANES_DPP_ROW,
+                        ),
+                        (reads_mask_as_data(x.st, i), super::LANES_MASK_DATA),
+                    ];
+                    for (on, bit) in terms {
+                        if on {
+                            kinds |= bit;
+                        }
+                    }
+                }
+                if x.st.literal {
+                    kinds |= super::LANES_LITERAL;
+                }
+                super::note_lane_kinds(kinds);
             }
             if halves && !synced {
                 halves_refused = Self::halves_lds(group, s.lds_dwords);

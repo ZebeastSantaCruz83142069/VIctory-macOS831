@@ -436,6 +436,7 @@ pub(crate) fn host_shader_with(
     let translate = |c: &[u8]| {
         let _ = victory_shader::emit::take_kept_out_of_halves();
         let _ = victory_shader::emit::take_in_halves();
+        let _ = victory_shader::emit::take_lane_kinds();
         let r = victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
         // Which compute programs run a console wave in two 32-lane halves
         // (each exchange between them a group barrier), and why, by the hash
@@ -454,7 +455,24 @@ pub(crate) fn host_shader_with(
             .filter(|(bit, _)| in_halves & bit != 0)
             .map(|(_, why)| why)
             .collect();
-            tracing::info!(hash, why = why.join(", "), "program runs in 32-lane halves");
+            use victory_shader::emit as e;
+            let kinds = e::take_lane_kinds();
+            let reads: Vec<&str> = [
+                (e::LANES_SWIZZLE, "swizzle"),
+                (e::LANES_PERMUTE, "permute"),
+                (e::LANES_PERMLANE, "permlane"),
+                (e::LANES_MBCNT, "mbcnt"),
+                (e::LANES_READLANE, "readlane"),
+                (e::LANES_DPP_QUAD, "dpp-quad"),
+                (e::LANES_DPP_ROW, "dpp-row"),
+                (e::LANES_MASK_DATA, "mask-data"),
+                (e::LANES_LITERAL, "literal"),
+            ]
+            .into_iter()
+            .filter(|(bit, _)| kinds & bit != 0)
+            .map(|(_, name)| name)
+            .collect();
+            tracing::info!(hash, why = why.join(", "), reads = reads.join(" "), "program runs in 32-lane halves");
         }
         // `VICTORY_FIRST_LANE_PER_HALF` (measurement only): which programs
         // its `enter` took out of halves, by the hash the logs use.

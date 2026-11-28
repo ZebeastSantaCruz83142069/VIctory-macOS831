@@ -613,6 +613,41 @@ pub fn take_in_halves() -> u8 {
     IN_HALVES.with(|c| c.replace(0))
 }
 
+thread_local! {
+    /// The kinds of other-lane reads ([`LANES_SWIZZLE`] and the others) in
+    /// this thread's translations in halves since [`take_lane_kinds`].
+    static LANE_KINDS: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
+}
+
+/// `ds_swizzle` (within 32 lanes).
+pub const LANES_SWIZZLE: u16 = 1;
+/// `ds_permute` / `ds_bpermute` (any of the wave's lanes).
+pub const LANES_PERMUTE: u16 = 2;
+/// `v_permlane16` / `v_permlanex16` (within 32 lanes).
+pub const LANES_PERMLANE: u16 = 4;
+/// `v_mbcnt` (bits of a 64-lane mask below the lane).
+pub const LANES_MBCNT: u16 = 8;
+/// `v_readlane` / `v_writelane` (any lane).
+pub const LANES_READLANE: u16 = 16;
+/// DPP quad permutes (within 4 lanes).
+pub const LANES_DPP_QUAD: u16 = 32;
+/// Other DPP16 and DPP8 (within a row of 16 lanes on gfx10).
+pub const LANES_DPP_ROW: u16 = 64;
+/// Lane masks read as data.
+pub const LANES_MASK_DATA: u16 = 128;
+/// Literal halves (whole-wave control flow).
+pub const LANES_LITERAL: u16 = 256;
+
+/// Notes the kinds of other-lane reads of a translation in halves.
+pub(crate) fn note_lane_kinds(kinds: u16) {
+    LANE_KINDS.with(|c| c.set(c.get() | kinds));
+}
+
+/// The kinds since the last call ([`LANES_SWIZZLE`] bits).
+pub fn take_lane_kinds() -> u16 {
+    LANE_KINDS.with(|c| c.replace(0))
+}
+
 pub fn cap_barriers_refused() -> bool {
     #[cfg(test)]
     {
