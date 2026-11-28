@@ -1050,6 +1050,28 @@ pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && pipeline(this).host.skipped_shader.is_some()
 }
 
+/// The hash of a shader of `this` that `VICTORY_TRACE_DISPATCH` lists
+/// (comma-separated 16-digit hashes), whose dispatches' sizes are logged.
+pub(crate) fn traced_dispatch(this: This) -> Option<String> {
+    static LIST: OnceLock<Vec<String>> = OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_TRACE_DISPATCH")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_owned())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    if list.is_empty() || this.is_null() {
+        return None;
+    }
+    pipeline(this)
+        .shaders
+        .iter()
+        .find(|s| list.contains(&s.hash))
+        .map(|s| s.hash.clone())
+}
+
 /// The shaders of `this`, as host pipelines are named (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn shaders_of(this: This) -> String {

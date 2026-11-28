@@ -1606,6 +1606,12 @@ impl State {
         if kind_skipped(3) {
             return;
         }
+        if let Some(hash) = crate::pipeline::traced_dispatch(self.pipeline as This) {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 400 {
+                tracing::info!(%hash, x, y, z, flags, frame = crate::queue::presented(), "traced dispatch");
+            }
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2760,6 +2766,12 @@ impl State {
             };
             if i.is_some_and(kind_skipped) {
                 return Some(true);
+            }
+            if let Some(hash) = crate::pipeline::traced_dispatch(self.pipeline as This) {
+                static N: AtomicU64 = AtomicU64::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 400 {
+                    tracing::info!(%hash, kind, stride, max, frame = crate::queue::presented(), "traced indirect execution");
+                }
             }
         }
         #[cfg(feature = "diagnostics")]
