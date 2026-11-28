@@ -6638,6 +6638,10 @@ impl Meter {
                  for clamps)",
                 making = crate::pipeline::making()
             );
+            tracing::info!(
+                "title commands per frame: {}",
+                crate::draw::kinds_line(report_frames)
+            );
             crate::ray_skip::log(report_frames);
             crate::ambient_estimate::log(report_frames);
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
