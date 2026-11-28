@@ -435,7 +435,27 @@ pub(crate) fn host_shader_with(
     options.uav_size_level0 = uav_size_level0_for(container);
     let translate = |c: &[u8]| {
         let _ = victory_shader::emit::take_kept_out_of_halves();
+        let _ = victory_shader::emit::take_in_halves();
         let r = victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+        // Which compute programs run a console wave in two 32-lane halves
+        // (each exchange between them a group barrier), and why, by the hash
+        // the GPU timings use. Logged when translated, not when cached.
+        let in_halves = victory_shader::emit::take_in_halves();
+        if in_halves != 0 && r.is_ok() {
+            use victory_shader::emit::{IN_HALVES_FIRST_LANE, IN_HALVES_LANES, IN_HALVES_LDS};
+            let hash = blake3::hash(c);
+            let hash: String = hash.as_bytes()[..8].iter().map(|b| format!("{b:02x}")).collect();
+            let why: Vec<&str> = [
+                (IN_HALVES_LANES, "reads other lanes"),
+                (IN_HALVES_FIRST_LANE, "reads a first lane"),
+                (IN_HALVES_LDS, "one wave's LDS"),
+            ]
+            .into_iter()
+            .filter(|(bit, _)| in_halves & bit != 0)
+            .map(|(_, why)| why)
+            .collect();
+            tracing::info!(hash, why = why.join(", "), "program runs in 32-lane halves");
+        }
         // `VICTORY_FIRST_LANE_PER_HALF` (measurement only): which programs
         // its `enter` took out of halves, by the hash the logs use.
         if victory_shader::emit::take_kept_out_of_halves() > 0 {

@@ -837,6 +837,14 @@ impl<'a> Lower<'a> {
             let fits = x.narrow_waves && (synced || group <= 32);
             let needs_wave = console_lanes || one_wave && s.lds_dwords > 0 && !fits;
             halves = Self::halves_wanted(x, needs_wave);
+            if halves {
+                let lds = one_wave && s.lds_dwords > 0 && !fits;
+                super::note_in_halves(
+                    (u8::from(lanes_other) * super::IN_HALVES_LANES)
+                        | (u8::from(first_needed && !super::first_lane_enter_alone()) * super::IN_HALVES_FIRST_LANE)
+                        | (u8::from(lds) * super::IN_HALVES_LDS),
+                );
+            }
             if halves && !synced {
                 halves_refused = Self::halves_lds(group, s.lds_dwords);
             }

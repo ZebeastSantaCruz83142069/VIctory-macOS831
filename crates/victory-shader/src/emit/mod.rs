@@ -585,6 +585,34 @@ pub fn take_kept_out_of_halves() -> u32 {
     KEPT_OUT.with(|c| c.replace(0))
 }
 
+thread_local! {
+    /// Why this thread's last translation runs a console wave64 compute
+    /// program in 32-lane halves ([`IN_HALVES_LANES`] and the others), 0
+    /// when it does not; since [`take_in_halves`].
+    static IN_HALVES: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// [`take_in_halves`]: the program reads other lanes (swizzles, permutes,
+/// lane counts, DPP, readlane, masks read as data).
+pub const IN_HALVES_LANES: u8 = 1;
+/// [`take_in_halves`]: it reads a first lane (`VICTORY_FIRST_LANE_PER_HALF`
+/// would keep it out).
+pub const IN_HALVES_FIRST_LANE: u8 = 2;
+/// [`take_in_halves`]: its one console wave shares LDS that no barrier syncs.
+pub const IN_HALVES_LDS: u8 = 4;
+
+/// Notes why the translation runs in halves.
+pub(crate) fn note_in_halves(why: u8) {
+    IN_HALVES.with(|c| c.set(c.get() | why));
+}
+
+/// Why this thread's translations since the last call run in halves, as
+/// [`IN_HALVES_LANES`] bits; 0 when none did (the runtime logs the program,
+/// so the GPU timings' hashes can be told apart by it).
+pub fn take_in_halves() -> u8 {
+    IN_HALVES.with(|c| c.replace(0))
+}
+
 pub fn cap_barriers_refused() -> bool {
     #[cfg(test)]
     {
