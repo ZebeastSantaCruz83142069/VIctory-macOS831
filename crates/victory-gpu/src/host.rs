@@ -3863,6 +3863,8 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         #[cfg(feature = "diagnostics")]
+        self.log_listed_ops();
+        #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count =
                 (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -3882,6 +3884,53 @@ impl HostList {
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
+        }
+    }
+
+    /// Diagnostics, `VICTORY_LIST_OPS=<hashes>` (with `VICTORY_D3D12_DRED=1`,
+    /// which notes the commands): every command of a list that runs one of
+    /// these shaders, logged when it closes, for a few lists from
+    /// `VICTORY_LIST_OPS_FROM` (default 150) frames after the world's first
+    /// (`VICTORY_CAPTURE_WORLD` must be set) on: what the host records
+    /// between a pass's dispatches.
+    #[cfg(feature = "diagnostics")]
+    fn log_listed_ops(&self) {
+        static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+        static FROM: OnceLock<u64> = OnceLock::new();
+        static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let hashes = HASHES.get_or_init(|| {
+            std::env::var("VICTORY_LIST_OPS")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|h| !h.is_empty())
+                .map(str::to_owned)
+                .collect()
+        });
+        if hashes.is_empty() {
+            return;
+        }
+        let from = *FROM.get_or_init(|| {
+            std::env::var("VICTORY_LIST_OPS_FROM")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(150)
+        });
+        let Some(world) = crate::capture::world_frame() else {
+            return;
+        };
+        if crate::queue::presented() < world + from || LOGGED.load(Ordering::Relaxed) >= 12 {
+            return;
+        }
+        let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+        if !notes.iter().any(|(n, _)| hashes.iter().any(|h| n.contains(h.as_str()))) {
+            return;
+        }
+        let k = LOGGED.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(list = k, commands = notes.len(), frame = crate::queue::presented(), "listed ops: begin");
+        for (i, (n, _)) in notes.iter().enumerate() {
+            let short: String = n.chars().take(260).collect();
+            tracing::info!(list = k, "listed op [{i}] {short}");
         }
     }
 
