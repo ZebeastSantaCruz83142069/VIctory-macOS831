@@ -332,7 +332,7 @@ impl Drop for StepTimer {
 fn note_step(kind: usize, started: Option<std::time::Instant>) {
     STEPS[kind].fetch_add(1, Ordering::Relaxed);
     if let Some(started) = started {
-        STEPS[STEP_NAMES.len() + kind].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        STEPS[STEP_NAMES.len() + kind].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 }
 
@@ -5394,7 +5394,9 @@ impl HostList {
             batch: &mut Batch,
         ) {
             if let Some((viewed, indices)) = run.take() {
+                let started = std::time::Instant::now();
                 crate::bindless::refresh_slots(viewed, &indices, |s, a, l| batch.add(s, a, l));
+                STEPS[STEP_NAMES.len() + 2].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
         }
         let mut slots: Option<(&std::sync::Arc<crate::bindless::Viewed>, Vec<u32>)> = None;
@@ -5420,8 +5422,7 @@ impl HostList {
             // diagnostics.
             let copy_started = matches!(step, Step::Copy(..) | Step::Move(..) | Step::Fill(..))
                 .then(std::time::Instant::now);
-            // The list-steps line: every step counted, all but the many
-            // refreshes and slots timed.
+            // The list-steps line: every step counted and timed (in ns).
             let step_kind = match step {
                 Step::Copy(..) | Step::Move(..) | Step::Fill(..) => 0,
                 Step::Refresh(..) => 1,
@@ -5432,7 +5433,7 @@ impl HostList {
                 Step::Heap(_) => 6,
                 Step::Memory(_) => 7,
             };
-            let _step = StepTimer(step_kind, (step_kind > 2).then(std::time::Instant::now));
+            let _step = StepTimer(step_kind, Some(std::time::Instant::now()));
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(
                 started,
@@ -6808,15 +6809,11 @@ impl Meter {
                     .iter()
                     .enumerate()
                     .map(|(k, name)| {
-                        if k == 1 || k == 2 {
-                            format!("{name} {:.0}", n[k] as f64 / report_frames)
-                        } else {
-                            format!("{name} {:.0} ({:.1} ms)", n[k] as f64 / report_frames, ms(n[kinds + k]))
-                        }
+                        format!("{name} {:.0} ({:.1} ms)", n[k] as f64 / report_frames, ms(n[kinds + k] / 1000))
                     })
                     .collect();
                 tracing::info!(
-                    "host list steps per frame (the rest of the phase is the refreshes and slots): {}",
+                    "host list steps per frame (the rest of the phase is the refreshes the steps flush): {}",
                     parts.join(", ")
                 );
             }
@@ -8018,7 +8015,8 @@ mod batch {
             super::STEPS[super::STEP_NAMES.len() + 3].load(std::sync::atomic::Ordering::Relaxed),
         );
         assert!(after > before || after >= 1, "{before} then {after}");
-        assert!(after_us >= before_us + 2000 || after_us >= 2000, "{before_us} then {after_us} us");
+        // Step times are kept in nanoseconds.
+        assert!(after_us >= before_us + 2_000_000 || after_us >= 2_000_000, "{before_us} then {after_us} ns");
     }
 
     /// The frame report's refreshed-copies line counts each copy's
