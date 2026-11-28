@@ -1417,10 +1417,24 @@ pub(crate) fn refresh_slots(
     mut add: impl FnMut(&Arc<Shadow>, usize, usize),
 ) {
     let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-    for index in indices {
-        let Some(Seen::Buffer(shadow, address, len, _)) = inner.slots.get(index) else {
+    // A run's tables name the same slots and ranges over and over (~38,000
+    // slot steps a frame took ~18 ms on an M1 Max): each slot, and each
+    // range, is asked for once a run. Nothing between a run's steps changes
+    // what an earlier ask of the same range brought up.
+    let mut asked: HashSet<u32, Hashing> = HashSet::with_capacity_and_hasher(indices.len().min(256), Hashing::Fold);
+    let mut last: (usize, u64, u64) = (0, 0, 0);
+    for &index in indices {
+        if !asked.insert(index) {
+            continue;
+        }
+        let Some(Seen::Buffer(shadow, address, len, _)) = inner.slots.get(&index) else {
             continue;
         };
+        let key = (Arc::as_ptr(shadow) as usize, *address, *len);
+        if key == last {
+            continue;
+        }
+        last = key;
         if !shadow.clean() && !crate::watch::clean_bit(shadow.dirty_bit()) {
             add(shadow, *address as usize, *len as usize);
         }
