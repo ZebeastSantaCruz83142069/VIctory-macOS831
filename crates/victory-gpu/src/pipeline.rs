@@ -109,6 +109,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 #[cfg(windows)]
                 crate::ray_skip::note_program(stage, &full.to_hex()[..16], bytes);
                 name_program(stage, &full.to_hex()[..16], bytes);
+                #[cfg(windows)]
                 dump_program(&full.to_hex()[..16], bytes);
                 Arc::new(Shader::with_hash(stage, bytes, full))
             })
@@ -636,6 +637,7 @@ fn name_program(stage: &str, hash: &str, container: &[u8]) {
 /// container of each listed program, as the title passes it, to
 /// `program-<hash>.bin` in the capture folder (`VICTORY_CAPTURE`), for
 /// `victory shader-info --disasm` and `victory translate`.
+#[cfg(windows)]
 fn dump_program(hash: &str, container: &[u8]) {
     static LIST: OnceLock<Vec<String>> = OnceLock::new();
     let list = LIST.get_or_init(|| {
