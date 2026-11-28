@@ -651,11 +651,11 @@ fn dump_program(hash: &str, container: &[u8]) {
     if !list.iter().any(|h| h == hash) {
         return;
     }
-    let Some(dir) = crate::capture::folder() else {
+    let Some(dir) = std::env::var_os("VICTORY_CAPTURE").map(std::path::PathBuf::from) else {
         return;
     };
     let path = dir.join(format!("program-{hash}.bin"));
-    match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, container)) {
+    match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, container)) {
         Ok(()) => tracing::info!(path = %path.display(), "program container saved"),
         Err(e) => tracing::warn!(error = %e, path = %path.display(), "program container not saved"),
     }
