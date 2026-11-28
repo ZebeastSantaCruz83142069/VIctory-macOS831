@@ -71,9 +71,19 @@ pub(crate) fn make(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let first = start as usize / PAGE;
     let pages = (start.checked_add(len)? as usize).div_ceil(PAGE) - first;
     let mut tiles = Vec::with_capacity(pages);
-    if !lookup(first * PAGE, pages * PAGE, &mut tiles)
-        || tiles.len() != pages
-        || tiles.iter().any(Option::is_none)
+    if !lookup(first * PAGE, pages * PAGE, &mut tiles) || tiles.len() != pages {
+        return None;
+    }
+    let missing = tiles.iter().filter(|t| t.is_none()).count();
+    // A page with no tile is either unmapped (reserved, nothing committed:
+    // a tile of zeros shows it, and mapping pages there later retiles the
+    // copy, `physical_retiled`) or memory of another kind, which must be
+    // copied. Only `VICTORY_PHYSICAL_TILES=partial` takes the first kind, and
+    // only beside at least one physical page.
+    if missing > 0
+        && (missing == pages
+            || !crate::alias::physical_tiles_partial()
+            || !unmapped(first, &tiles))
     {
         return None;
     }
@@ -118,6 +128,32 @@ pub(crate) fn make(start: u64, len: u64) -> Option<Arc<Shadow>> {
     static FIRST: std::sync::Once = std::sync::Once::new();
     FIRST.call_once(|| tracing::info!(start = format_args!("{start:#x}"), len, "first title buffer read on its physical pages in place"));
     Some(copy)
+}
+
+/// Whether every page of the title's from page `first` on that `tiles` has
+/// no tile for is unmapped: reserved or free, nothing committed there.
+fn unmapped(first: usize, tiles: &[Option<Tile>]) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut page = 0;
+    while page < tiles.len() {
+        if tiles[page].is_some() {
+            page += 1;
+            continue;
+        }
+        let at = (first + page) * PAGE;
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size; any address may be asked.
+        let got = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        if got == 0 || info.State == MEM_COMMIT {
+            return false;
+        }
+        // The region the query names has one state: skip its pages.
+        let end = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        let next = end.div_ceil(PAGE).saturating_sub(first);
+        page = next.max(page + 1);
+    }
+    true
 }
 
 /// The title's memory `[at, at + len)` now shows `tiles` (one per page; `None`
