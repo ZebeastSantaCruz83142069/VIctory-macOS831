@@ -12017,4 +12017,4 @@ impl<'a> Lower<'a> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

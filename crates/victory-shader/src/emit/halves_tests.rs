@@ -6023,3 +6023,21 @@ fn a_register_index_waterfall_matches_the_console_on_every_gpu() {
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
+
+/// A lane mask read as data where selective predication runs lanes whose
+/// path is elsewhere too (`lower::tests::mask_in_predicated_guards`) gives
+/// the console's ballot on every hardware adapter in groups of one, two
+/// and four console waves: the upper half's late lanes are waited for, not
+/// read as absent because lanes run as nothing counted done there too.
+#[test]
+#[cfg(windows)]
+fn a_mask_behind_predicated_guards_matches_the_console_on_every_gpu() {
+    use super::lower::tests::{console_mask_in_predicated_guards, mask_in_predicated_guards};
+    let words = mask_in_predicated_guards();
+    let mut failed = Vec::new();
+    for threads in [64, 128, 256] {
+        let want = console_mask_in_predicated_guards(threads);
+        failed.extend(differences(&words, threads, 3, &want));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
