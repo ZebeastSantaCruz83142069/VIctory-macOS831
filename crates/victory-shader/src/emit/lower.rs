@@ -210,6 +210,10 @@ pub(crate) struct Parts<'a> {
     /// each texel's lanes of a wave to their maximum key
     /// ([`Options::atomic_umax`](super::Options)).
     pub atomic_umax: bool,
+    /// With `atomic_locks`, a compute or mesh program's glc-clear 64-bit
+    /// min or max is a plain read, compare and write
+    /// ([`Options::racy_minmax`](super::Options)).
+    pub racy_minmax: bool,
     /// Compute-stage biased samples run as gradient samples scaled by
     /// `2^bias` ([`Options::bias_as_gradients`](super::Options)).
     pub bias_as_gradients: bool,
@@ -9567,6 +9571,49 @@ impl<'a> Lower<'a> {
                     Some(v) if cache.glc => self.i32_of(v)?,
                     _ => self.s.m.i32(0),
                 });
+            }
+            let minmax = matches!(op, "umax" | "umin" | "smax" | "smin");
+            if wide && self.x.atomic_locks && self.x.racy_minmax && minmax && !cache.glc && !self.s.pixel {
+                // [`Parts::racy_minmax`]: read, compare, write only if it
+                // moves the texel, no lock and no fence.
+                self.s.flags |= flags::TYPED_UAV_LOADS | flags::INT64;
+                let h = self.handle(site, src, false, (kind | 0x1000 | 0x4000, 0x205))?;
+                let at = self.begin_guarded(guard);
+                let b = self.cur;
+                let mut args = vec![h, iu];
+                args.extend(&cs);
+                args.extend([iu, iu, iu]);
+                let r = self.s.op(b, "textureLoad.i32", Attr::ReadOnly, self.s.t.res_ret_i32, 66, &args);
+                let lo = self.s.m.extract(b, r, 0);
+                let hi = self.s.m.extract(b, r, 1);
+                let l64 = self.s.m.cast(b, Cast::ZExt, lo, i64t);
+                let h64 = self.s.m.cast(b, Cast::ZExt, hi, i64t);
+                let k32 = self.s.m.int_const(i64t, 32);
+                let h64 = self.s.m.bin(b, Bin::Shl, h64, k32);
+                let now = self.s.m.bin(b, Bin::Or, l64, h64);
+                let p = match op {
+                    "umax" => pred::IUGT,
+                    "umin" => pred::IULT,
+                    "smax" => pred::SGT,
+                    _ => pred::SLT,
+                };
+                let moves = self.s.m.cmp(b, p, value, now);
+                let store = self.s.m.new_block();
+                let after = self.s.m.new_block();
+                self.s.m.terminate(b, Term::CondBr(moves, store, after));
+                let nlo = self.s.m.cast(store, Cast::Trunc, value, self.s.t.i32);
+                let nhi = self.s.m.bin(store, Bin::LShr, value, k32);
+                let nhi = self.s.m.cast(store, Cast::Trunc, nhi, self.s.t.i32);
+                let mut args = vec![h];
+                args.extend(&cs);
+                // DXIL stores all four channels; an R32G32 view keeps two.
+                args.extend([nlo, nhi, nlo, nhi, self.s.m.i8(0xF)]);
+                self.s.op(store, "textureStore.i32", Attr::NoUnwind, self.s.t.void, 67, &args);
+                self.s.m.terminate(store, Term::Br(after));
+                self.cur = after;
+                let r = self.end_guarded(at, &[(lo, old[0]), (hi, old[1])]);
+                let _ = r;
+                return Ok(());
             }
             if wide && self.x.atomic_locks {
                 let compare = (code == u32::MAX).then(|| value_at(self, 1));

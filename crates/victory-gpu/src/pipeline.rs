@@ -108,6 +108,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 // (`crate::ray_skip`; nothing while it is off).
                 #[cfg(windows)]
                 crate::ray_skip::note_program(stage, &full.to_hex()[..16], bytes);
+                name_program(stage, &full.to_hex()[..16], bytes);
+                note_leave_out(&full.to_hex()[..16], bytes);
+                #[cfg(windows)]
+                dump_program(&full.to_hex()[..16], bytes);
                 Arc::new(Shader::with_hash(stage, bytes, full))
             })
             .clone()
@@ -615,6 +619,59 @@ fn link_mesh_outputs() -> bool {
     })
 }
 
+/// Diagnostics (`VICTORY_NAME_PROGRAMS=1`): logs the program name a shader
+/// container holds (its first `CS_`, `MS_`, `PS_`, `VS_` or `AS_` string),
+/// once, when the title first passes it, so a hash in the GPU timings can
+/// be told by its name.
+fn name_program(stage: &str, hash: &str, container: &[u8]) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| crate::switch::on("VICTORY_NAME_PROGRAMS")) {
+        return;
+    }
+    let names: Vec<String> = [b"CS_", b"MS_", b"PS_", b"VS_", b"AS_"]
+        .iter()
+        .filter_map(|prefix| {
+            let at = container.windows(3).position(|w| w == *prefix)?;
+            let name: Vec<u8> = container[at..]
+                .iter()
+                .take(96)
+                .take_while(|&&b| b.is_ascii_graphic())
+                .copied()
+                .collect();
+            Some(String::from_utf8_lossy(&name).into_owned())
+        })
+        .collect();
+    tracing::info!(stage, hash, names = %names.join(" "), "program named");
+}
+
+/// Diagnostics (`VICTORY_DUMP_PROGRAMS=<hash>,...`): writes the shader
+/// container of each listed program, as the title passes it, to
+/// `program-<hash>.bin` in the capture folder (`VICTORY_CAPTURE`), for
+/// `victory shader-info --disasm` and `victory translate`.
+#[cfg(windows)]
+fn dump_program(hash: &str, container: &[u8]) {
+    static LIST: OnceLock<Vec<String>> = OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_DUMP_PROGRAMS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_owned())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    if !list.iter().any(|h| h == hash) {
+        return;
+    }
+    let Some(dir) = std::env::var_os("VICTORY_CAPTURE").map(std::path::PathBuf::from) else {
+        return;
+    };
+    let path = dir.join(format!("program-{hash}.bin"));
+    match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, container)) {
+        Ok(()) => tracing::info!(path = %path.display(), "program container saved"),
+        Err(e) => tracing::warn!(error = %e, path = %path.display(), "program container not saved"),
+    }
+}
+
 /// Whether mesh+pixel pipelines whose pixel shader reads non-provoking vertex
 /// values (`VICTORY_P10`/`VICTORY_P20`) fall back to center interpolation
 /// (`per_vertex_center`) instead of being refused (`VICTORY_MESH_PER_VERTEX_CENTER=0`
@@ -1002,6 +1059,71 @@ fn skipped_shader<'a>(shaders: &'a [Arc<Shader>], hashes: &[String]) -> Option<&
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && pipeline(this).host.skipped_shader.is_some()
+}
+
+/// Programs left out by name (`VICTORY_LEAVE_OUT=<names>`, comma-separated
+/// substrings of the program names in shader containers, such as
+/// `CS_DepthProcessingHBO`): their draws and dispatches are not run. For
+/// measuring what a pass costs, and a picture without it.
+fn leave_out_names() -> &'static [String] {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        std::env::var("VICTORY_LEAVE_OUT")
+            .unwrap_or_default()
+            .split(',')
+            .map(|n| n.trim().to_owned())
+            .filter(|n| !n.is_empty())
+            .collect()
+    })
+}
+
+/// The shader hashes [`leave_out_names`] matched so far.
+static LEFT_OUT: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Notes `hash` as left out if its container names a listed program.
+fn note_leave_out(hash: &str, container: &[u8]) {
+    let names = leave_out_names();
+    if names.is_empty() {
+        return;
+    }
+    if let Some(name) = names
+        .iter()
+        .find(|n| container.windows(n.len()).any(|w| w == n.as_bytes()))
+    {
+        tracing::info!(hash, name = %name, "program left out (VICTORY_LEAVE_OUT)");
+        LEFT_OUT.write().unwrap_or_else(|e| e.into_inner()).push(hash.to_owned());
+    }
+}
+
+/// Whether `this` has a shader [`note_leave_out`] left out.
+pub(crate) fn left_out(this: This) -> bool {
+    if leave_out_names().is_empty() || this.is_null() {
+        return false;
+    }
+    let left = LEFT_OUT.read().unwrap_or_else(|e| e.into_inner());
+    pipeline(this).shaders.iter().any(|s| left.contains(&s.hash))
+}
+
+/// The hash of a shader of `this` that `VICTORY_TRACE_DISPATCH` lists
+/// (comma-separated 16-digit hashes), whose dispatches' sizes are logged.
+pub(crate) fn traced_dispatch(this: This) -> Option<String> {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_TRACE_DISPATCH")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_owned())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    if list.is_empty() || this.is_null() {
+        return None;
+    }
+    pipeline(this)
+        .shaders
+        .iter()
+        .find(|s| list.contains(&s.hash))
+        .map(|s| s.hash.clone())
 }
 
 /// The shaders of `this`, as host pipelines are named (diagnostics).

@@ -1172,6 +1172,7 @@ mod tests {
                 atomic_locks: true,
                 atomic_lock_rounds: true,
                 atomic_umax: on,
+                racy_minmax: false,
                 ..options
             })
         };
