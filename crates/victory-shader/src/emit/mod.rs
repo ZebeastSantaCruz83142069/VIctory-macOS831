@@ -565,6 +565,16 @@ pub struct Options {
     /// representative a group locking (module notes, "Atomic locks"). The
     /// translation differs, so the shader cache keys on it.
     pub atomic_umax: bool,
+    /// With [`Options::atomic_locks`]: a compute or mesh program's glc-clear
+    /// 64-bit min or max runs as a plain read, compare and write, without the
+    /// lock and its fences. Two lanes that update one texel at the same time
+    /// can lose the smaller update (the texel keeps a value that was written,
+    /// never a torn one), which Grand Theft Auto VI's hair visibility pass
+    /// (`CS_VisHair`, a strand per lane, one atomic per pixel it crosses)
+    /// shows at most as a strand behind another for a frame, at a fraction
+    /// of the lock's cost. The translation differs, so the shader cache keys
+    /// on it.
+    pub racy_minmax: bool,
     /// Compute-stage biased samples run as gradient samples with the quad
     /// gradients scaled by `2^bias`, for hosts that ignore the bias of a
     /// compute shader's sample (D3DMetal, #30).
@@ -1114,6 +1124,7 @@ fn emit_pruned(
         atomic_locks: options.atomic_locks,
         atomic_lock_rounds: options.atomic_lock_rounds,
         atomic_umax: options.atomic_umax,
+        racy_minmax: options.racy_minmax,
         bias_as_gradients: options.bias_as_gradients,
         host_wave32: options.host_wave32,
         narrow_waves: options.narrow_waves,
