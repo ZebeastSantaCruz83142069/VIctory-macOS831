@@ -483,6 +483,48 @@ fn not_run(why: &'static str) {
     let _ = why;
 }
 
+/// The title commands counted by kind (and, for measuring only, left out
+/// with `VICTORY_SKIP_KINDS=<names>`, comma-separated): mesh dispatches,
+/// draws, indexed draws, dispatches, then the same four executed
+/// indirectly. Leaving a kind out breaks the picture; what the GPU time
+/// does without it says what that kind costs the host.
+pub(crate) const KINDS: [&str; 8] = [
+    "mesh", "draw", "indexed", "dispatch", "imesh", "idraw", "iindexed", "idispatch",
+];
+static KIND_COUNTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// The kinds `VICTORY_SKIP_KINDS` names, as bits of [`KINDS`].
+fn skipped_kinds() -> u32 {
+    static MASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MASK.get_or_init(|| {
+        let value = std::env::var("VICTORY_SKIP_KINDS").unwrap_or_default();
+        let mask = value
+            .split(',')
+            .filter_map(|k| KINDS.iter().position(|n| *n == k.trim()))
+            .fold(0, |m, i| m | 1 << i);
+        if mask != 0 {
+            tracing::warn!(kinds = %value, "VICTORY_SKIP_KINDS: leaving these commands out (measuring only)");
+        }
+        mask
+    })
+}
+
+/// Counts a command of kind `i` of [`KINDS`]; whether it is left out.
+fn kind_skipped(i: usize) -> bool {
+    KIND_COUNTS[i].fetch_add(1, Ordering::Relaxed);
+    skipped_kinds() & (1 << i) != 0
+}
+
+/// The commands per frame by kind since the last call, over `frames`.
+pub(crate) fn kinds_line(frames: f64) -> String {
+    KINDS
+        .iter()
+        .zip(&KIND_COUNTS)
+        .map(|(n, c)| format!("{n} {:.0}", c.swap(0, Ordering::Relaxed) as f64 / frames))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 
@@ -1561,6 +1603,9 @@ impl State {
     /// along x is a part of one, the pipeline's form whose lanes past the
     /// count leave runs instead (`crate::pipeline::thread_limited`).
     pub(crate) fn dispatch_x(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
+        if kind_skipped(3) {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1897,6 +1942,9 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        if kind_skipped(0) {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = self.prepare(list, false, true)
@@ -2501,6 +2549,9 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        if kind_skipped(1) {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         // Rectangles: completed by the pipeline's geometry shader, else
@@ -2607,6 +2658,9 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        if kind_skipped(2) {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
@@ -2693,6 +2747,21 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
+        // Counted (and left out with `VICTORY_SKIP_KINDS`) once per title
+        // call: the title list calls first with `may_cut`, again without it
+        // after a cut.
+        if may_cut {
+            let i = match kind {
+                MESH => Some(4),
+                DRAW => Some(5),
+                INDEXED => Some(6),
+                DISPATCH => Some(7),
+                _ => None,
+            };
+            if i.is_some_and(kind_skipped) {
+                return Some(true);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         let pipeline = self.pipeline as This;
         #[cfg(feature = "diagnostics")]
