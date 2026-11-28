@@ -1982,8 +1982,9 @@ pub(crate) fn evict_unused() {
     let candidates = candidates();
     part.lap(EvictPart::Candidates);
     evict_among(&candidates, &read, frame, now_ms(), over.max(ram));
-    drop(candidates);
     part.lap(EvictPart::GiveUp);
+    drop(candidates);
+    part.lap(EvictPart::LetGo);
     empty_sparse_heap(frame);
     part.lap(EvictPart::SparseHeap);
     // Host copies of title memory take the same memory and textures give
@@ -2022,10 +2023,14 @@ pub(crate) enum EvictPart {
     Trim,
     /// Unordered views left null made again (`descriptor::remake_unordered`).
     Remake,
+    /// Of [`EvictPart::GiveUp`]: the heap slots viewing them made null.
+    NullSlots,
+    /// The candidates let go (a host texture given up goes with its last).
+    LetGo,
 }
 
 #[cfg(windows)]
-const EVICT_NAMES: [&str; 9] = [
+const EVICT_NAMES: [&str; 11] = [
     "budget asked",
     "read marks",
     "candidates",
@@ -2035,6 +2040,8 @@ const EVICT_NAMES: [&str; 9] = [
     "stale copies",
     "readbacks trimmed",
     "unordered views made again",
+    "of given up: slots made null",
+    "candidates let go",
 ];
 
 #[cfg(windows)]
@@ -2411,8 +2418,10 @@ fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
     }
     {
         use windows::core::Interface;
+        let mut part = EvictClock(std::time::Instant::now());
         let raws = gone.iter().map(|(t, _)| t.texture.as_raw() as usize).collect();
         crate::descriptor::evict(&raws);
+        part.lap(EvictPart::NullSlots);
     }
     let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
     let live: std::collections::HashSet<usize> = at.values().flatten().copied().collect();
