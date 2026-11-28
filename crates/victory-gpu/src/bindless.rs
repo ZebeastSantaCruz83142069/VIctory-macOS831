@@ -1075,17 +1075,21 @@ impl Viewed {
         // slots that took them join their copies, then ranges let go, which
         // can drop a copy's spans), the counts, spans and slots are those one
         // slot at a time would leave.
+        //
+        // Keyed by the copy's address: a range's copy is held once, by its
+        // entry here, cloned only when the batch first names it. Cloning it
+        // for every slot (four clones and drops a slot) was an atomic each
+        // on the big copies' counts, which the title's threads share.
         let mut net: HashMap<Range, (i64, Arc<Shadow>), Hashing> =
             HashMap::with_capacity_and_hasher(entries.len().min(1024), Hashing::Fold);
-        // Slots that took a buffer range, joining its copy's slots once the
-        // ranges taken are in (a slot written twice in the batch joins once).
-        let mut joined: HashMap<u32, ((usize, bool), Arc<Shadow>), Hashing> =
-            HashMap::with_hasher(Hashing::Fold);
-        let buffer = |seen: &Seen| match seen {
-            Seen::Buffer(shadow, address, len, uav) => Some((
-                (Arc::as_ptr(shadow) as usize, *address, address + len, *uav),
-                shadow.clone(),
-            )),
+        // Slots that took a buffer range (its key in `net`), joining its
+        // copy's slots once the ranges taken are in (a slot written twice in
+        // the batch joins once).
+        let mut joined: HashMap<u32, Range, Hashing> = HashMap::with_hasher(Hashing::Fold);
+        let key_of = |seen: &Seen| match seen {
+            Seen::Buffer(shadow, address, len, uav) => {
+                Some((Arc::as_ptr(shadow) as usize, *address, address + len, *uav))
+            }
             _ => None,
         };
         for (&(index, ref update), entry) in updates.iter().zip(entries) {
@@ -1107,14 +1111,17 @@ impl Viewed {
                 continue;
             }
             if let Some(old) = inner.slots.remove(&index) {
-                if let Some((key, shadow)) = buffer(&old) {
+                if let Some(key) = key_of(&old) {
                     // Taken earlier in this batch: it has not joined yet.
                     if joined.remove(&index).is_none()
                         && let Some(&idx) = inner.hull_pos.get(&(key.0, key.3))
                     {
                         inner.hulls[idx as usize].slots.remove(&index);
                     }
-                    net.entry(key).or_insert_with(|| (0, shadow)).0 -= 1;
+                    let Seen::Buffer(shadow, ..) = old else {
+                        unreachable!("a buffer's key")
+                    };
+                    net.entry(key).or_insert((0, shadow)).0 -= 1;
                 } else {
                     let (u, h) = inner.count(Some(index), &old, false);
                     unordered_changed |= u;
@@ -1122,9 +1129,14 @@ impl Viewed {
                 }
             }
             if let Some(entry) = entry {
-                if let Some((key, shadow)) = buffer(&entry) {
-                    net.entry(key).or_insert_with(|| (0, shadow.clone())).0 += 1;
-                    joined.insert(index, ((key.0, key.3), shadow));
+                if let Some(key) = key_of(&entry) {
+                    net.entry(key)
+                        .or_insert_with(|| match &entry {
+                            Seen::Buffer(shadow, ..) => (0, shadow.clone()),
+                            _ => unreachable!("a buffer's key"),
+                        })
+                        .0 += 1;
+                    joined.insert(index, key);
                 } else {
                     let (u, h) = inner.count(Some(index), &entry, true);
                     unordered_changed |= u;
@@ -1133,21 +1145,24 @@ impl Viewed {
                 inner.slots.insert(index, entry);
             }
         }
-        let (taken, let_go): (Vec<_>, Vec<_>) =
-            net.into_iter().filter(|(_, (d, _))| *d != 0).partition(|(_, (d, _))| *d > 0);
-        for (key, (d, shadow)) in &taken {
-            let (u, h) = inner.count_range(*key, shadow, *d);
-            unordered_changed |= u;
-            hulls_changed |= h;
+        for (key, (d, shadow)) in &net {
+            if *d > 0 {
+                let (u, h) = inner.count_range(*key, shadow, *d);
+                unordered_changed |= u;
+                hulls_changed |= h;
+            }
         }
-        for (index, (hull_key, shadow)) in joined {
-            let idx = inner.hull_index(hull_key, &shadow);
+        for (index, key) in joined {
+            let shadow = &net[&key].1;
+            let idx = inner.hull_index((key.0, key.3), shadow);
             inner.hulls[idx as usize].slots.insert(index);
         }
-        for (key, (d, shadow)) in &let_go {
-            let (u, h) = inner.count_range(*key, shadow, *d);
-            unordered_changed |= u;
-            hulls_changed |= h;
+        for (key, (d, shadow)) in &net {
+            if *d < 0 {
+                let (u, h) = inner.count_range(*key, shadow, *d);
+                unordered_changed |= u;
+                hulls_changed |= h;
+            }
         }
         if hulls_changed {
             self.hull_generation.fetch_add(1, Release);
