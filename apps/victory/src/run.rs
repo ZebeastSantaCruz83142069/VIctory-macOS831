@@ -108,6 +108,12 @@ pub fn run(
     let original = patching.is_some().then_some(original);
 
     let images = cfg.cache_subdir("images")?;
+    // Rosetta stops on a 256-bit store that faults in its second page, in
+    // the executable and in any title DLL alike: with tracking on there,
+    // each image's list of them is looked for in the cache too.
+    if needs_patch {
+        victory_loader::wide::use_default_dir(cfg.cache_dir.join("wide"));
+    }
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
     // Mapped: the patched bytes (the exe's size, 114 MB) are not needed.
@@ -177,12 +183,19 @@ pub fn run(
     // Every other 256-bit store of the title split into 128-bit halves, from
     // a list made offline (`cargo xtask wide-stores`): Rosetta cannot resume
     // one that faults in its second page.
+    // `VICTORY_PATCH_WIDE` names the list, `0` turns it off; unset, it is
+    // found as a DLL's is (`victory_loader::wide::list_for`).
     #[cfg(windows)]
-    if let Some(list) = std::env::var_os("VICTORY_PATCH_WIDE").filter(|v| !v.is_empty() && v != "0")
     {
-        let (n, refused) =
-            victory_loader::wide::patch(image.base() as u64, std::path::Path::new(&list));
-        println!("wide stores    {n} split into 128-bit halves ({refused} refused)");
+        let list = match std::env::var_os("VICTORY_PATCH_WIDE").filter(|v| !v.is_empty()) {
+            Some(v) if v == "0" => None,
+            Some(v) => Some(std::path::PathBuf::from(v)),
+            None => victory_loader::wide::list_for(&hash, exe),
+        };
+        if let Some(list) = list {
+            let (n, refused) = victory_loader::wide::patch(image.base() as u64, &list);
+            println!("wide stores    {n} split into 128-bit halves ({refused} refused)");
+        }
     }
     let resolver = HleResolver::new(if strict {
         HostPolicy::none()
