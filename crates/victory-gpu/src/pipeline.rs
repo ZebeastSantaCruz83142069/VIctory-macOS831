@@ -108,6 +108,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 // (`crate::ray_skip`; nothing while it is off).
                 #[cfg(windows)]
                 crate::ray_skip::note_program(stage, &full.to_hex()[..16], bytes);
+                name_program(stage, &full.to_hex()[..16], bytes);
                 Arc::new(Shader::with_hash(stage, bytes, full))
             })
             .clone()
@@ -603,6 +604,31 @@ fn link_mesh_outputs() -> bool {
         Some(v) => crate::switch::value_is_on(Some(&v)),
         None => crate::shader_cache::under_wine(),
     })
+}
+
+/// Diagnostics (`VICTORY_NAME_PROGRAMS=1`): logs the program name a shader
+/// container holds (its first `CS_`, `MS_`, `PS_`, `VS_` or `AS_` string),
+/// once, when the title first passes it, so a hash in the GPU timings can
+/// be told by its name.
+fn name_program(stage: &str, hash: &str, container: &[u8]) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| crate::switch::on("VICTORY_NAME_PROGRAMS")) {
+        return;
+    }
+    let names: Vec<String> = [b"CS_", b"MS_", b"PS_", b"VS_", b"AS_"]
+        .iter()
+        .filter_map(|prefix| {
+            let at = container.windows(3).position(|w| w == *prefix)?;
+            let name: Vec<u8> = container[at..]
+                .iter()
+                .take(96)
+                .take_while(|&&b| b.is_ascii_graphic())
+                .copied()
+                .collect();
+            Some(String::from_utf8_lossy(&name).into_owned())
+        })
+        .collect();
+    tracing::info!(stage, hash, names = %names.join(" "), "program named");
 }
 
 /// Whether mesh+pixel pipelines whose pixel shader reads non-provoking vertex
