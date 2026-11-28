@@ -711,7 +711,10 @@ mod gpu {
     /// record each (as VIctory draws the title's indirect mesh draws), and
     /// as one execution of many. A one-triangle mesh on an 8x8 target, so
     /// the draws' own work is next to nothing. `PROBE_COUNT` draws
-    /// (default 1024).
+    /// (default 1024). Also direct draws each followed by a global UAV
+    /// barrier (as VIctory records every title barrier), on a target of
+    /// `PROBE_SIZE` square pixels (default 8): a barrier that ends the
+    /// render pass costs a store and a load of the target.
     #[test]
     #[ignore = "timing probe; run by hand on the GPU"]
     fn mesh_indirect_cost_timing() {
@@ -719,6 +722,7 @@ mod gpu {
         use windows::Win32::Graphics::Dxgi::Common::*;
         use windows::core::Interface;
         let n: u32 = std::env::var("PROBE_COUNT").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
+        let size: u32 = std::env::var("PROBE_SIZE").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
         let _one = crate::emit::valu_tests::ONE_AT_A_TIME
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -763,8 +767,8 @@ mod gpu {
                     D3D12_HEAP_FLAG_NONE,
                     &D3D12_RESOURCE_DESC {
                         Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-                        Width: 8,
-                        Height: 8,
+                        Width: u64::from(size),
+                        Height: size,
                         DepthOrArraySize: 1,
                         MipLevels: 1,
                         Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
@@ -844,18 +848,39 @@ mod gpu {
                 list.Close().expect("close");
                 run(&list.cast().expect("cast"));
             }
-            // 0: direct, 1: one execution each, 2: one execution of n.
+            // 0: direct, 1: one execution each, 2: one execution of n,
+            // 3: direct, each followed by a global UAV barrier.
             let record = |how: u8| {
                 let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
                 let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso).expect("list");
                 let list6: ID3D12GraphicsCommandList6 = list.cast().expect("list 6");
                 list.OMSetRenderTargets(1, Some(&rtv), false, None);
-                list.RSSetViewports(&[D3D12_VIEWPORT { Width: 8.0, Height: 8.0, MaxDepth: 1.0, ..Default::default() }]);
-                list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: 8, bottom: 8 }]);
+                list.RSSetViewports(&[D3D12_VIEWPORT {
+                    Width: size as f32,
+                    Height: size as f32,
+                    MaxDepth: 1.0,
+                    ..Default::default()
+                }]);
+                list.RSSetScissorRects(&[windows::Win32::Foundation::RECT {
+                    left: 0,
+                    top: 0,
+                    right: size as i32,
+                    bottom: size as i32,
+                }]);
                 list.SetGraphicsRootSignature(&root);
                 match how {
                     0 => (0..n).for_each(|_| list6.DispatchMesh(1, 1, 1)),
                     1 => (0..n).for_each(|i| list.ExecuteIndirect(&signature, 1, &args, u64::from(i) * 12, None, 0)),
+                    3 => (0..n).for_each(|_| {
+                        list6.DispatchMesh(1, 1, 1);
+                        list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::zeroed() }),
+                            },
+                        }]);
+                    }),
                     _ => list.ExecuteIndirect(&signature, n, &args, 0, None, 0),
                 }
                 list.Close().expect("close");
@@ -868,7 +893,13 @@ mod gpu {
                 (0..4).map(|_| run(&list)).skip(1).min().unwrap()
             };
             let direct = time(0);
-            eprintln!("{n} direct mesh draws: {:.2} ms", ms_of(direct));
+            eprintln!("{n} direct mesh draws ({size}x{size} target): {:.2} ms", ms_of(direct));
+            let barriers = time(3);
+            eprintln!(
+                "{n} direct mesh draws each followed by a global UAV barrier: {:.2} ms ({:.1} us a barrier)",
+                ms_of(barriers),
+                (ms_of(barriers) - ms_of(direct)) * 1e3 / f64::from(n)
+            );
             let each = time(1);
             eprintln!("{n} indirect mesh executions of one: {:.2} ms", ms_of(each));
             let batched = time(2);
