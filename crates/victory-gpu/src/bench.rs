@@ -375,6 +375,18 @@ fn escape_json(s: &str) -> String {
     out
 }
 
+/// Draws a frame needs for the warm-up to count it
+/// (`VICTORY_BENCH_WARM_DRAWS`, default [`WORLD_DRAW_THRESHOLD`]).
+fn warm_draws() -> u64 {
+    static N: OnceLock<u64> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_BENCH_WARM_DRAWS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(WORLD_DRAW_THRESHOLD)
+    })
+}
+
 struct BenchRecorder {
     warmup_target: u64,
     world_frame: u64,
@@ -452,7 +464,14 @@ impl BenchRecorder {
         if !self.measuring {
             if is_world_frame {
                 self.low_run = 0;
-                self.warmup_world += 1;
+                // Only frames of the full scene count with
+                // `VICTORY_BENCH_WARM_DRAWS` (default the world threshold):
+                // the world's first minute streams in at half the draws and
+                // twice the speed, and a run that measured it is not
+                // comparable with one that did not.
+                if frame_draws >= warm_draws() {
+                    self.warmup_world += 1;
+                }
             } else {
                 self.low_run += 1;
                 if self.low_run >= LOADING_RUN {
