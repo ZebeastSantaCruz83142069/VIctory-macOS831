@@ -109,6 +109,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 #[cfg(windows)]
                 crate::ray_skip::note_program(stage, &full.to_hex()[..16], bytes);
                 name_program(stage, &full.to_hex()[..16], bytes);
+                note_leave_out(&full.to_hex()[..16], bytes);
                 #[cfg(windows)]
                 dump_program(&full.to_hex()[..16], bytes);
                 Arc::new(Shader::with_hash(stage, bytes, full))
@@ -1058,6 +1059,49 @@ fn skipped_shader<'a>(shaders: &'a [Arc<Shader>], hashes: &[String]) -> Option<&
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && pipeline(this).host.skipped_shader.is_some()
+}
+
+/// Programs left out by name (`VICTORY_LEAVE_OUT=<names>`, comma-separated
+/// substrings of the program names in shader containers, such as
+/// `CS_DepthProcessingHBO`): their draws and dispatches are not run. For
+/// measuring what a pass costs, and a picture without it.
+fn leave_out_names() -> &'static [String] {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        std::env::var("VICTORY_LEAVE_OUT")
+            .unwrap_or_default()
+            .split(',')
+            .map(|n| n.trim().to_owned())
+            .filter(|n| !n.is_empty())
+            .collect()
+    })
+}
+
+/// The shader hashes [`leave_out_names`] matched so far.
+static LEFT_OUT: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Notes `hash` as left out if its container names a listed program.
+fn note_leave_out(hash: &str, container: &[u8]) {
+    let names = leave_out_names();
+    if names.is_empty() {
+        return;
+    }
+    if let Some(name) = names
+        .iter()
+        .find(|n| container.windows(n.len()).any(|w| w == n.as_bytes()))
+    {
+        tracing::info!(hash, name = %name, "program left out (VICTORY_LEAVE_OUT)");
+        LEFT_OUT.write().unwrap_or_else(|e| e.into_inner()).push(hash.to_owned());
+    }
+}
+
+/// Whether `this` has a shader [`note_leave_out`] left out.
+pub(crate) fn left_out(this: This) -> bool {
+    if leave_out_names().is_empty() || this.is_null() {
+        return false;
+    }
+    let left = LEFT_OUT.read().unwrap_or_else(|e| e.into_inner());
+    pipeline(this).shaders.iter().any(|s| left.contains(&s.hash))
 }
 
 /// The hash of a shader of `this` that `VICTORY_TRACE_DISPATCH` lists

@@ -1611,7 +1611,7 @@ impl State {
     /// along x is a part of one, the pipeline's form whose lanes past the
     /// count leave runs instead (`crate::pipeline::thread_limited`).
     pub(crate) fn dispatch_x(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
-        if kind_skipped(3) {
+        if kind_skipped(3) || crate::pipeline::left_out(self.pipeline as This) {
             return;
         }
         if let Some(hash) = crate::pipeline::traced_dispatch(self.pipeline as This) {
@@ -1956,7 +1956,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        if kind_skipped(0) {
+        if kind_skipped(0) || crate::pipeline::left_out(self.pipeline as This) {
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -2563,7 +2563,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        if kind_skipped(1) {
+        if kind_skipped(1) || crate::pipeline::left_out(self.pipeline as This) {
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -2672,7 +2672,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        if kind_skipped(2) {
+        if kind_skipped(2) || crate::pipeline::left_out(self.pipeline as This) {
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -2772,7 +2772,7 @@ impl State {
                 DISPATCH => Some(7),
                 _ => None,
             };
-            if i.is_some_and(kind_skipped) {
+            if i.is_some_and(kind_skipped) || crate::pipeline::left_out(self.pipeline as This) {
                 return Some(true);
             }
             if let Some(hash) = crate::pipeline::traced_dispatch(self.pipeline as This) {
