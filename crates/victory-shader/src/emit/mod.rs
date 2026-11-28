@@ -558,6 +558,27 @@ pub fn first_lane_per_half() -> bool {
     first_lane_mode() != 0
 }
 
+/// Measurement only, never a default (`VICTORY_HALVES_EXTRA_BARRIER=1`): an
+/// exchange between the two 32-lane halves of a console wave ends with one
+/// more group barrier, after its reads. What the frame's GPU time gains
+/// with it is about what leaving one of its two barriers out would save (a
+/// safe way of leaving one out, alternating exchange words, needs that to
+/// be worth it). Leaving the barrier before the store out instead let a
+/// half overwrite what the other had not read: GPU 270 -> 415 ms a frame on
+/// an M1 Max, the values wrong. The translation differs, so the shader
+/// cache keys on it.
+pub fn halves_extra_barrier() -> bool {
+    #[cfg(test)]
+    {
+        false
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("VICTORY_HALVES_EXTRA_BARRIER").as_deref() == Ok("1"))
+    }
+}
+
 /// [`first_lane_mode`]'s `enter`.
 pub(crate) fn first_lane_enter_alone() -> bool {
     first_lane_mode() & 1 != 0

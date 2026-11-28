@@ -356,6 +356,10 @@ impl Lower<'_> {
         if let Some(saved) = saved {
             self.give_back(f, saved, at);
         }
+        // `VICTORY_HALVES_EXTRA_BARRIER=1` (measurement only).
+        if crate::emit::halves_extra_barrier() {
+            self.group_sync(at);
+        }
         if !group.is_multiple_of(2 * HALF) {
             let first = self.s.m.bin(at, Bin::Shl, high, five);
             let n = self.s.m.i32(group);

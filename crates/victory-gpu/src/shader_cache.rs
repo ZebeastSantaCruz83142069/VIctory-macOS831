@@ -319,6 +319,8 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     // `VICTORY_FIRST_LANE_PER_HALF=1` (measurement only) changes programs
     // only where they run in halves.
     let per_half = options.host_wave32 && victory_shader::emit::first_lane_per_half();
+    // `VICTORY_HALVES_EXTRA_BARRIER=1` (measurement only), likewise.
+    let extra_barrier = options.host_wave32 && victory_shader::emit::halves_extra_barrier();
     if !locks
         && !bias
         && !narrow
@@ -329,10 +331,11 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         && !limits
         && !half_loops
         && !per_half
+        && !extra_barrier
     {
         return build();
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 8192] = [const { OnceLock::new() }; 8192];
+    static BUILDS: [OnceLock<[u8; 32]>; 16384] = [const { OnceLock::new() }; 16384];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
@@ -345,7 +348,8 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         | usize::from(limits) << 9
         | usize::from(racy) << 10
         | usize::from(half_loops) << 11
-        | usize::from(per_half) << 12;
+        | usize::from(per_half) << 12
+        | usize::from(extra_barrier) << 13;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
@@ -367,6 +371,9 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         if per_half {
             h.update(b"first lane per half");
             h.update(&[victory_shader::emit::first_lane_mode()]);
+        }
+        if extra_barrier {
+            h.update(b"halves extra barrier");
         }
         if bias {
             h.update(b"bias as gradients");
