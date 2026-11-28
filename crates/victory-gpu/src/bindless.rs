@@ -1934,9 +1934,10 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// overlapping ranges of three buffers, unordered and shader views,
     /// unmade views, clears, slots written twice in a batch, and ranges one
     /// slot drops while another takes them, with and without the fast census
-    /// and disjoint spans. A page bucket's observed bounds may stay wider in
-    /// the batch (a range dropped and taken again is never dropped), never
-    /// narrower: a refresh covers at least what one slot at a time covers.
+    /// and disjoint spans. A page bucket's observed bounds may differ (they
+    /// only grow until the page's last range goes, and the batch counts
+    /// neither a range dropped and taken again nor one taken and dropped
+    /// within it), but both hold every live range's bytes on the page.
     #[test]
     fn set_batch_leaves_what_one_slot_at_a_time_leaves() {
         let Some(_host) = crate::host::host() else {
@@ -2075,12 +2076,30 @@ void main(uint3 id : SV_DispatchThreadID) {
                     b == s,
                     "fast={fast} quick={quick} disjoint={disjoint} round {round}: batch differs from single sets"
                 );
-                for (key, (lo, hi)) in &s_bounds {
-                    let (b_lo, b_hi) = b_bounds[key];
-                    assert!(
-                        b_lo <= *lo && b_hi >= *hi,
-                        "fast={fast} quick={quick} disjoint={disjoint} round {round}: page {key:?} bounds narrower"
-                    );
+                // Page bounds only grow until a page's last range goes, so one
+                // slot at a time keeps those of a range a slot took and let go
+                // within the batch, which the batch never counts: the bounds
+                // may differ, but each must hold every live range's bytes on
+                // the page (what the refresh spans are made from).
+                for (bounds, who) in [(&b_bounds, "batch"), (&s_bounds, "single")] {
+                    for &((copy, from, to, uav), _) in &b.0 {
+                        if from >= to {
+                            continue;
+                        }
+                        let (p0, p1) = (from >> CHUNK_SHIFT, (to - 1) >> CHUNK_SHIFT);
+                        if p1 - p0 >= MAX_SMALL_CHUNKS {
+                            continue; // kept whole, in `large`
+                        }
+                        for p in p0..=p1 {
+                            let (lo, hi) = (from.max(p << CHUNK_SHIFT), to.min((p + 1) << CHUNK_SHIFT));
+                            let (b_lo, b_hi) = bounds[&((copy, uav), p)];
+                            assert!(
+                                b_lo <= lo && b_hi >= hi,
+                                "fast={fast} quick={quick} disjoint={disjoint} round {round}: \
+                                 {who}'s page {p} bounds miss a live range"
+                            );
+                        }
+                    }
                 }
                 if fast {
                     let norm = |w: Option<Snapshot<Shadow>>| {
