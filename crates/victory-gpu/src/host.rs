@@ -326,11 +326,15 @@ static COPY_KINDS: [std::sync::atomic::AtomicU64; 6] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// Of the preparing's list steps (`HostList::run_deferred`), since the last
-/// frame-rate line, by [`STEP_NAMES`]: how many ran, and the microseconds
-/// of the kinds timed (one clock read each: the many refreshes and slots
-/// are only counted, their time is the rest of the phase).
+/// frame-rate line, by [`STEP_NAMES`]: how many ran, and their nanoseconds
+/// (each step timed alone, but the many refreshes and slots one in
+/// [`SAMPLE_EVERY`], their time scaled up from those).
 static STEPS: [std::sync::atomic::AtomicU64; 2 * STEP_NAMES.len()] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2 * STEP_NAMES.len()];
+
+/// One refresh or slot in this many is timed (two clock reads each; a world
+/// frame has ~75,000 of them).
+const SAMPLE_EVERY: u64 = 16;
 
 const STEP_NAMES: [&str; 8] = [
     "title copies and fills",
@@ -343,8 +347,20 @@ const STEP_NAMES: [&str; 8] = [
     "page tables (title memory)",
 ];
 
+/// Whether list-step kind `kind` is one of the many sampled ones.
+fn sampled(kind: usize) -> bool {
+    kind == 1 || kind == 2
+}
+
 /// Notes a list step when dropped (each arm of `run_deferred` ends its own way).
 struct StepTimer(usize, Option<std::time::Instant>);
+
+impl StepTimer {
+    fn start(kind: usize) -> Self {
+        let timed = !sampled(kind) || STEPS[kind].load(Ordering::Relaxed).is_multiple_of(SAMPLE_EVERY);
+        Self(kind, timed.then(std::time::Instant::now))
+    }
+}
 
 impl Drop for StepTimer {
     fn drop(&mut self) {
@@ -352,15 +368,19 @@ impl Drop for StepTimer {
     }
 }
 
-/// Counts a list step of kind `kind`, and its microseconds if timed.
+/// Counts a list step of kind `kind`, and its nanoseconds if timed (in
+/// nanoseconds: most steps take less than a microsecond, which a count in
+/// microseconds rounded to nothing).
 fn note_step(kind: usize, started: Option<std::time::Instant>) {
     STEPS[kind].fetch_add(1, Ordering::Relaxed);
     if let Some(started) = started {
-        STEPS[STEP_NAMES.len() + kind].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let ns = started.elapsed().as_nanos() as u64;
+        let ns = if sampled(kind) { ns * SAMPLE_EVERY } else { ns };
+        STEPS[STEP_NAMES.len() + kind].fetch_add(ns, Ordering::Relaxed);
     }
 }
 
-/// Of the preparing, by phase ([`Phase`]), in microseconds since the last
+/// Of the preparing, by phase ([`Phase`]), in nanoseconds since the last
 /// frame-rate line: where a submission's CPU time goes, so a frame report
 /// says which part to make faster. Read with [`take_phases`].
 static PREP_PHASES: [std::sync::atomic::AtomicU64; PHASE_NAMES.len()] =
@@ -406,11 +426,11 @@ impl PhaseClock {
     /// Counts the time since the last lap as `phase`'s.
     fn lap(&mut self, phase: Phase) {
         let now = std::time::Instant::now();
-        let us = (now - self.0).as_micros() as u64;
-        PREP_PHASES[phase as usize].fetch_add(us, Ordering::Relaxed);
+        let ns = (now - self.0).as_nanos() as u64;
+        PREP_PHASES[phase as usize].fetch_add(ns, Ordering::Relaxed);
         FLIGHT_PHASES.with(|p| {
             let mut a = p.get();
-            a[phase as usize] += us;
+            a[phase as usize] += ns;
             p.set(a);
         });
         self.0 = now;
@@ -418,7 +438,7 @@ impl PhaseClock {
 }
 
 thread_local! {
-    /// This thread's preparing microseconds by [`Phase`] since
+    /// This thread's preparing nanoseconds by [`Phase`] since
     /// [`take_flight_phases`] (`VICTORY_FLIGHT_TRACE=1`).
     static FLIGHT_PHASES: std::cell::Cell<[u64; PHASE_NAMES.len()]> =
         const { std::cell::Cell::new([0; PHASE_NAMES.len()]) };
@@ -426,12 +446,13 @@ thread_local! {
 
 /// This thread's preparing microseconds by phase since the last call.
 pub(crate) fn take_flight_phases() -> [u64; PHASE_NAMES.len()] {
-    FLIGHT_PHASES.with(|p| p.replace([0; PHASE_NAMES.len()]))
+    FLIGHT_PHASES.with(|p| p.replace([0; PHASE_NAMES.len()])).map(|ns| ns / 1000)
 }
 
-/// The phases' microseconds since the last call, by [`PHASE_NAMES`].
+/// The phases' microseconds since the last call, by [`PHASE_NAMES`]
+/// (counted in nanoseconds: a phase between two lists is often less than one).
 fn take_phases() -> [u64; PHASE_NAMES.len()] {
-    PREP_PHASES.each_ref().map(|c| c.swap(0, Ordering::Relaxed))
+    PREP_PHASES.each_ref().map(|c| c.swap(0, Ordering::Relaxed) / 1000)
 }
 
 /// What the runtime does when the host GPU fails for good: report it like a
@@ -3058,7 +3079,9 @@ impl Host {
             clock.lap(Phase::Evicting);
             flight::land_ahead(flight::Early::Remake);
             clock.lap(Phase::LandingEarly);
+            let mut part = crate::resource::EvictClock(std::time::Instant::now());
             crate::descriptor::remake_unordered();
+            part.lap(crate::resource::EvictPart::Remake);
         }
         clock.lap(Phase::Evicting);
         // Descriptors the title copied into its heaps itself, before the
@@ -5726,6 +5749,9 @@ impl HostList {
         for step in &deferred.copies {
             if let Step::Slot(viewed, index) = step {
                 note_step(2, None);
+                if !batch.need_slot(viewed, *index) {
+                    continue;
+                }
                 if let Some((run, indices)) = &mut slots
                     && std::sync::Arc::ptr_eq(*run, viewed)
                 {
@@ -5756,7 +5782,7 @@ impl HostList {
                 Step::Heap(_) => 6,
                 Step::Memory(_) => 7,
             };
-            let _step = StepTimer(step_kind, (step_kind > 2).then(std::time::Instant::now));
+            let _step = StepTimer::start(step_kind);
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(
                 started,
@@ -5823,7 +5849,9 @@ impl HostList {
                     continue;
                 }
                 Step::Slot(viewed, index) => {
-                    crate::bindless::refresh_slot(viewed, *index, |s, a, l| batch.add(s, a, l));
+                    if batch.need_slot(viewed, *index) {
+                        crate::bindless::refresh_slot(viewed, *index, |s, a, l| batch.add(s, a, l));
+                    }
                     continue;
                 }
                 Step::Host(work) => {
@@ -5912,6 +5940,122 @@ impl std::hash::Hasher for PtrHasher {
 
 type PtrMap<V> = std::collections::HashMap<usize, V, std::hash::BuildHasherDefault<PtrHasher>>;
 
+/// Hashes a table slot's `(viewed_ptr, index)` (both words, unlike
+/// [`PtrHasher`], which keeps the last).
+#[derive(Default)]
+struct SlotHasher(u64);
+
+impl std::hash::Hasher for SlotHasher {
+    fn finish(&self) -> u64 {
+        self.0 ^ (self.0 >> 29)
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(u64::from(b));
+        }
+    }
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+    fn write_usize(&mut self, i: usize) {
+        self.write_u64(i as u64);
+    }
+    fn write_u32(&mut self, i: u32) {
+        self.write_u64(u64::from(i));
+    }
+}
+
+type SlotSet = std::collections::HashSet<(usize, u32), std::hash::BuildHasherDefault<SlotHasher>>;
+
+/// What `VICTORY_SLOT_ONCE` asks for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SlotOnce {
+    /// Every list's table slots asked (the default).
+    Off,
+    /// Asked again as before, and the asks again counted.
+    Probe,
+    /// A slot asked once per submission until a title write or copy.
+    On,
+}
+
+/// `VICTORY_SLOT_ONCE`: `1` (or `on`) or `probe`.
+///
+/// Each list asks each table slot its draws read once (`defer_slot`), and
+/// a world submission's lists ask the same slots again and again: ~52,000
+/// asks a frame, each taking the heap's lock and looking the slot up. What
+/// an ask finds changes only with a title write or copy (the heaps were
+/// synced before the lists' steps; what the title's threads write meanwhile
+/// is for later submissions, as for [`Batch`]'s other sets), so with the
+/// switch a submission asks a slot once until then.
+fn slot_once() -> SlotOnce {
+    #[cfg(test)]
+    if let Some(mode) = TEST_SLOT_ONCE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static MODE: OnceLock<SlotOnce> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = match std::env::var("VICTORY_SLOT_ONCE").ok().as_deref() {
+            Some("probe") => SlotOnce::Probe,
+            Some(v) if crate::switch::value_is_on(Some(std::ffi::OsStr::new(v))) => SlotOnce::On,
+            _ => SlotOnce::Off,
+        };
+        if mode != SlotOnce::Off {
+            tracing::info!(?mode, "a submission asks each table slot once until a title write (VICTORY_SLOT_ONCE)");
+        }
+        mode
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`slot_once`] on this test's thread.
+    static TEST_SLOT_ONCE: std::cell::Cell<Option<SlotOnce>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+mod slot_once_tests {
+    use super::{Batch, SlotOnce, TEST_SLOT_ONCE};
+
+    fn with_mode(mode: SlotOnce, test: impl FnOnce()) {
+        TEST_SLOT_ONCE.with(|m| m.set(Some(mode)));
+        test();
+        TEST_SLOT_ONCE.with(|m| m.set(None));
+    }
+
+    #[test]
+    fn a_slot_is_asked_once_until_the_title_writes_or_copies() {
+        with_mode(SlotOnce::On, || {
+            let mut batch = Batch::default();
+            let (a, b) = ((0x1000, 7), (0x1000, 8));
+            assert!(batch.need_slot_at(a));
+            assert!(batch.need_slot_at(b), "another slot of the heap");
+            assert!(!batch.need_slot_at(a), "asked again in the submission");
+            assert!(batch.need_slot_at((0x2000, 7)), "the same index of another heap");
+            batch.title_written();
+            assert!(batch.need_slot_at(a), "a title write may change what it finds");
+            assert!(!batch.need_slot_at(a));
+            // A copy into title memory no copy holds still makes every slot due.
+            let mut bytes = vec![0u8; 2 * crate::watch::PAGE];
+            batch.title_copied(bytes.as_mut_ptr() as usize, 64);
+            assert!(batch.need_slot_at(a), "a title copy may change what it finds");
+        });
+    }
+
+    #[test]
+    fn probe_and_off_ask_every_time() {
+        for mode in [SlotOnce::Probe, SlotOnce::Off] {
+            with_mode(mode, || {
+                let mut batch = Batch::default();
+                assert!(batch.need_slot_at((0x1000, 1)));
+                assert!(batch.need_slot_at((0x1000, 1)), "{mode:?} asks again");
+            });
+        }
+    }
+}
+
+/// Table slots asked again since the last frame report ([`slot_once`]).
+static SLOTS_AGAIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 struct BatchBuffers {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, crate::ranges::Ranges)>,
     pending: PtrMap<usize>,
@@ -5920,6 +6064,7 @@ struct BatchBuffers {
     pending_extents: victory_formats::extents::Extents,
     heaps_seen: Vec<(usize, u64)>,
     memories_seen: Vec<(usize, u64)>,
+    slots_seen: SlotSet,
 }
 
 static BATCH_POOL: Mutex<Vec<BatchBuffers>> = Mutex::new(Vec::new());
@@ -5951,6 +6096,9 @@ struct Batch {
     /// Title-memory page tables (`(heap_key, shadow_generation)`) already
     /// prepared since the last title write or copy.
     memories_seen: Vec<(usize, u64)>,
+    /// Table slots (`(viewed_ptr, index)`) already asked since the last
+    /// title write or copy ([`slot_once`]).
+    slots_seen: SlotSet,
 }
 
 /// How far apart a copy's pending ranges may be and still be done as one,
@@ -5968,6 +6116,7 @@ impl Drop for Batch {
         self.pending_extents.clear();
         self.heaps_seen.clear();
         self.memories_seen.clear();
+        self.slots_seen.clear();
         if self.current.capacity() == 0
             && self.pending.capacity() == 0
             && self.heaps_seen.capacity() == 0
@@ -5985,6 +6134,7 @@ impl Drop for Batch {
                 pending_extents: std::mem::take(&mut self.pending_extents),
                 heaps_seen: std::mem::take(&mut self.heaps_seen),
                 memories_seen: std::mem::take(&mut self.memories_seen),
+                slots_seen: std::mem::take(&mut self.slots_seen),
             });
         }
     }
@@ -6005,6 +6155,7 @@ impl Batch {
             pending_extents: buffers.pending_extents,
             heaps_seen: buffers.heaps_seen,
             memories_seen: buffers.memories_seen,
+            slots_seen: buffers.slots_seen,
         }
     }
 
@@ -6033,6 +6184,26 @@ impl Batch {
         }
         true
     }
+    /// Whether table slot `index` of `viewed` is to be asked (`false`: it
+    /// was since the last title write or copy, and [`slot_once`] leaves the
+    /// ask out). Counted in [`SLOTS_AGAIN`].
+    fn need_slot(&mut self, viewed: &crate::bindless::Viewed, index: u32) -> bool {
+        self.need_slot_at((std::ptr::from_ref(viewed) as usize, index))
+    }
+
+    /// [`Batch::need_slot`] by the slot's `(viewed_ptr, index)`.
+    fn need_slot_at(&mut self, slot: (usize, u32)) -> bool {
+        let mode = slot_once();
+        if mode == SlotOnce::Off {
+            return true;
+        }
+        if self.slots_seen.insert(slot) {
+            return true;
+        }
+        SLOTS_AGAIN.fetch_add(1, Ordering::Relaxed);
+        mode == SlotOnce::Probe
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         // Nothing to copy: a world submission asks for every copy its heaps'
         // views and page tables reach (~9,000), a few of them written.
@@ -6082,6 +6253,7 @@ impl Batch {
         self.extents.clear();
         self.heaps_seen.clear();
         self.memories_seen.clear();
+        self.slots_seen.clear();
     }
 
     /// As [`Batch::title_written`], before a copy into the title memory
@@ -6106,6 +6278,7 @@ impl Batch {
         // pick up the post-copy bytes.
         self.heaps_seen.clear();
         self.memories_seen.clear();
+        self.slots_seen.clear();
         // Flush only pending refreshes whose ranges overlap the destination
         // window; disjoint copies stay queued so they coalesce across lists.
         // The index reaches the copies whose memory can hold the window's
@@ -7148,6 +7321,8 @@ impl Meter {
                 "host uploads per frame by step, ms: {}",
                 crate::bindless::take_upload_steps(report_frames)
             );
+            #[cfg(windows)]
+            crate::resource::log_evicting(report_frames);
             {
                 let n = STEPS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
                 let kinds = STEP_NAMES.len();
@@ -7155,20 +7330,28 @@ impl Meter {
                     .iter()
                     .enumerate()
                     .map(|(k, name)| {
-                        // Refreshes and slots are counted, not timed: a
-                        // clock read costs about a microsecond under Wine,
-                        // and they come ~80,000 a frame.
-                        if k == 1 || k == 2 {
-                            format!("{name} {:.0}", n[k] as f64 / report_frames)
+                        let (count, ms) = (n[k] as f64 / report_frames, n[kinds + k] as f64 / 1e6 / report_frames);
+                        if sampled(k) {
+                            format!("{name} {count:.0} (~{ms:.1} ms)")
                         } else {
-                            format!("{name} {:.0} ({:.1} ms)", n[k] as f64 / report_frames, ms(n[kinds + k] / 1000))
+                            format!("{name} {count:.0} ({ms:.1} ms)")
                         }
                     })
                     .collect();
                 tracing::info!(
-                    "host list steps per frame (the rest of the phase is the refreshes and slots): {}",
+                    "host list steps per frame (refreshes and slots timed one in {SAMPLE_EVERY}; the rest \
+                     of the phase is the loop and the steps' bookkeeping): {}",
                     parts.join(", ")
                 );
+                let again = SLOTS_AGAIN.swap(0, Ordering::Relaxed);
+                if slot_once() != SlotOnce::Off {
+                    tracing::info!(
+                        "table slots asked again in a submission per frame (VICTORY_SLOT_ONCE {}): {:.0} of {:.0}",
+                        if slot_once() == SlotOnce::On { "leaves them out" } else { "probe" },
+                        again as f64 / report_frames,
+                        n[2] as f64 / report_frames
+                    );
+                }
             }
             #[cfg(windows)]
             crate::descriptor::log_sync(report_frames);
@@ -7237,7 +7420,6 @@ impl Meter {
                     crate::resource::SOON_FRAMES,
                 );
                 // Window caption updates leave the report counters intact.
-                let drops = crate::pipeline::take_drops();
                 crate::frame::log();
                 log_gpu_times(report_frames);
                 log_gpu_walls(report_frames);
@@ -7274,12 +7456,14 @@ impl Meter {
                         shed as f64 / 1e6
                     );
                 }
-                for (why, n) in drops.iter().take(40) {
-                    tracing::info!(
-                        "dropped {:.1}/frame without a host pipeline: {why}",
-                        *n as f64 / report_frames
-                    );
-                }
+            }
+            // By why, with `VICTORY_DROP_WHY=1` (`crate::pipeline::drop_why`).
+            #[cfg(windows)]
+            for (why, n) in crate::pipeline::take_drops().iter().take(40) {
+                tracing::info!(
+                    "dropped {:.1}/frame without a host pipeline: {why}",
+                    *n as f64 / report_frames
+                );
             }
         }
         if self.caption.is_none() {

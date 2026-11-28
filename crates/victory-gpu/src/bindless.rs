@@ -158,6 +158,33 @@ impl Viewed {
             fast.invalidate();
         }
     }
+    /// Keeps the walk of its textures between submissions, or stops
+    /// (tests and benchmarks: `VICTORY_HEAP_WALK_CACHE` decides for the
+    /// heaps the title makes).
+    #[cfg(test)]
+    pub(crate) fn cache_walk(&self, on: bool) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if !on {
+            inner.walk = None;
+        } else if inner.walk.is_none() {
+            let mut walk = Walk::default();
+            for &r in inner.textures.keys() {
+                walk.add(r);
+            }
+            inner.walk = Some(walk);
+        }
+    }
+
+    /// The textures its cached walk holds (tests).
+    #[cfg(test)]
+    fn walked(&self) -> Option<Vec<usize>> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.walk.as_ref().map(|w| {
+            let mut r: Vec<usize> = w.entries.iter().map(|e| e.resource).collect();
+            r.sort_unstable();
+            r
+        })
+    }
 }
 
 pub(crate) type Range = (usize, u64, u64, bool);
@@ -328,7 +355,11 @@ impl CopySpans {
         let changed = if !disjoint_spans {
             was_empty || outer_changed
         } else {
-            was_empty || (span_grew && (self.dirty || !self.covers(from, to)))
+            // Page bounds never tighten while a range reaches the page, but
+            // spans are clamped to the copy's first start and last end, so a
+            // range can sit inside the page bounds ("nothing grew") yet outside
+            // every span. Re-make the spans whenever none holds the new range.
+            was_empty || (span_grew && self.dirty) || !self.covers(from, to)
         };
         if changed {
             self.dirty = true;
@@ -516,6 +547,150 @@ struct Inner {
     unordered: Option<UnorderedIndex<Shadow>>,
     /// Whether >256 KiB gaps stay split (`VICTORY_DISJOINT_SPANS`).
     disjoint_spans: bool,
+    /// `textures`, flat, with what each submission's walk found of them
+    /// (`VICTORY_HEAP_WALK_CACHE=1`, [`Walk`]).
+    walk: Option<Walk>,
+}
+
+/// Whether the heaps keep their textures' walk between submissions
+/// (`VICTORY_HEAP_WALK_CACHE=1`; off).
+fn walk_cache_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_HEAP_WALK_CACHE"))
+}
+
+/// The textures a heap views, for [`uploads`] to walk at each submission
+/// without the work of finding each again (`VICTORY_HEAP_WALK_CACHE=1`).
+///
+/// Without it, every submission (13-23 a frame) took, for every texture a
+/// heap views, its resource's host lock and its staging's lock, two `Arc`s
+/// and two set inserts, to find that almost all of them had not changed:
+/// 9.4 ms of `heap texture uploads` a frame in a cell of the prologue with
+/// 0.7 MB of textures changed (#505), 27.8 ms on an M5 Max (#417). Here a
+/// texture whose tracker says clean costs two atomic loads, and the rest
+/// is done only for those that may have changed.
+///
+/// It holds no texture: weak references, since a host texture still held
+/// is found again for its memory (`resource::shared_texture`) and would
+/// keep its heap space after eviction.
+#[derive(Default)]
+struct Walk {
+    entries: Vec<Walked>,
+    /// Each texture's place in `entries`.
+    at: HashMap<usize, u32>,
+    /// [`crate::resource::GIVE_UPS`] when the entries were last looked at:
+    /// once it moves, an entry's tracker may be gone and its bit taken by
+    /// another tracker, so each is checked again.
+    give_ups: u64,
+}
+
+/// A texture of a [`Walk`], and what the walk found of it: its host
+/// texture, its staging, and the staging's clean marks
+/// ([`crate::texture::Staging::clean_marks`]).
+struct Walked {
+    resource: usize,
+    copy: Option<std::sync::Weak<crate::resource::HostTexture>>,
+    staging: Option<std::sync::Weak<crate::texture::Staging>>,
+    clean: Option<(u32, Arc<AtomicBool>)>,
+}
+
+impl Walked {
+    /// Its host texture went: found again when next asked.
+    fn forget_made(&mut self) {
+        (self.copy, self.staging, self.clean) = (None, None, None);
+    }
+}
+
+impl Walk {
+    fn add(&mut self, resource: usize) {
+        if let std::collections::hash_map::Entry::Vacant(v) = self.at.entry(resource) {
+            v.insert(self.entries.len() as u32);
+            self.entries.push(Walked {
+                resource,
+                copy: None,
+                staging: None,
+                clean: None,
+            });
+        }
+    }
+
+    fn remove(&mut self, resource: usize) {
+        if let Some(i) = self.at.remove(&resource) {
+            let i = i as usize;
+            self.entries.swap_remove(i);
+            if let Some(moved) = self.entries.get(i) {
+                self.at.insert(moved.resource, i as u32);
+            }
+        }
+    }
+
+    /// Adds to `work` the textures [`uploads`] brings up whose memory may
+    /// have changed, as the walk without the cache does (it adds the
+    /// others too, which `crate::texture::refresh_all` then passes by).
+    /// Called under the heap's lock, as that walk: a released texture
+    /// leaves the heap ([`Inner::forget`]) before its resource goes.
+    fn collect(
+        &mut self,
+        staged: &mut HashSet<*const crate::texture::Staging, Hashing>,
+        work: &mut Vec<(
+            Arc<crate::texture::Staging>,
+            Arc<crate::resource::HostTexture>,
+        )>,
+    ) {
+        let give_ups = crate::resource::GIVE_UPS.load(Acquire);
+        if give_ups != self.give_ups {
+            self.give_ups = give_ups;
+            for e in &mut self.entries {
+                if e.copy
+                    .as_ref()
+                    .is_some_and(|w| w.upgrade().is_none_or(|t| t.is_given_up()))
+                {
+                    e.forget_made();
+                }
+            }
+        }
+        for e in &mut self.entries {
+            // Not changed since detiled: nothing to bring up.
+            if let Some((bit, force)) = &e.clean
+                && crate::watch::clean_bit(Some(*bit))
+                && !force.load(Acquire)
+            {
+                continue;
+            }
+            let texture = match e.copy.as_ref().and_then(std::sync::Weak::upgrade) {
+                Some(t) if !t.is_given_up() => t,
+                _ => {
+                    e.forget_made();
+                    // Not made (given up, or never read): nothing to bring up.
+                    let Some(t) = crate::resource::made_copy(e.resource as This) else {
+                        continue;
+                    };
+                    e.copy = Some(Arc::downgrade(&t));
+                    t
+                }
+            };
+            // As the walk without the cache: only what shaders read lately,
+            // and not what a host copy wrote.
+            if !texture.used_recently() || texture.host_written.load(Relaxed) {
+                continue;
+            }
+            let staging = match e.staging.as_ref().and_then(std::sync::Weak::upgrade) {
+                Some(s) => s,
+                None => {
+                    let made = crate::texture::staging(e.resource as This, &texture.texture);
+                    let Some(s) = made else {
+                        continue;
+                    };
+                    e.staging = Some(Arc::downgrade(&s));
+                    e.clean = s.clean_marks();
+                    s
+                }
+            };
+            if staging.maybe_changed() && staged.insert(Arc::as_ptr(&staging)) {
+                work.push((staging, texture));
+            }
+        }
+    }
 }
 
 impl Default for Inner {
@@ -536,6 +711,7 @@ impl Inner {
             untracked_hulls: Vec::new(),
             unordered: fast.then(UnorderedIndex::new),
             disjoint_spans,
+            walk: walk_cache_on().then(Walk::default),
         }
     }
 }
@@ -751,6 +927,7 @@ impl Inner {
             Seen::Texture(r) => {
                 if let Some(index) = slot {
                     let slots = self.textures.entry(*r).or_default();
+                    let new = slots.is_empty();
                     if add {
                         slots.insert(index);
                     } else {
@@ -758,6 +935,11 @@ impl Inner {
                     }
                     if slots.is_empty() {
                         self.textures.remove(r);
+                        if let Some(walk) = &mut self.walk {
+                            walk.remove(*r);
+                        }
+                    } else if new && let Some(walk) = &mut self.walk {
+                        walk.add(*r);
                     }
                 }
             }
@@ -791,6 +973,9 @@ impl Inner {
 
     /// The title released the texture `resource`: the slots viewing it go.
     fn forget(&mut self, resource: usize) {
+        if let Some(walk) = &mut self.walk {
+            walk.remove(resource);
+        }
         if let Some(slots) = self.textures.remove(&resource) {
             #[cfg(feature = "diagnostics")]
             {
@@ -1212,9 +1397,17 @@ pub(crate) fn uploads(
     lap(1);
     let worker_on = crate::heap_worker::on();
     let mut done = HashSet::with_hasher(Hashing::Fold);
+    let mut walked = HashSet::with_hasher(Hashing::Fold);
     if !worker_on {
         for viewed in heaps {
-            let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(walk) = inner.walk.as_mut() {
+                // A heap several lists of the submission ran: walked once.
+                if walked.insert(Arc::as_ptr(viewed)) {
+                    walk.collect(&mut staged, &mut work);
+                }
+                continue;
+            }
             for &r in inner.textures.keys() {
                 if !done.insert(r) {
                     continue;
@@ -2719,7 +2912,33 @@ void main(uint3 id : SV_DispatchThreadID) {
                 std::ptr::write_bytes(tex_bytes.cast_mut(), texel, size);
             }
         };
-        rounds(src, dst, tex, write);
+        rounds(src, dst, tex, write, false);
+    }
+
+    /// [`heap_views_are_current`] with the cached walk of the heap's
+    /// textures (`VICTORY_HEAP_WALK_CACHE=1`): every round reaches the
+    /// shader, and the walk holds the texture the heap views.
+    #[test]
+    fn heap_views_are_current_with_the_cached_walk() {
+        let (src, dst) = (resource(1, 256, 1, 0, 1), resource(1, 256, 1, 0, 1));
+        // A size no other test makes.
+        let tex = resource(3, 12, 1, 28, LINEAR);
+        let write = |base: u32, texel: u8| {
+            let (src_bytes, _) = crate::resource::buffer_bytes(src).unwrap();
+            let (tex_bytes, tex_desc) = crate::resource::texture_memory(tex).unwrap();
+            let size = crate::resource::texture_layout(&tex_desc).unwrap().planes[0]
+                .layout
+                .size as usize;
+            // SAFETY: the resources' own memory, 256 bytes and the texture's.
+            unsafe {
+                let words = std::slice::from_raw_parts_mut(src_bytes.cast::<u32>(), 64);
+                for (i, w) in words.iter_mut().enumerate() {
+                    *w = base + i as u32;
+                }
+                std::ptr::write_bytes(tex_bytes.cast_mut(), texel, size);
+            }
+        };
+        rounds(src, dst, tex, write, true);
     }
 
     /// The same with the buffer and the texture in one view of physical
@@ -2743,15 +2962,16 @@ void main(uint3 id : SV_DispatchThreadID) {
                 std::ptr::write_bytes((b + PAGE_BYTES) as *mut u8, texel, size);
             }
         };
-        rounds(src, dst, tex, write);
+        rounds(src, dst, tex, write, false);
     }
 
     const PAGE_BYTES: usize = crate::watch::PAGE;
 
     /// Three rounds of: record a dispatch reading slots 0 and 2 and writing
     /// slot 1, let the title `write` (after recording, before submitting),
-    /// submit, check the output's host copy.
-    fn rounds(src: This, dst: This, tex: This, write: impl Fn(u32, u8)) {
+    /// submit, check the output's host copy. `cached`: with the heap's walk
+    /// of its textures kept ([`Viewed::cache_walk`]).
+    fn rounds(src: This, dst: This, tex: This, write: impl Fn(u32, u8), cached: bool) {
         let _serial = crate::heap_worker::serial();
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
@@ -2777,6 +2997,15 @@ void main(uint3 id : SV_DispatchThreadID) {
         crate::descriptor::create_uav(null, dst, null, &uav, slot(1));
         crate::descriptor::create_srv(null, tex, std::ptr::null(), slot(2));
         let heap_host = title_heap.host().expect("a host view heap");
+        if cached {
+            heap_host.viewed.cache_walk(true);
+            let walked = heap_host.viewed.walked();
+            assert_eq!(
+                walked,
+                Some(vec![tex as usize]),
+                "the walk holds the texture viewed"
+            );
+        }
         let (root, pso) = compile();
         let list = host.new_list().unwrap();
         let (dst_bytes, _) = crate::resource::buffer_bytes(dst).unwrap();
@@ -3021,6 +3250,50 @@ void main(uint3 id : SV_DispatchThreadID) {
         crate::shadow::unregister(at as usize, at);
     }
 
+    /// A range added below the copy's first start but inside an already
+    /// occupied 64 KiB page must still get a refresh span. Page buckets keep
+    /// their widest bounds while any range touches the page, but spans are
+    /// clamped to the copy's `(min, max)`, so after the low range leaves, the
+    /// bucket can reach below the first start without any span holding it.
+    #[test]
+    fn disjoint_range_below_first_start_inside_old_page_bounds_is_covered() {
+        const SIZE: usize = 1 << 20;
+        let memory = vec![0u8; SIZE];
+        let at = memory.as_ptr() as u64;
+        crate::shadow::register(at as usize, at, SIZE as u64);
+        let Some(copy) = crate::shadow::find(at, SIZE as u64) else {
+            crate::shadow::unregister(at as usize, at);
+            return; // no host GPU here
+        };
+        // First 64 KiB-aligned address inside the buffer, so all ranges share a page.
+        let o = at.next_multiple_of(1 << CHUNK_SHIFT) - at;
+
+        for disjoint in [true, false] {
+            let viewed = Viewed::with_disjoint_spans(false, disjoint);
+            viewed.set_buffer_slot(1, Some((&copy, at + o, 4096, false)));
+            viewed.set_buffer_slot(2, Some((&copy, at + o + 32 * 1024, 4096, false)));
+            let mut seen = Vec::new();
+            refresh(&viewed, |_, a, l| seen.push((a as u64 - at, l as u64)));
+            // The low range leaves: the first start moves up to the second range.
+            viewed.set_buffer_slot(1, None);
+            seen.clear();
+            refresh(&viewed, |_, a, l| seen.push((a as u64 - at, l as u64)));
+            assert_eq!(seen, vec![(o + 32 * 1024, 4096)], "disjoint={disjoint}");
+            // A new range below the new first start, inside the old page bounds.
+            viewed.set_buffer_slot(3, Some((&copy, at + o + 16 * 1024, 4096, false)));
+            seen.clear();
+            refresh(&viewed, |_, a, l| seen.push((a as u64 - at, l as u64)));
+            let (from, to) = (o + 16 * 1024, o + 20 * 1024);
+            assert!(
+                seen.iter().any(|&(a, l)| a <= from && to <= a + l),
+                "disjoint={disjoint}: new range {from:#x}..{to:#x} not refreshed, got {seen:x?}"
+            );
+        }
+
+        drop(copy);
+        crate::shadow::unregister(at as usize, at);
+    }
+
     /// Evicting an unregistered shadow removes only its `k` associated slots in
     /// O(k) via `CopySpans::slots`, tracks slot reassignments without stale
     /// entries, and keeps live copies' slots and spans intact.
@@ -3079,5 +3352,186 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(viewed);
         drop(live);
         crate::shadow::unregister(at_live as usize, at_live);
+    }
+
+    /// The cached walk keeps one entry per texture the heap views, whatever
+    /// the number of slots viewing it, and drops it with its last slot or
+    /// when the title releases it.
+    #[test]
+    fn the_cached_walk_follows_the_textures_viewed() {
+        let mut inner = Inner::new(false, false, false);
+        inner.walk = Some(Walk::default());
+        let walked = |inner: &Inner| {
+            let w = inner.walk.as_ref().unwrap();
+            for (i, e) in w.entries.iter().enumerate() {
+                assert_eq!(
+                    w.at[&e.resource], i as u32,
+                    "the index names each entry's place"
+                );
+            }
+            assert_eq!(w.at.len(), w.entries.len());
+            let mut r: Vec<usize> = w.entries.iter().map(|e| e.resource).collect();
+            r.sort_unstable();
+            r
+        };
+        let (a, b, c) = (0x1000usize, 0x2000usize, 0x3000usize);
+        inner.count(Some(0), &Seen::Texture(a), true);
+        inner.count(Some(1), &Seen::Texture(a), true);
+        inner.count(Some(2), &Seen::Texture(b), true);
+        inner.count(Some(3), &Seen::Texture(c), true);
+        assert_eq!(walked(&inner), vec![a, b, c]);
+        // One of two slots viewing `a` goes: `a` stays.
+        inner.count(Some(0), &Seen::Texture(a), false);
+        assert_eq!(walked(&inner), vec![a, b, c]);
+        // Its last slot goes: so does `a` (an entry moves into its place).
+        inner.count(Some(1), &Seen::Texture(a), false);
+        assert_eq!(walked(&inner), vec![b, c]);
+        // The title releases `b`.
+        inner.forget(b);
+        assert_eq!(walked(&inner), vec![c]);
+        assert_eq!(inner.textures.keys().copied().collect::<Vec<_>>(), vec![c]);
+        // Viewed again after it went: walked again.
+        inner.count(Some(4), &Seen::Texture(a), true);
+        assert_eq!(walked(&inner), vec![a, c]);
+    }
+
+    /// A shader-visible view heap of `slots` slots (tests).
+    fn view_heap(slots: u32) -> This {
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, slots, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
+            S_OK
+        );
+        heap
+    }
+
+    /// The cached walk brings a texture up once, passes it by while clean,
+    /// brings it up again when the title writes it, and keeps nothing of it
+    /// once eviction gave it up (its views go with it, `descriptor::evict`;
+    /// the walk holds no texture alive).
+    #[test]
+    fn the_cached_walk_uploads_changed_textures_and_lets_given_up_ones_go() {
+        let _serial = crate::heap_worker::serial();
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let heap = view_heap(4);
+        let title_heap = crate::descriptor::heap(heap);
+        // In write-watched memory, as the title's textures are (tracked),
+        // left allocated (`resource::texture_at` keeps a texture per
+        // address for the process), of a size no other test makes.
+        let tex = resource_at(crate::watch::tests::pool(1), 3, 20, 1, 28, LINEAR);
+        let (bytes, desc) = crate::resource::texture_memory(tex).unwrap();
+        let size = crate::resource::texture_layout(&desc).unwrap().planes[0]
+            .layout
+            .size as usize;
+        // SAFETY: the texture's own memory.
+        unsafe { std::ptr::write_bytes(bytes.cast_mut(), 0x21, size) };
+        crate::descriptor::create_srv(std::ptr::null(), tex, std::ptr::null(), title_heap.start);
+        let heap_host = title_heap.host().expect("a host view heap");
+        let viewed = heap_host.viewed.clone();
+        viewed.cache_walk(true);
+        let walk = || uploads(std::slice::from_ref(&viewed), &[]).is_some();
+        let first = crate::resource::made_copy(tex).expect("made for its view");
+        first.stamp();
+        // The first walk brings it up; the next finds nothing changed.
+        assert!(walk(), "first upload");
+        assert_eq!(crate::texture::uploads(tex), 1);
+        assert!(!walk(), "clean: nothing to bring up");
+        // The title writes it: brought up again.
+        // SAFETY: as above.
+        unsafe { std::ptr::write_bytes(bytes.cast_mut(), 0x42, size) };
+        first.stamp();
+        assert!(walk(), "written: brought up");
+        assert_eq!(crate::texture::uploads(tex), 2);
+        {
+            let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let e = &inner.walk.as_ref().unwrap().entries[0];
+            assert!(
+                e.clean.is_some(),
+                "a tracked texture's clean marks are kept"
+            );
+            assert!(e.copy.is_some() && e.staging.is_some());
+        }
+        // Given up: its views go with it (`descriptor::evict`), and the walk
+        // with them; what it found of the texture is let go either way.
+        drop(first);
+        if !crate::resource::give_up_now(tex) {
+            return; // eviction keeps it on this host
+        }
+        assert!(crate::resource::made_copy(tex).is_none());
+        assert!(!walk(), "nothing made: nothing to bring up");
+        {
+            let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let walk = inner.walk.as_ref().unwrap();
+            assert!(
+                walk.entries
+                    .iter()
+                    .all(|e| e.copy.is_none() && e.staging.is_none() && e.clean.is_none()),
+                "nothing of the texture given up is kept"
+            );
+        }
+        crate::object::release_ref(tex);
+        crate::object::release_ref(heap);
+    }
+
+    /// Time of one submission's walk over a heap viewing 2,048 textures
+    /// that have not changed, with and without the cached walk: run by
+    /// name under Wine, `--release --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement: run by name"]
+    fn bench_heap_texture_walk() {
+        let _serial = crate::heap_worker::serial();
+        if crate::host::host().is_none() {
+            return;
+        }
+        const N: u32 = 2048;
+        const CALLS: u32 = 200;
+        let heap = view_heap(N);
+        let title_heap = crate::descriptor::heap(heap);
+        // Tracked, as the title's textures in its pools: 64 a page (left
+        // allocated, as `resource::texture_at` keeps them).
+        let pool = crate::watch::tests::pool(N as usize / 64);
+        let textures: Vec<This> = (0..N)
+            .map(|i| {
+                let tex = resource_at(pool + 1024 * i as usize, 3, 28, 1, 28, LINEAR);
+                let slot = title_heap.start + 32 * u64::from(i);
+                crate::descriptor::create_srv(std::ptr::null(), tex, std::ptr::null(), slot);
+                tex
+            })
+            .collect();
+        let heap_host = title_heap.host().expect("a host view heap");
+        let viewed = heap_host.viewed.clone();
+        let time = |label: &str| {
+            for &t in &textures {
+                crate::resource::made_copy(t)
+                    .expect("made for its view")
+                    .stamp();
+            }
+            // The first walk brings every texture up (and fills the walk's
+            // entries); the rest find them unchanged.
+            drop(uploads(std::slice::from_ref(&viewed), &[]));
+            let t = std::time::Instant::now();
+            for _ in 0..CALLS {
+                assert!(uploads(std::slice::from_ref(&viewed), &[]).is_none());
+            }
+            let us = t.elapsed().as_secs_f64() * 1e6 / f64::from(CALLS);
+            let ns = us * 1e3 / f64::from(N);
+            eprintln!("{label}: {us:.1} us a submission, {ns:.1} ns a texture");
+            us
+        };
+        viewed.cache_walk(false);
+        let plain = time("walk without the cache");
+        viewed.cache_walk(true);
+        let cached = time("cached walk");
+        eprintln!("cached walk {:.1}x faster", plain / cached);
     }
 }

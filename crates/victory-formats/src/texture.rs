@@ -604,8 +604,35 @@ impl Layout {
         self.mips.get(mip as usize).map_or(0, |m| m.depth)
     }
 
+    /// The bytes from the texture's start that mip `first` and the smaller
+    /// ones take: the smaller a mip, the nearer the start it lies, so a
+    /// title that streams textures has memory for the smaller mips only and
+    /// another texture right behind them. All of the layout where slices
+    /// follow each other (each holds its whole chain).
+    pub fn bytes_from(&self, first: u32) -> u64 {
+        let whole = first == 0
+            || self.slices != 1
+            || self.thick
+            || self.desc.dimension == Dimension::Tex3d
+            || self.desc.samples != 1
+            || first >= self.desc.mips;
+        if whole {
+            return self.size;
+        }
+        self.mips[first as usize..]
+            .iter()
+            .map(|m| match m.tail {
+                Some(_) => self.alignment,
+                None => m.offset + u64::from(m.pitch) * u64::from(m.rows) * u64::from(self.desc.element_bytes),
+            })
+            .max()
+            .unwrap_or(self.size)
+            .min(self.size)
+    }
+
     /// Copies one subresource out of tiled memory (the whole texture,
-    /// [`Layout::size`] bytes) into linear rows: mip `mip` of array slice
+    /// [`Layout::size`] bytes, or the [`Layout::bytes_from`] of the mip)
+    /// into linear rows: mip `mip` of array slice
     /// `slice` (3D: every depth slice of the mip, `slice` 0). Rows are
     /// `row_pitch` bytes apart, depth slices `depth_pitch`.
     pub fn detile(
@@ -862,7 +889,8 @@ impl Layout {
             Buffers::Tile { tiled, linear } => (tiled.len(), linear.len()),
             Buffers::Detile { tiled, linear } => (tiled.len(), linear.len()),
         };
-        if tiled_len < self.size as usize || linear_len < need || row_pitch < bytes {
+        let tiled_need = if matches!(copy, Buffers::Detile { .. }) { self.bytes_from(mip) } else { self.size };
+        if tiled_len < tiled_need as usize || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
         }
         let row_range = match rows {
@@ -1107,10 +1135,10 @@ pub fn format(dxgi: u32) -> Option<Format> {
         1..=4 => (16, 1, false),
         9..=18 => (8, 1, false),
         19..=22 | 44..=47 => (4, 1, true),
-        23..=43 | 67 | 87..=93 | 116 | 117 => (4, 1, false),
+        23..=43 | 67 | 87..=93 | 116 | 117 | 189 | 191 => (4, 1, false),
         48..=59 | 85 | 86 | 115 => (2, 1, false),
         118..=120 => (2, 1, true),
-        60..=65 => (1, 1, false),
+        60..=65 | 190 => (1, 1, false),
         70..=72 | 79..=81 => (8, 4, false),
         73..=78 | 82..=84 | 94..=99 => (16, 4, false),
         _ => return None,
@@ -1530,6 +1558,20 @@ mod tests {
             })
             .unwrap();
             assert_eq!(tiled.size, single.size * u64::from(samples));
+        }
+    }
+
+    #[test]
+    fn console_formats_have_layouts() {
+        for (dxgi, bytes) in [(189, 4), (190, 1), (191, 4)] {
+            assert_eq!(
+                format(dxgi),
+                Some(Format {
+                    bytes,
+                    block: 1,
+                    stencil: false
+                })
+            );
         }
     }
 
@@ -2130,6 +2172,34 @@ mod tests {
             }
             assert_eq!((l.size, l.first_tail_mip, h), expected, "{d:?}");
         }
+    }
+
+    /// The smaller mips lie first: they are read from the memory that holds
+    /// them alone, as from the whole texture's.
+    #[test]
+    fn smaller_mips_need_only_the_start_of_the_texture() {
+        for swizzle in [Swizzle::SW_4KB_S, Swizzle(9)] {
+            let l = Layout::new(&Desc { block: 4, ..desc(1024, 1024, 9, 8, swizzle) }).unwrap();
+            assert_eq!(l.bytes_from(0), l.size);
+            let needs: Vec<u64> = (0..9).map(|mip| l.bytes_from(mip)).collect();
+            assert!(needs.windows(2).all(|w| w[0] >= w[1]), "{needs:?}");
+            assert!(needs[3] * 4 < l.size, "{needs:?}");
+            let tiled: Vec<u8> = (0..l.size).map(|i| ((i * 7) >> 3) as u8).collect();
+            for mip in 1..9 {
+                let m = l.mips[mip as usize];
+                let pitch = m.width as usize * 8;
+                let read = |tiled: &[u8]| {
+                    let mut linear = vec![0; pitch * m.height as usize];
+                    l.detile(tiled, mip, 0, &mut linear, pitch, pitch * m.height as usize).map(|()| linear)
+                };
+                let len = l.bytes_from(mip) as usize;
+                assert_eq!(read(&tiled[..len]), read(&tiled));
+                assert_eq!(read(&tiled[..len - 1]), Err(Error::TooSmall));
+            }
+        }
+        // Slices each hold their chain: the whole texture.
+        let l = Layout::new(&Desc { depth: 2, block: 4, ..desc(1024, 1024, 9, 8, Swizzle::SW_4KB_S) }).unwrap();
+        assert_eq!(l.bytes_from(4), l.size);
     }
 
     #[test]

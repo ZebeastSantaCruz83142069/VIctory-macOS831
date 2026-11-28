@@ -1,6 +1,48 @@
 # What testers have seen
 
-Screenshots and videos that testers posted in the issues, newest first within each Mac. They are kept here rather than in the README so the README loads quickly. Each one is the game window only, from the tester's own copy of the game.
+Screenshots and videos that testers posted in the issues. The ones from 27 and 28 November are at the top, and the older ones follow. They are kept here rather than in the README so the README loads quickly. Each one is the game window only, from the tester's own copy of the game.
+
+- [Video](https://github.com/user-attachments/assets/37e042d7-238b-4a75-b4ef-aef3f9eeecb8): hackgods's M5 Pro (64 GB), Series X, 27 November 2026, sped up about 10 times. The player walks around the opening cell, gets the "Approach a cellmate" prompt and then follows the prison guard to the door, at about 2.2 fps in this capture build (#513).
+
+- [Video](https://github.com/user-attachments/assets/d878a14c-4266-4ffb-bdc9-aa4dd89408b4): Zeyphers's M1 Max (32 GB, macOS 15.7.3), Series X, 27 November 2026, sped up about 30 times. The prologue cell with the player in control, with white flashes, ghosting and grey skin still visible (#513).
+
+- [Video](https://github.com/user-attachments/assets/7abab2d1-2abd-4e90-92a4-a20fcd30dddf): cirddan's 16 GB M5, Series S at 1280x720, 27 November 2026, sped up 4 times, on main `d1609d9` with #610 (#513).
+
+- [Video](https://github.com/user-attachments/assets/cfa02500-354e-4831-b52f-b37975278448): gdemontalivet's M5 Max (128 GB), 27 November 2026 (#513).
+
+- The prologue cell with the player in control on Zeyphers's M1 Max, about 1 s per frame and 4,900 draws per frame, with `VICTORY_BARRIER_AFTER_CAP=1`, 27 November 2026 (#50).
+
+  <img src="https://github.com/user-attachments/assets/6c2a6454-77d7-467f-927c-be68291e4302" width="480" alt="The prologue cell with the player in control on an M1 Max under VIctory" loading="lazy">
+
+- The same cell at full size. The yard outside the window is blotchy where shaders still do not translate (#50).
+
+  <img src="https://github.com/user-attachments/assets/3d7b360c-dfc3-4e48-b26f-b48bca89ed11" width="480" alt="The prologue cell and a blotchy yard on an M1 Max under VIctory" loading="lazy">
+
+- One of the washed-out frames on the same M1 Max, with a white wedge over the wall and the bunk (#50).
+
+  <img src="https://github.com/user-attachments/assets/c322d88b-e6d3-462e-92b3-27002de36414" width="480" alt="A washed-out frame with a white wedge in the prologue cell on an M1 Max" loading="lazy">
+
+- A lit night street with a police car on ducks-c's 16 GB M1 Pro, Series S at 1920x1080, main `d1609d9`, 27 November 2026 (#632).
+
+  <img src="https://github.com/user-attachments/assets/7b15e834-2405-4223-827d-6e8b3257a324" width="480" alt="A lit night street with a police car on an M1 Pro under VIctory" loading="lazy">
+
+- Buildings in the same run (#632).
+
+  <img src="https://github.com/user-attachments/assets/bf494cf6-5668-4b3b-9df4-052ded82d408" width="480" alt="City buildings on an M1 Pro under VIctory" loading="lazy">
+
+- Daylight outdoors with foliage and the HUD bar, the same run, before a Rosetta hang about 28 minutes in (#632).
+
+  <img src="https://github.com/user-attachments/assets/67dd3f4c-3b41-44ff-a0b2-d1d5cb8719aa" width="480" alt="Daylight foliage and the HUD bar on an M1 Pro under VIctory" loading="lazy">
+
+- Gameplay prompts on screen on the same M1 Pro in a later run, 28 November 2026 (#632).
+
+  <img src="https://github.com/user-attachments/assets/c653c323-936a-413a-998c-e6871f5952f1" width="480" alt="Gameplay prompts on screen on an M1 Pro under VIctory" loading="lazy">
+
+- Animacustoms's M1 Max (32 GB) on main `4396e31` with `VICTORY_SET=16gb` and an 8 GB GPU budget, at about 6 fps, 28 November 2026 (#662).
+
+  <img src="https://github.com/user-attachments/assets/94af81b9-97e3-49fb-9de2-8883a25cf78a" width="480" alt="The game world on an M1 Max with the 16gb switch set under VIctory" loading="lazy">
+
+  <img src="https://github.com/user-attachments/assets/86338e07-2fe1-405b-b2f8-00752d181858" width="480" alt="A second view of the game world on the same M1 Max" loading="lazy">
 
 - The title screen on jjlange's M3 Max, 25 November 2026 (#50).
 

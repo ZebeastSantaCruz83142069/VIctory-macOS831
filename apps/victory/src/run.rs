@@ -197,6 +197,40 @@ pub fn run(
             println!("wide stores    {n} split into 128-bit halves ({refused} refused)");
         }
     }
+    // A way out of a title lookup that can loop forever on a Mac
+    // (victory_loader::probe_guard); off unless asked for.
+    let guard_lookup = std::env::var("VICTORY_GUARD_LOOKUP").as_deref() == Ok("1");
+    if guard_lookup {
+        match victory_loader::probe_guard::patch(image.base() as u64) {
+            Ok(()) => println!("lookup guard   on: the lookup at +0x50eb750 gives up when its key is absent"),
+            Err(why) => println!("lookup guard   not applied: {why}"),
+        }
+    }
+    // The longest step the title's clamped timers take in a
+    // frame, made longer (victory_loader::time_step); off unless asked for.
+    if let Some(seconds) =
+        victory_loader::time_step::wanted(std::env::var(victory_loader::time_step::SWITCH).ok().as_deref())
+    {
+        match victory_loader::time_step::patch(image.base() as u64, seconds) {
+            Ok(step) => println!(
+                "time step      on: the title's clamped timers step up to {step} s a frame (the title's 1/15 s; asked for {seconds})"
+            ),
+            Err(why) => println!("time step      not applied: {why}"),
+        }
+    }
+    // The title's time budget for placing map pieces, made
+    // larger (victory_loader::map_budget); off unless asked for.
+    if let Some(k) = victory_loader::map_budget::wanted(std::env::var(victory_loader::map_budget::SWITCH).ok().as_deref())
+    {
+        match victory_loader::map_budget::patch(image.base() as u64, k) {
+            Ok(()) => println!(
+                "map budget     on: {} to {} us a frame for placing map pieces (the title's limits times {k})",
+                250 * k,
+                1250 * k
+            ),
+            Err(why) => println!("map budget     not applied: {why}"),
+        }
+    }
     let resolver = HleResolver::new(if strict {
         HostPolicy::none()
     } else {
@@ -265,6 +299,10 @@ pub fn run(
         inner: &resolver,
         dlls: &dlls,
     };
+    // The title's Bink exports go through the movie skipper when
+    // VICTORY_SKIP_BINK asks for it (bound as before otherwise); beneath
+    // the FidelityFX interposer, which only looks at its own DLL.
+    let with_dlls = victory_hle::modules::bink::SkipMovies { inner: &with_dlls };
     let show = |name: &str, report: BindReport| {
         println!(
             "bound          {name}: {} hle, {} host, {} title, {} missing",
@@ -295,6 +333,9 @@ pub fn run(
     victory_hle::runtime::use_console_timers();
     // `VICTORY_PROFILE=<thread names>`: samples our own threads' stacks.
     victory_loader::profile_on_request();
+    if guard_lookup {
+        victory_loader::probe_guard::watch();
+    }
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
     let late = LateDlls {
@@ -520,6 +561,9 @@ impl LateDlls {
                     inner: &old,
                     dlls: &new,
                 };
+                // As at startup: Bink imports of DLLs loaded later too
+                // (VICTORY_SKIP_BINK; bound as before otherwise).
+                let resolver = victory_hle::modules::bink::SkipMovies { inner: &resolver };
                 for (name, dll) in &new {
                     println!(
                         "title dll      {name} at {:#x} (loaded by the title)",

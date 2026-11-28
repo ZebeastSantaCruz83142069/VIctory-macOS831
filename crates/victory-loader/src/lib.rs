@@ -24,6 +24,9 @@
 #[cfg(windows)]
 mod crash;
 pub mod masked;
+pub mod probe_guard;
+pub mod map_budget;
+pub mod time_step;
 pub mod wide;
 #[cfg(windows)]
 mod patch;

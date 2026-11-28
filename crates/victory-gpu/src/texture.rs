@@ -67,7 +67,9 @@ pub(crate) struct Staging {
     uploaded_once: std::sync::atomic::AtomicBool,
     /// Forces a refresh on the next pass even when a tracker reports clean
     /// (e.g. a pre-staged worker upload was discarded before reaching the GPU).
-    force_refresh: std::sync::atomic::AtomicBool,
+    /// Shared with the heaps' cached walk ([`Staging::clean_marks`]), which
+    /// reads it without holding the staging.
+    force_refresh: Arc<std::sync::atomic::AtomicBool>,
     /// Last `crate::queue::presented()` frame on which an untracked check ran.
     checked_frame: std::sync::atomic::AtomicU64,
     /// Per subresource, the bytes of the texture's memory it lies in (from
@@ -762,6 +764,16 @@ impl Staging {
         last.states.clear();
         self.force_refresh
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// What tells, without the staging, that its memory has not changed
+    /// since it was last detiled ([`Staging::maybe_changed`] false): its
+    /// tracker's bit (`crate::watch::clean_bit`) and its forced-refresh
+    /// flag. `None` for untracked memory, which always may have changed, or
+    /// a tracker without a bit of its own.
+    pub(crate) fn clean_marks(&self) -> Option<(u32, Arc<std::sync::atomic::AtomicBool>)> {
+        let bit = self.tracked.as_ref()?.bit()?;
+        Some((bit, self.force_refresh.clone()))
     }
 
     /// Whether its memory may have changed since it was last detiled (an
@@ -1711,7 +1723,7 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
         uploaded_once: std::sync::atomic::AtomicBool::new(false),
-        force_refresh: std::sync::atomic::AtomicBool::new(false),
+        force_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         checked_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
         spans,
         last: Mutex::default(),
@@ -1863,6 +1875,7 @@ pub(crate) mod tests {
         // Clean up tracker reference.
         if let Some(copy) = crate::resource::host_copy(out) {
             copy.staging.lock().unwrap_or_else(|e| e.into_inner()).take();
+            crate::resource::GIVE_UPS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         }
         drop(s);
         crate::object::release(out);
@@ -2499,6 +2512,7 @@ pub(crate) mod tests {
     fn release_staging(object: This, s: Arc<Staging>) {
         if let Some(copy) = crate::resource::host_copy(object) {
             copy.staging.lock().unwrap_or_else(|e| e.into_inner()).take();
+            crate::resource::GIVE_UPS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         }
         drop(s);
     }
@@ -2629,5 +2643,121 @@ pub(crate) mod tests {
         assert_eq!(staging_byte(&upload, &s, 0, page), 0x77);
 
         release_staging(obj, s);
+    }
+
+    /// Where the first refresh of a fresh tracked texture goes (a streamed
+    /// texture made, or made again after eviction): run by name under Wine,
+    /// `--ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement: run by name"]
+    fn probe_first_refresh_phases() {
+        let Some(_host) = host() else {
+            return;
+        };
+        let page = crate::watch::PAGE;
+        let n = 16;
+        let pages = 64; // 2048x2048 BC7, one mip: 4 MiB
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1e3;
+        let (mut make, mut stage, mut first, mut fill, mut again) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        let mut kept = None;
+        for k in 0..n {
+            let address = crate::watch::tests::pool(pages);
+            // SAFETY: our pool.
+            unsafe { (address as *mut u8).write_bytes(k as u8 + 1, pages * page) };
+            // 2048 wide, a height no other texture has, BC7, SW_64KB_S.
+            let height = 2048 - 4 * k as u32;
+            let words: [u32; 14] = [
+                3,
+                0,
+                0,
+                0,
+                2048,
+                0,
+                height,
+                1 | (1 << 16),
+                98,
+                1,
+                0,
+                0x109,
+                0,
+                0,
+            ];
+            let t = std::time::Instant::now();
+            let mut out = std::ptr::null();
+            let hr = crate::resource::create_at_address(
+                std::ptr::null(),
+                address as u64,
+                words.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                &iid,
+                &mut out,
+            );
+            assert_eq!(hr, 0);
+            let tex = crate::resource::host_resource(out).expect("host texture");
+            make += ms(t);
+            let t = std::time::Instant::now();
+            let s = staging(out, &tex).expect("staging");
+            stage += ms(t);
+            kept = Some(s.layout.clone());
+            let t = std::time::Instant::now();
+            let (_, up) = s.refresh_now(Staging::detile);
+            assert!(up.is_some());
+            first += ms(t);
+            let t = std::time::Instant::now();
+            for p in 0..pages {
+                // SAFETY: our pool.
+                unsafe { ((address + p * page) as *mut u8).write(0x40) };
+            }
+            fill += ms(t);
+            let t = std::time::Instant::now();
+            let _ = s.refresh_now(Staging::detile);
+            again += ms(t);
+            recycle();
+        }
+        // The parts on a pool of the same size, without a texture.
+        let (mut track, mut take, mut read, mut detile) = (0.0, 0.0, 0.0, 0.0);
+        let layout = kept.expect("a layout");
+        let mut buf = vec![0u8; pages * page];
+        let mut lin = vec![0u8; pages * page];
+        for _ in 0..n {
+            let address = crate::watch::tests::pool(pages);
+            let t = std::time::Instant::now();
+            let tr = crate::watch::track(address, pages * page, true).expect("tracked");
+            track += ms(t);
+            let t = std::time::Instant::now();
+            let _ = tr.take_split(address, address + pages * page);
+            take += ms(t);
+            let t = std::time::Instant::now();
+            crate::host::copy_mapped(buf.as_mut_ptr(), address as *const u8, pages * page, false);
+            read += ms(t);
+            {
+                let t = std::time::Instant::now();
+                let _ = layout.detile(&buf, 0, 0, &mut lin, 512 * 16, pages * page);
+                detile += ms(t);
+            }
+            std::mem::forget(tr);
+        }
+        let n = n as f64;
+        eprintln!(
+            "per 4 MiB texture, ms: make {:.2}, staging {:.2}, first refresh {:.2}, \
+             fill every page {:.2}, refresh after {:.2}; parts: track {:.2}, take_split {:.2}, \
+             kernel read {:.2}, detile {:.2}",
+            make / n,
+            stage / n,
+            first / n,
+            fill / n,
+            again / n,
+            track / n,
+            take / n,
+            read / n,
+            detile / n
+        );
     }
 }
