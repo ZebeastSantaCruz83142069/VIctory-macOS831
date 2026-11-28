@@ -293,6 +293,8 @@ pub fn run(
     // run killed outright loses what it had recorded (VICTORY_PIPELINE_BOOK).
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
+    // `VICTORY_PROFILE=<thread names>`: samples our own threads' stacks.
+    victory_loader::profile_on_request();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
     let late = LateDlls {
