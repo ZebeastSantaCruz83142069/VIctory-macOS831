@@ -662,6 +662,46 @@ thread_local! {
     static TEST_SYNC_EARLY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// `VICTORY_SYNC_EARLY=cut` (with [`sync_early_enabled`]): a submission whose
+/// heaps were synced while the flight before it ran is prepared without
+/// syncing them again after that flight lands. The early sync runs once the
+/// submission is already the title's (the submit worker took its lists), so
+/// it holds every descriptor the title wrote before submitting it; what the
+/// title writes after (in the world, right after each fence moves: ~32 ms of
+/// sync a frame after the landings on an M1 Max) is for later submissions,
+/// and by the rule above not in slots this one reads. The next early sync,
+/// while this one runs, takes it. Views the landing makes for slots shaders
+/// read (`descriptor::make_read`) are made by the landing itself.
+///
+/// shortcut: a title that writes a descriptor after submitting work that
+/// reads it (the console's GPU would read it if it came before the GPU got
+/// there) gets the view from before, for that submission only.
+pub(crate) fn sync_early_cut() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = sync_early_enabled()
+            && std::env::var_os("VICTORY_SYNC_EARLY").is_some_and(|v| v == "cut");
+        if on {
+            tracing::info!(
+                "heaps synced early are not synced again after the landing (VICTORY_SYNC_EARLY=cut)"
+            );
+        }
+        on
+    })
+}
+
+thread_local! {
+    /// This thread synced the heaps for the submission it prepares next while
+    /// the last flight ran ([`sync_early_cut`]).
+    static SYNCED_EARLY_FOR_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the submission this thread prepares now had its heaps synced
+/// early ([`sync_early_cut`]); cleared.
+pub(crate) fn take_synced_early() -> bool {
+    SYNCED_EARLY_FOR_NEXT.with(|c| c.replace(false))
+}
+
 /// Heap syncs done while the last flight ran ([`sync_early_enabled`]) and
 /// their microseconds, since the last frame report.
 static SYNCED_EARLY: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -999,6 +1039,9 @@ impl Host {
                 crate::descriptor::sync_heaps();
                 SYNCED_EARLY[0].fetch_add(1, Ordering::Relaxed);
                 SYNCED_EARLY[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                if sync_early_cut() {
+                    SYNCED_EARLY_FOR_NEXT.with(|c| c.set(true));
+                }
             }
             // Wait-Before-Prep: drain Flight N-1 completely before Flight N
             // touches any shared Shadow, upload staging pool, or Mark

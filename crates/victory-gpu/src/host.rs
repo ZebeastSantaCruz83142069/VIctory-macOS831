@@ -2958,7 +2958,11 @@ impl Host {
         // heaps' views are brought up to date below.
         #[cfg(feature = "diagnostics")]
         let syncing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncHeapsUs);
-        crate::descriptor::sync_heaps();
+        // Synced while the last flight ran, with `VICTORY_SYNC_EARLY=cut`:
+        // what the title wrote since is for later submissions.
+        if !flight::take_synced_early() {
+            crate::descriptor::sync_heaps();
+        }
         // Slots left as they were while the last submission ran, because
         // the texture they now view was made meanwhile (`VICTORY_SHOW_AFTER`).
         crate::descriptor::show_held();
