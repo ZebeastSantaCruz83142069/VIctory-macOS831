@@ -149,6 +149,11 @@ fn lowered_with(
     lower_halves(native, host_wave32, narrow_waves, false)
 }
 
+thread_local! {
+    /// [`lower::Parts::half_loops`] for the lowerings of these tests.
+    static HALF_LOOPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn lower_halves(
     native: &NativeProgram,
     host_wave32: bool,
@@ -189,6 +194,7 @@ fn lower_halves_limited(
             atomic_lock_rounds: false,
             atomic_umax: false,
             racy_minmax: false,
+            half_loops: HALF_LOOPS.with(std::cell::Cell::get),
             bias_as_gradients: false,
             narrow_waves,
             uav_size_level0: false,
@@ -2958,6 +2964,7 @@ fn thread_ticket_relabels_2d_and_partial_tail_groups_bijectively() {
                 atomic_lock_rounds: false,
                 atomic_umax: false,
                 racy_minmax: false,
+                half_loops: false,
                 bias_as_gradients: false,
                 host_wave32: true,
                 narrow_waves: false,
@@ -3303,6 +3310,7 @@ fn lane_masks_in_divergent_code_meet_between_halves() {
         atomic_lock_rounds: false,
         atomic_umax: false,
         racy_minmax: false,
+        half_loops: false,
         bias_as_gradients: false,
         narrow_waves: false,
         halves_rendezvous: false,
@@ -6022,6 +6030,129 @@ fn a_register_index_waterfall_matches_the_console_on_every_gpu() {
                     .into_iter()
                     .map(|m| format!("{threads} threads (mbcnt={with_mbcnt}): {m}")),
             );
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+
+/// GTA VI's hair visibility loop (`CS_VisHair`, `b6df66af105d8b2d`) in
+/// small: a first-lane read before the loop puts the program in halves and
+/// in lockstep, then a per-lane loop (`do { ... } while (lanes left)`, the
+/// lanes left in `s[12:13]`, the test `s_andn2_b64` + `s_cbranch_scc1`, the
+/// loop entered at its body) with a store in its body. Pass `p` of a lane
+/// stores `p` at dword `p` of its eight; a lane runs `max(tid & 7, 1)`
+/// passes. Dword 0: the console wave's first thread id.
+fn hair_like_loop() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E0C_0500, // v_readfirstlane_b32 s6, v0
+        0x7E04_0206, // v_mov_b32 v2, s6
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x360A_0087, // v_and_b32 v5, 7, v0
+        0xBEA4_047E, // s_mov_b64 s[36:37], exec
+        0xBE8C_047E, // s_mov_b64 s[12:13], exec
+        0xBF82_0001, // s_branch (the body)
+        0x87FE_0C0E, // s_and_b64 exec, s[14:15], s[12:13]
+        0xBE8E_047E, // s_mov_b64 s[14:15], exec
+        0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+        0x3422_0282, // v_lshlrev_b32 v17, 2, v1
+        0x4A22_2310, // v_add_nc_u32 v17, v16, v17
+        0xE070_1000,
+        0x800A_0111, // buffer_store_dword v1, v17, s[40:43], 0 offen
+        0x7DA6_0305, // v_cmpx_le_u32 exec, v5, v1
+        0x8A8C_7E0C, // s_andn2_b64 s[12:13], s[12:13], exec
+        0xBF85_FFF6, // s_cbranch_scc1 (the s_and_b64)
+        0xBEFE_0424, // s_mov_b64 exec, s[36:37]
+    ]);
+    w.extend(store(2, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn the_hair_like_loop_is_what_its_comments_say() {
+    let words = hair_like_loop();
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let text: Vec<String> = gfx10::decode(&code)
+        .expect("decodes")
+        .iter()
+        .map(|i| i.text(true))
+        .collect();
+    let want = [
+        "v_lshlrev_b32 v16, 5, v0",
+        "v_readfirstlane_b32 s6, v0",
+        "v_mov_b32 v2, s6",
+        "v_mov_b32 v1, 0",
+        "v_and_b32 v5, 7, v0",
+        "s_mov_b64 s[36:37], exec",
+        "s_mov_b64 s[12:13], exec",
+        "s_branch",
+        "s_and_b64 exec, s[14:15], s[12:13]",
+        "s_mov_b64 s[14:15], exec",
+        "v_add_nc_u32 v1, 1, v1",
+        "v_lshlrev_b32 v17, 2, v1",
+        "v_add_nc_u32 v17, v16, v17",
+        "buffer_store_dword v1, v17, s[40:43], 0 offen",
+        "v_cmpx_le_u32",
+        "s_andn2_b64 s[12:13], s[12:13], exec",
+        "s_cbranch_scc1",
+        "s_mov_b64 exec, s[36:37]",
+    ];
+    for (n, want) in want.iter().enumerate() {
+        let got = &text[PROLOGUE.len() - 1 + n];
+        assert!(got.starts_with(want), "{n}: {got:?}, not {want:?}");
+    }
+}
+
+/// In halves the loop runs in lockstep, meeting the other half at group
+/// barriers in every pass; with `half_loops` each half leaves on its own
+/// lanes, and the loop has no barrier left.
+#[test]
+fn a_loop_with_no_barrier_in_it_leaves_per_half_with_half_loops() {
+    for threads in [64, 128] {
+        let n = native(&hair_like_loop(), true, threads, 0);
+        let lockstep = lowered(&n, true).expect("lockstep");
+        HALF_LOOPS.with(|h| h.set(true));
+        let half = lowered(&n, true);
+        HALF_LOOPS.with(|h| h.set(false));
+        let half = half.expect("half loops");
+        assert!(
+            half.barriers < lockstep.barriers,
+            "{threads} threads: {} barriers with half loops, {} in lockstep",
+            half.barriers,
+            lockstep.barriers
+        );
+    }
+}
+
+/// The console's stores of [`hair_like_loop`] for a group of `threads`.
+fn console_hair_like_loop(threads: u32) -> Vec<u32> {
+    (0..threads)
+        .flat_map(|t| {
+            let mut lane = [0; 8];
+            lane[0] = t & !63;
+            for p in 1..=(t & 7).max(1) {
+                lane[p as usize] = p;
+            }
+            lane
+        })
+        .collect()
+}
+
+/// Both translations store what the console does, on every GPU.
+#[cfg(windows)]
+#[test]
+fn a_loop_leaving_per_half_matches_the_console_on_every_gpu() {
+    let words = hair_like_loop();
+    let mut failed = Vec::new();
+    for half in [false, true] {
+        for threads in [64, 128] {
+            HALF_LOOPS.with(|h| h.set(half));
+            let wrong = differences(&words, threads, 8, &console_hair_like_loop(threads));
+            HALF_LOOPS.with(|h| h.set(false));
+            failed.extend(wrong.into_iter().map(|m| format!("half_loops={half} {threads} threads: {m}")));
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));

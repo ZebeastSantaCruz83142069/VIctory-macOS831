@@ -214,6 +214,8 @@ pub(crate) struct Parts<'a> {
     /// min or max is a plain read, compare and write
     /// ([`Options::racy_minmax`](super::Options)).
     pub racy_minmax: bool,
+    /// [`Options::half_loops`](super::Options).
+    pub half_loops: bool,
     /// Compute-stage biased samples run as gradient samples scaled by
     /// `2^bias` ([`Options::bias_as_gradients`](super::Options)).
     pub bias_as_gradients: bool,
@@ -403,6 +405,9 @@ struct Lower<'a> {
     loop_outer_active: Map<usize, Option<V>>,
     /// Lockstep loop active-lane phis `(phi, header, latch)` filled in `fill_phis`.
     loop_act_phis: Vec<(V, usize, usize)>,
+    /// [`Shader::syncs`](super::shader::Shader) when each lockstep loop
+    /// header was entered (`Options::half_loops`).
+    loop_syncs: Map<usize, u32>,
     /// [`Lower::relabelled_flat`], once made.
     relabelled: Option<V>,
     /// Lower non-provoking per-vertex pixel reads (P10/P20) to zero and
@@ -959,6 +964,7 @@ impl<'a> Lower<'a> {
             pred_edge_active: Map::default(),
             loop_outer_active: Map::default(),
             loop_act_phis: Vec::new(),
+            loop_syncs: Map::default(),
             relabelled: None,
             per_vertex_center,
             group_scalars,

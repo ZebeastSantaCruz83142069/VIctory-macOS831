@@ -574,6 +574,13 @@ pub struct Options {
     /// of the lock's cost. The translation differs, so the shader cache keys
     /// on it.
     pub racy_minmax: bool,
+    /// With [`Options::host_wave32`]: a divergent loop made lockstep
+    /// (`lower::predicate`) whose body has no group barrier and no
+    /// rendezvous of halves tests only its own host wave's lanes to go on,
+    /// so each half leaves when its lanes are done instead of meeting the
+    /// other at two group barriers every iteration (`VICTORY_HALF_LOOPS=1`).
+    /// The translation differs, so the shader cache keys on it.
+    pub half_loops: bool,
     /// Compute-stage biased samples run as gradient samples with the quad
     /// gradients scaled by `2^bias`, for hosts that ignore the bias of a
     /// compute shader's sample (D3DMetal, #30).
@@ -1122,6 +1129,7 @@ fn emit_pruned(
         atomic_lock_rounds: options.atomic_lock_rounds,
         atomic_umax: options.atomic_umax,
         racy_minmax: options.racy_minmax,
+        half_loops: options.half_loops,
         bias_as_gradients: options.bias_as_gradients,
         host_wave32: options.host_wave32,
         narrow_waves: options.narrow_waves,
