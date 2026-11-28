@@ -6796,6 +6796,11 @@ impl Meter {
                 .map(|(name, us)| format!("{name} {:.1}", ms(us)))
                 .collect();
             tracing::info!("host preparing per frame by phase, ms: {}", phases.join(", "));
+            // The uploads phase by step (the rest of it is trimming idle lists).
+            tracing::info!(
+                "host uploads per frame by step, ms: {}",
+                crate::bindless::take_upload_steps(report_frames)
+            );
             {
                 let n = STEPS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
                 let kinds = STEP_NAMES.len();

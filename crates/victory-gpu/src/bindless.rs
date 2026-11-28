@@ -1065,11 +1065,34 @@ fn left_kind(view: &View) -> (usize, u64, u64) {
 ///
 /// shortcut: a title copy into texture memory recorded in the same
 /// submission shows from the next one on.
+/// Microseconds of [`uploads`] by step since the last frame report
+/// ([`take_upload_steps`]): recycling staging and resetting the list,
+/// textures read through tables, the heaps' textures, checking and detiling
+/// what changed, recording the copies.
+static UPLOAD_US: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// [`UPLOAD_US`] in milliseconds per frame over `frames`, named, cleared.
+pub(crate) fn take_upload_steps(frames: f64) -> String {
+    const NAMES: [&str; 5] = ["recycle+reset", "table textures", "heap textures", "check+detile", "record"];
+    NAMES
+        .iter()
+        .zip(UPLOAD_US.each_ref().map(|a| a.swap(0, Relaxed)))
+        .map(|(n, us)| format!("{n} {:.1}", us as f64 / 1e3 / frames))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub(crate) fn uploads(
     heaps: &[Arc<Viewed>],
     textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
 ) -> Option<Uploads> {
     static LIST: Mutex<Holder> = Mutex::new(Holder(None, false));
+    let mut lap_at = std::time::Instant::now();
+    let mut lap = |step: usize| {
+        let now = std::time::Instant::now();
+        UPLOAD_US[step].fetch_add((now - lap_at).as_micros() as u64, Relaxed);
+        lap_at = now;
+    };
     let list = {
         let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
         crate::texture::recycle();
@@ -1094,6 +1117,7 @@ pub(crate) fn uploads(
         guard.1 = false;
         list
     };
+    lap(0);
     let mut uploads = Uploads {
         list: Some(list),
         dirty: true,
@@ -1119,6 +1143,7 @@ pub(crate) fn uploads(
             work.push((staging.clone(), copy.clone()));
         }
     }
+    lap(1);
     let worker_on = crate::heap_worker::on();
     let mut done = HashSet::with_hasher(Hashing::Fold);
     if !worker_on {
@@ -1155,10 +1180,13 @@ pub(crate) fn uploads(
             }
         }
     }
+    lap(2);
     let mut recorded = false;
     // The textures copied into stay alive in `work` until recorded.
     let mut readable = Vec::new();
-    for ((staging, copy), upload) in work.iter().zip(crate::texture::refresh_all(&work)) {
+    let refreshed = crate::texture::refresh_all(&work);
+    lap(3);
+    for ((staging, copy), upload) in work.iter().zip(refreshed) {
         if let Some(upload) = upload {
             readable.extend(crate::texture::record_upload(list, copy, staging, &upload));
             recorded = true;
@@ -1224,6 +1252,7 @@ pub(crate) fn uploads(
         unsafe { list.list.ResourceBarrier(&readable) };
     }
     list.close();
+    lap(4);
     uploads.dirty = recorded;
     *uploads.worker.get_mut().unwrap_or_else(|e| e.into_inner()) = ready;
     // A list recording nothing is not run (dropping `uploads` returns it to
