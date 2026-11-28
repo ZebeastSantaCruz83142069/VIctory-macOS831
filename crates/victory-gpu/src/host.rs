@@ -5394,9 +5394,7 @@ impl HostList {
             batch: &mut Batch,
         ) {
             if let Some((viewed, indices)) = run.take() {
-                let started = std::time::Instant::now();
                 crate::bindless::refresh_slots(viewed, &indices, |s, a, l| batch.add(s, a, l));
-                STEPS[STEP_NAMES.len() + 2].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
         }
         let mut slots: Option<(&std::sync::Arc<crate::bindless::Viewed>, Vec<u32>)> = None;
@@ -5422,7 +5420,8 @@ impl HostList {
             // diagnostics.
             let copy_started = matches!(step, Step::Copy(..) | Step::Move(..) | Step::Fill(..))
                 .then(std::time::Instant::now);
-            // The list-steps line: every step counted and timed (in ns).
+            // The list-steps line: every step counted, all but the many
+            // refreshes and slots timed (in ns).
             let step_kind = match step {
                 Step::Copy(..) | Step::Move(..) | Step::Fill(..) => 0,
                 Step::Refresh(..) => 1,
@@ -5433,7 +5432,7 @@ impl HostList {
                 Step::Heap(_) => 6,
                 Step::Memory(_) => 7,
             };
-            let _step = StepTimer(step_kind, Some(std::time::Instant::now()));
+            let _step = StepTimer(step_kind, (step_kind > 2).then(std::time::Instant::now));
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(
                 started,
@@ -6809,11 +6808,18 @@ impl Meter {
                     .iter()
                     .enumerate()
                     .map(|(k, name)| {
-                        format!("{name} {:.0} ({:.1} ms)", n[k] as f64 / report_frames, ms(n[kinds + k] / 1000))
+                        // Refreshes and slots are counted, not timed: a
+                        // clock read costs about a microsecond under Wine,
+                        // and they come ~80,000 a frame.
+                        if k == 1 || k == 2 {
+                            format!("{name} {:.0}", n[k] as f64 / report_frames)
+                        } else {
+                            format!("{name} {:.0} ({:.1} ms)", n[k] as f64 / report_frames, ms(n[kinds + k] / 1000))
+                        }
                     })
                     .collect();
                 tracing::info!(
-                    "host list steps per frame (the rest of the phase is the refreshes the steps flush): {}",
+                    "host list steps per frame (the rest of the phase is the refreshes and slots): {}",
                     parts.join(", ")
                 );
             }
