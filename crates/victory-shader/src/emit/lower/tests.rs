@@ -4685,6 +4685,7 @@ fn a_mask_behind_predicated_guards_meets() {
                 atomic_locks: false,
                 atomic_lock_rounds: false,
                 atomic_umax: false,
+                racy_minmax: false,
                 bias_as_gradients: false,
                 host_wave32: true,
                 narrow_waves: false,
