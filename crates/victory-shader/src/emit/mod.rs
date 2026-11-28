@@ -512,6 +512,72 @@ pub struct UserData {
 /// the world was drawn black on M3 Max and M5 Pro Macs (#497), where keeping
 /// their barrier, as before, drew it. Tests run with the refusal on unless
 /// they turn it off ([`with_cap_barriers`]).
+/// Measurement only, never a default (`VICTORY_FIRST_LANE_PER_HALF`): on a
+/// host of 32-lane waves, how a wave64 compute program's
+/// `v_readfirstlane_b32` of a value not proven alike is translated, as
+/// before #522:
+///
+/// - `enter` (or `1`/`all`, with `reads`): it no longer puts the program in
+///   halves (`halves::needs_first_lane`); each host wave reads the first
+///   active lane of its own 32 lanes;
+/// - `reads` (or `1`/`all`, with `enter`): in a program already in halves,
+///   it reads its own half's first active lane, with no exchange between
+///   the halves.
+///
+/// That is the console's value only where it is the same in both halves
+/// (the commonest case: a reciprocal or other value made in VALU from
+/// scalars), so a program may compute something else; it tells what the
+/// halves cost the GPU (#553). Translations made with it are cached apart
+/// (`translation_build`, keyed by [`first_lane_mode`]).
+pub fn first_lane_mode() -> u8 {
+    #[cfg(test)]
+    {
+        0
+    }
+    #[cfg(not(test))]
+    {
+        static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        *MODE.get_or_init(|| match std::env::var("VICTORY_FIRST_LANE_PER_HALF").as_deref() {
+            Ok("1" | "all") => 3,
+            Ok("enter") => 1,
+            Ok("reads") => 2,
+            _ => 0,
+        })
+    }
+}
+
+/// Whether any of [`first_lane_mode`] is on.
+pub fn first_lane_per_half() -> bool {
+    first_lane_mode() != 0
+}
+
+/// [`first_lane_mode`]'s `enter`.
+pub(crate) fn first_lane_enter_alone() -> bool {
+    first_lane_mode() & 1 != 0
+}
+
+/// [`first_lane_mode`]'s `reads`.
+pub(crate) fn first_lane_reads_alone() -> bool {
+    first_lane_mode() & 2 != 0
+}
+
+thread_local! {
+    /// Programs this thread translated that [`first_lane_mode`]'s `enter`
+    /// kept out of halves, since [`take_kept_out_of_halves`].
+    static KEPT_OUT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Notes that a translation was kept out of halves ([`first_lane_mode`]).
+pub(crate) fn note_kept_out_of_halves() {
+    KEPT_OUT.with(|c| c.set(c.get() + 1));
+}
+
+/// How many times this thread's translations were kept out of halves by
+/// [`first_lane_mode`] since the last call (the runtime logs the program).
+pub fn take_kept_out_of_halves() -> u32 {
+    KEPT_OUT.with(|c| c.replace(0))
+}
+
 pub fn cap_barriers_refused() -> bool {
     #[cfg(test)]
     {
