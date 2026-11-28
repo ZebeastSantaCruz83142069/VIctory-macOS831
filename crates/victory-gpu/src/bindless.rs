@@ -1102,6 +1102,8 @@ impl Viewed {
             }
             _ => None,
         };
+        let looping = std::time::Instant::now();
+        let (mut buffers, mut textures) = (0u64, 0u64);
         for (&(index, ref update), entry) in updates.iter().zip(entries) {
             // Unregister changes the epoch before acquiring this lock to evict
             // the old copy. Do not reinsert an entry after its eviction.
@@ -1132,7 +1134,9 @@ impl Viewed {
                         unreachable!("a buffer's key")
                     };
                     net.entry(key).or_insert((0, shadow)).0 -= 1;
+                    buffers += 1;
                 } else {
+                    textures += u64::from(matches!(old, Seen::Texture(_)));
                     let (u, h) = inner.count(Some(index), &old, false);
                     unordered_changed |= u;
                     hulls_changed |= h;
@@ -1147,7 +1151,9 @@ impl Viewed {
                         })
                         .0 += 1;
                     joined.insert(index, key);
+                    buffers += 1;
                 } else {
+                    textures += u64::from(matches!(entry, Seen::Texture(_)));
                     let (u, h) = inner.count(Some(index), &entry, true);
                     unordered_changed |= u;
                     hulls_changed |= h;
@@ -1155,6 +1161,8 @@ impl Viewed {
                 inner.slots.insert(index, entry);
             }
         }
+        let applying = std::time::Instant::now();
+        let ranges = net.values().filter(|(d, _)| *d != 0).count() as u64;
         for (key, (d, shadow)) in &net {
             if *d > 0 {
                 let (u, h) = inner.count_range(*key, shadow, *d);
@@ -1181,6 +1189,14 @@ impl Viewed {
             && let Some(fast) = &self.fast
         {
             fast.invalidate();
+        }
+        {
+            use crate::descriptor::{SyncStat as S, sync_stat};
+            sync_stat(S::ViewedLoopUs, (applying - looping).as_micros() as u64);
+            sync_stat(S::ViewedApplyUs, applying.elapsed().as_micros() as u64);
+            sync_stat(S::ViewedBuffers, buffers);
+            sync_stat(S::ViewedTextures, textures);
+            sync_stat(S::ViewedRanges, ranges);
         }
     }
 

@@ -336,7 +336,7 @@ static STEPS: [std::sync::atomic::AtomicU64; 2 * STEP_NAMES.len()] =
 /// frame has ~75,000 of them).
 const SAMPLE_EVERY: u64 = 16;
 
-const STEP_NAMES: [&str; 8] = [
+const STEP_NAMES: [&str; 9] = [
     "title copies and fills",
     "refreshes asked",
     "table slots",
@@ -345,11 +345,12 @@ const STEP_NAMES: [&str; 8] = [
     "table textures",
     "heap scans (bindless)",
     "page tables (title memory)",
+    "table slot runs (refreshed under the heap's lock)",
 ];
 
 /// Whether list-step kind `kind` is one of the many sampled ones.
 fn sampled(kind: usize) -> bool {
-    kind == 1 || kind == 2
+    kind == 1 || kind == 2 || kind == 8
 }
 
 /// Notes a list step when dropped (each arm of `run_deferred` ends its own way).
@@ -5741,6 +5742,7 @@ impl HostList {
             batch: &mut Batch,
         ) {
             if let Some((viewed, indices)) = run.take() {
+                let _step = StepTimer::start(8);
                 crate::bindless::refresh_slots(viewed, &indices, |s, a, l| batch.add(s, a, l));
             }
         }
@@ -7391,7 +7393,7 @@ impl Meter {
                     })
                     .collect();
                 tracing::info!(
-                    "host list steps per frame (refreshes and slots timed one in {SAMPLE_EVERY}; the rest \
+                    "host list steps per frame (refreshes, slots and slot runs timed one in {SAMPLE_EVERY}; the rest \
                      of the phase is the loop and the steps' bookkeeping): {}",
                     parts.join(", ")
                 );
