@@ -522,7 +522,14 @@ pub struct UserData {
 ///   active lane of its own 32 lanes;
 /// - `reads` (or `1`/`all`, with `enter`): in a program already in halves,
 ///   it reads its own half's first active lane, with no exchange between
-///   the halves.
+///   the halves. The halves' own barriers assume both agree on the value:
+///   on an M1 Max a run with `reads` alone hung the GPU while loading.
+///
+/// `enter` keeps a program out of halves altogether, so only the console
+/// program's own barriers remain, which it places under conditions the same
+/// in the whole group. On an M1 Max (Series X, standing in the world) it
+/// kept 29 programs out of halves, the batch culling ones among them, and
+/// took the GPU time of a frame from 352 to 269 ms.
 ///
 /// That is the console's value only where it is the same in both halves
 /// (the commonest case: a reciprocal or other value made in VALU from

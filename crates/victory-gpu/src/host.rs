@@ -382,10 +382,27 @@ impl PhaseClock {
     /// Counts the time since the last lap as `phase`'s.
     fn lap(&mut self, phase: Phase) {
         let now = std::time::Instant::now();
-        PREP_PHASES[phase as usize]
-            .fetch_add((now - self.0).as_micros() as u64, Ordering::Relaxed);
+        let us = (now - self.0).as_micros() as u64;
+        PREP_PHASES[phase as usize].fetch_add(us, Ordering::Relaxed);
+        FLIGHT_PHASES.with(|p| {
+            let mut a = p.get();
+            a[phase as usize] += us;
+            p.set(a);
+        });
         self.0 = now;
     }
+}
+
+thread_local! {
+    /// This thread's preparing microseconds by [`Phase`] since
+    /// [`take_flight_phases`] (`VICTORY_FLIGHT_TRACE=1`).
+    static FLIGHT_PHASES: std::cell::Cell<[u64; PHASE_NAMES.len()]> =
+        const { std::cell::Cell::new([0; PHASE_NAMES.len()]) };
+}
+
+/// This thread's preparing microseconds by phase since the last call.
+pub(crate) fn take_flight_phases() -> [u64; PHASE_NAMES.len()] {
+    FLIGHT_PHASES.with(|p| p.replace([0; PHASE_NAMES.len()]))
 }
 
 /// The phases' microseconds since the last call, by [`PHASE_NAMES`].

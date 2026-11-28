@@ -10,6 +10,7 @@
 //! `crate::watch`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::{Acquire, Relaxed, Release}};
 use std::sync::{Arc, Mutex};
 
@@ -86,8 +87,38 @@ struct ActiveWord {
     entries: Vec<(u8, u32)>,
 }
 
+/// A multiply-and-fold hasher for the batch's range keys and the slot map
+/// (addresses, offsets and slot numbers: no adversary, and SipHash cost
+/// more than the lookups it fed).
+#[derive(Default)]
+struct FoldHasher(u64);
+
+impl std::hash::Hasher for FoldHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(u64::from(b));
+        }
+    }
+    fn write_u64(&mut self, x: u64) {
+        let m = u128::from(self.0 ^ x) * 0x9e37_79b9_7f4a_7c15;
+        self.0 = (m as u64) ^ ((m >> 64) as u64);
+    }
+    fn write_u32(&mut self, x: u32) {
+        self.write_u64(u64::from(x));
+    }
+    fn write_usize(&mut self, x: usize) {
+        self.write_u64(x as u64);
+    }
+    fn write_u8(&mut self, x: u8) {
+        self.write_u64(u64::from(x));
+    }
+}
+
 struct Inner {
-    slots: HashMap<u32, Seen>,
+    slots: HashMap<u32, Seen, BuildHasherDefault<FoldHasher>>,
     ranges: BTreeMap<Range, (u32, Arc<Shadow>)>,
     /// Per title texture, the slots viewing it: an entry names its slots, so
     /// releasing the texture ([`Inner::forget`]) does not search the heap.
@@ -124,7 +155,7 @@ impl Default for Inner {
 impl Inner {
     fn new(fast: bool) -> Self {
         Inner {
-            slots: HashMap::new(),
+            slots: HashMap::default(),
             ranges: BTreeMap::new(),
             textures: BTreeMap::new(),
             hulls: Vec::new(),
@@ -240,81 +271,10 @@ impl Inner {
     /// Updates range, hull, texture, and (when enabled) UAV-index counts for
     /// one slot transition. Returns `(unordered_changed, hulls_changed)`.
     fn count(&mut self, index: u32, seen: &Seen, add: bool) -> (bool, bool) {
-        let step = |n: &mut u32| if add { *n += 1 } else { *n = n.saturating_sub(1) };
-        let mut unordered_changed = false;
-        let mut hulls_changed = false;
         match seen {
             Seen::Buffer(shadow, address, len, uav) => {
                 let key = (Arc::as_ptr(shadow) as usize, *address, address + len, *uav);
-                let e = self.ranges.entry(key).or_insert_with(|| (0, shadow.clone()));
-                let was = e.0;
-                step(&mut e.0);
-                let now = e.0;
-                if now == 0 {
-                    self.ranges.remove(&key);
-                }
-                if (was == 0) != (now == 0)
-                    && key.3
-                    && let Some(unordered) = &mut self.unordered
-                {
-                    if now > 0 {
-                        unordered.insert(key, shadow);
-                    } else {
-                        unordered.remove(&key);
-                    }
-                    unordered_changed = true;
-                }
-                // A range came or went: its copy's hull may change.
-                if (was == 0) != (now == 0) {
-                    let hull_key = (key.0, key.3);
-                    let ends = self
-                        .ends
-                        .entry(hull_key)
-                        .or_insert_with(|| (shadow.clone(), BTreeMap::new(), BTreeMap::new()));
-                    tally(&mut ends.1, key.1, now > 0);
-                    tally(&mut ends.2, key.2, now > 0);
-                    let hull = match (ends.1.first_key_value(), ends.2.last_key_value()) {
-                        (Some((&from, _)), Some((&to, _))) => Some((from, to - from)),
-                        _ => None,
-                    };
-                    match hull {
-                        Some((from, len)) => {
-                            if let Some(&idx) = self.hull_pos.get(&hull_key) {
-                                let hull = &mut self.hulls[idx as usize];
-                                // The refresh pass uses the hull, not its
-                                // individual ranges. Interior changes still
-                                // update the UAV index above.
-                                if (hull.1, hull.2) != (from, len) {
-                                    (hull.1, hull.2) = (from, len);
-                                    hulls_changed = true;
-                                }
-                            } else {
-                                let bit = shadow.dirty_bit();
-                                let idx = self.hulls.len() as u32;
-                                self.hulls.push((shadow.clone(), from, len, key.3, bit));
-                                self.hull_pos.insert(hull_key, idx);
-                                self.insert_hull_index(idx, bit);
-                                hulls_changed = true;
-                            }
-                        }
-                        None => {
-                            self.ends.remove(&hull_key);
-                            if let Some(idx) = self.hull_pos.remove(&hull_key) {
-                                let last_idx = (self.hulls.len() - 1) as u32;
-                                let removed = self.hulls.swap_remove(idx as usize);
-                                self.remove_hull_index(idx, removed.4);
-                                if idx != last_idx {
-                                    let moved = &self.hulls[idx as usize];
-                                    let moved_key = (Arc::as_ptr(&moved.0) as usize, moved.3);
-                                    let moved_bit = moved.4;
-                                    self.hull_pos.insert(moved_key, idx);
-                                    self.move_hull_index(moved_bit, last_idx, idx);
-                                }
-                                hulls_changed = true;
-                            }
-                        }
-                    }
-                }
+                self.count_range(key, shadow, if add { 1 } else { -1 })
             }
             Seen::Texture(r) => {
                 let slots = self.textures.entry(*r).or_default();
@@ -326,8 +286,89 @@ impl Inner {
                 if slots.is_empty() {
                     self.textures.remove(r);
                 }
+                (false, false)
             }
-            Seen::Left(_) => {}
+            Seen::Left(_) => (false, false),
+        }
+    }
+
+    /// Adds `delta` slots viewing buffer range `key` of `shadow` (fewer where
+    /// negative, never below none): the range, its copy's hull and (when
+    /// enabled) the UAV index follow where it came or went. Returns
+    /// `(unordered_changed, hulls_changed)`. [`Viewed::set_batch`] passes a
+    /// batch's net change of each range at once, so a range one slot of the
+    /// batch drops and another takes costs nothing.
+    fn count_range(&mut self, key: Range, shadow: &Arc<Shadow>, delta: i64) -> (bool, bool) {
+        let mut unordered_changed = false;
+        let mut hulls_changed = false;
+        let e = self.ranges.entry(key).or_insert_with(|| (0, shadow.clone()));
+        let was = e.0;
+        e.0 = (i64::from(was) + delta).clamp(0, i64::from(u32::MAX)) as u32;
+        let now = e.0;
+        if now == 0 {
+            self.ranges.remove(&key);
+        }
+        if (was == 0) != (now == 0)
+            && key.3
+            && let Some(unordered) = &mut self.unordered
+        {
+            if now > 0 {
+                unordered.insert(key, shadow);
+            } else {
+                unordered.remove(&key);
+            }
+            unordered_changed = true;
+        }
+        // A range came or went: its copy's hull may change.
+        if (was == 0) != (now == 0) {
+            let hull_key = (key.0, key.3);
+            let ends = self
+                .ends
+                .entry(hull_key)
+                .or_insert_with(|| (shadow.clone(), BTreeMap::new(), BTreeMap::new()));
+            tally(&mut ends.1, key.1, now > 0);
+            tally(&mut ends.2, key.2, now > 0);
+            let hull = match (ends.1.first_key_value(), ends.2.last_key_value()) {
+                (Some((&from, _)), Some((&to, _))) => Some((from, to - from)),
+                _ => None,
+            };
+            match hull {
+                Some((from, len)) => {
+                    if let Some(&idx) = self.hull_pos.get(&hull_key) {
+                        let hull = &mut self.hulls[idx as usize];
+                        // The refresh pass uses the hull, not its
+                        // individual ranges. Interior changes still
+                        // update the UAV index above.
+                        if (hull.1, hull.2) != (from, len) {
+                            (hull.1, hull.2) = (from, len);
+                            hulls_changed = true;
+                        }
+                    } else {
+                        let bit = shadow.dirty_bit();
+                        let idx = self.hulls.len() as u32;
+                        self.hulls.push((shadow.clone(), from, len, key.3, bit));
+                        self.hull_pos.insert(hull_key, idx);
+                        self.insert_hull_index(idx, bit);
+                        hulls_changed = true;
+                    }
+                }
+                None => {
+                    self.ends.remove(&hull_key);
+                    if let Some(idx) = self.hull_pos.remove(&hull_key) {
+                        let last_idx = (self.hulls.len() - 1) as u32;
+                        let removed = self.hulls.swap_remove(idx as usize);
+                        self.remove_hull_index(idx, removed.4);
+                        if idx != last_idx {
+                            let moved = &self.hulls[idx as usize];
+                            let moved_key = (Arc::as_ptr(&moved.0) as usize, moved.3);
+                            let moved_bit = moved.4;
+                            self.hull_pos.insert(moved_key, idx);
+                            self.move_hull_index(moved_bit, last_idx, idx);
+                        }
+                        hulls_changed = true;
+                    }
+                }
+            }
         }
         (unordered_changed, hulls_changed)
     }
@@ -406,17 +447,44 @@ impl Viewed {
         }
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let (mut unordered_changed, mut hulls_changed) = (false, false);
+        // Buffer ranges by their net change over the batch: the title
+        // rewrites heap slots in runs, one slot dropping a range another
+        // takes (in the world ~22,000 slots a frame made null and ~14,000
+        // made again), and each change on its own was a walk of the range
+        // tree and of its copy's ends. Applied at the end, the counts are
+        // those one slot at a time would leave.
+        let mut net: HashMap<Range, (i64, Arc<Shadow>), BuildHasherDefault<FoldHasher>> =
+            HashMap::with_capacity_and_hasher(entries.len().min(1024), Default::default());
+        let mut note = |seen: &Seen, d: i64| match seen {
+            Seen::Buffer(shadow, address, len, uav) => {
+                let key = (Arc::as_ptr(shadow) as usize, *address, address + len, *uav);
+                net.entry(key).or_insert_with(|| (0, shadow.clone())).0 += d;
+                true
+            }
+            _ => false,
+        };
         for (index, entry) in entries {
-            if let Some(old) = inner.slots.remove(&index) {
+            if let Some(old) = inner.slots.remove(&index)
+                && !note(&old, -1)
+            {
                 let (u, h) = inner.count(index, &old, false);
                 unordered_changed |= u;
                 hulls_changed |= h;
             }
             if let Some(entry) = entry {
-                let (u, h) = inner.count(index, &entry, true);
+                if !note(&entry, 1) {
+                    let (u, h) = inner.count(index, &entry, true);
+                    unordered_changed |= u;
+                    hulls_changed |= h;
+                }
+                inner.slots.insert(index, entry);
+            }
+        }
+        for (key, (d, shadow)) in net {
+            if d != 0 {
+                let (u, h) = inner.count_range(key, &shadow, d);
                 unordered_changed |= u;
                 hulls_changed |= h;
-                inner.slots.insert(index, entry);
             }
         }
         if hulls_changed {
@@ -1308,6 +1376,135 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(inner.textures.keys().copied().collect::<Vec<_>>(), [0x20]);
         inner.forget(0x30);
         assert_eq!(inner.slots.len(), 2);
+    }
+
+    /// A batch (`set_batch`, which counts each buffer range once by its net
+    /// change) leaves every count, end, hull, texture slot and UAV range
+    /// that the same updates one slot at a time (`set`) leave: random
+    /// batches over overlapping ranges of three buffers, unordered and
+    /// shader views, unmade views, clears, a slot written twice in a batch,
+    /// and ranges one slot drops while another takes them.
+    #[test]
+    fn set_batch_leaves_what_one_slot_at_a_time_leaves() {
+        let Some(_host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let bufs = [
+            resource(1, 0x1000, 1, 0, 1),
+            resource(1, 0x1000, 1, 0, 1),
+            resource(1, 0x1000, 1, 0, 1),
+        ];
+        for &buf in &bufs {
+            let (ptr, size) = crate::resource::buffer_bytes(buf).unwrap();
+            assert!(crate::shadow::find(ptr as u64, size).is_some());
+        }
+        let uav = |buf: This, first: u32, count: u32| {
+            View::Unordered(buf as usize, 0, Some([39, 1, first, 0, count, 0, 0, 0, 1, 0]))
+        };
+        let srv = |buf: This, first: u32, count: u32| {
+            View::Shader(buf as usize, Some([39, 1, 0x1688, first, 0, 0, count, 0, 1, 0]))
+        };
+        let views = [
+            uav(bufs[0], 0, 64),
+            uav(bufs[0], 32, 64),
+            uav(bufs[1], 16, 32),
+            uav(bufs[2], 32, 48),
+            srv(bufs[0], 0, 64),
+            srv(bufs[1], 0, 64),
+            srv(bufs[1], 8, 16),
+            srv(bufs[2], 100, 4),
+        ];
+        // Everything the counts decide, in an order of its own.
+        type State = (
+            Vec<(Range, u32)>,
+            Vec<((usize, bool), Vec<(u64, u32)>, Vec<(u64, u32)>)>,
+            Vec<(usize, u64, u64, bool)>,
+            Vec<(usize, Vec<u32>)>,
+            Vec<(u32, String)>,
+            Vec<(usize, usize, usize)>,
+        );
+        let state = |v: &Viewed| -> State {
+            let mut writes = Vec::new();
+            widened_writes_into(v, &mut writes);
+            let mut writes: Vec<_> =
+                writes.iter().map(|(s, a, l)| (Arc::as_ptr(s) as usize, *a, *l)).collect();
+            writes.sort_unstable();
+            let i = v.inner.lock().unwrap();
+            let ranges = i.ranges.iter().map(|(k, (n, _))| (*k, *n)).collect();
+            let mut ends: Vec<_> = i
+                .ends
+                .iter()
+                .map(|(k, (_, a, b))| {
+                    (*k, a.iter().map(|(x, n)| (*x, *n)).collect(), b.iter().map(|(x, n)| (*x, *n)).collect())
+                })
+                .collect();
+            ends.sort_unstable();
+            let mut hulls: Vec<_> =
+                i.hulls.iter().map(|h| (Arc::as_ptr(&h.0) as usize, h.1, h.2, h.3)).collect();
+            hulls.sort_unstable();
+            for (k, &idx) in &i.hull_pos {
+                let h = &i.hulls[idx as usize];
+                assert_eq!(*k, (Arc::as_ptr(&h.0) as usize, h.3), "hull_pos names its hull");
+            }
+            let textures = i.textures.iter().map(|(r, s)| (*r, s.iter().copied().collect())).collect();
+            let mut slots: Vec<_> = i
+                .slots
+                .iter()
+                .map(|(k, seen)| {
+                    let what = match seen {
+                        Seen::Buffer(s, a, l, u) => format!("b {:x} {a} {l} {u}", Arc::as_ptr(s) as usize),
+                        Seen::Texture(r) => format!("t {r}"),
+                        Seen::Left(k) => format!("l {k:?}"),
+                    };
+                    (*k, what)
+                })
+                .collect();
+            slots.sort_unstable();
+            (ranges, ends, hulls, textures, slots, writes)
+        };
+        for fast in [false, true] {
+            let batched = Viewed::new(fast);
+            let single = Viewed::new(fast);
+            let mut rng = 0x2545_F491_4F6C_DD1Du64;
+            let mut next = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            for round in 0..300 {
+                let n = 1 + (next() % 40) as usize;
+                let ops: Vec<(u32, Option<usize>, bool)> = (0..n)
+                    .map(|_| {
+                        let slot = (next() % 48) as u32;
+                        let view = (!next().is_multiple_of(4)).then(|| (next() % views.len() as u64) as usize);
+                        (slot, view, !next().is_multiple_of(7))
+                    })
+                    .collect();
+                let refs: Vec<(u32, Option<&View>, bool)> =
+                    ops.iter().map(|&(s, v, m)| (s, v.map(|i| &views[i]), m)).collect();
+                batched.set_batch(&refs);
+                for &(s, v, m) in &refs {
+                    single.set(s, v, m);
+                }
+                assert!(state(&batched) == state(&single), "fast={fast} round {round}: batch differs from single sets");
+                if fast {
+                    let norm = |w: Option<Snapshot<Shadow>>| {
+                        let mut v: Vec<_> = w
+                            .expect("fast index")
+                            .iter()
+                            .map(|(s, a, l)| (Arc::as_ptr(s) as usize, *a, *l))
+                            .collect();
+                        v.sort_unstable();
+                        v
+                    };
+                    assert_eq!(norm(unordered_writes(&batched)), norm(unordered_writes(&single)), "round {round}");
+                }
+            }
+        }
+        for buf in bufs {
+            crate::object::release_ref(buf);
+        }
     }
 
     /// With `VICTORY_CENSUS_FAST=1`, `unordered_writes` matches the standard

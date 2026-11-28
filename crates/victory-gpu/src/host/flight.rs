@@ -322,6 +322,56 @@ fn idle_split(
     )
 }
 
+/// `VICTORY_FLIGHT_TRACE=1` (diagnostics, off by default): one line per
+/// host submission, so a frame's preparing can be seen submission by
+/// submission (where in the frame the heavy ones are).
+pub(crate) fn flight_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_FLIGHT_TRACE"))
+}
+
+/// The present count and the submissions since it, for [`trace_flight`].
+static TRACE_AT: std::sync::Mutex<(u64, u32)> = std::sync::Mutex::new((0, 0));
+
+/// Logs a launched flight ([`flight_trace`]): its place since the last
+/// present, the wait for the one before it, its preparing by phase and the
+/// GPU's idle time before it. This thread's phase times are taken either way.
+fn trace_flight(
+    fence: u64,
+    landing: std::time::Duration,
+    preparing: std::time::Duration,
+    (unasked, idle_preparing): (std::time::Duration, std::time::Duration),
+) {
+    let phases = super::take_flight_phases();
+    if !flight_trace() {
+        return;
+    }
+    let presented = crate::queue::presented();
+    let index = {
+        let mut at = TRACE_AT.lock().unwrap_or_else(|e| e.into_inner());
+        if at.0 != presented {
+            *at = (presented, 0);
+        }
+        at.1 += 1;
+        at.1
+    };
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+    let p: Vec<String> = phases.iter().map(|&us| format!("{:.1}", us as f64 / 1e3)).collect();
+    tracing::info!(
+        frame = presented,
+        index,
+        fence,
+        "flight trace: landing {:.1} ms, preparing {:.1} ms (evict/sync/uploads/steps/preludes/refresh/early/other {}), \
+         GPU idle before it {:.1} ms (nothing to run {:.1}, preparing {:.1})",
+        ms(landing),
+        ms(preparing),
+        p.join("/"),
+        ms(unasked + idle_preparing),
+        ms(unasked),
+        ms(idle_preparing),
+    );
+}
+
 /// The flights launched since the last call, and per [`Step`] their
 /// microseconds, cleared (the frame report).
 pub(crate) fn take_flight_times() -> (u64, [u64; 5]) {
@@ -1107,11 +1157,14 @@ impl Host {
         {
             let mut state = self.flight.lock().unwrap_or_else(|e| e.into_inner());
             debug_assert!(state.flights.len() < 2 && (state.flights.is_empty() || still_behind));
+            let mut idle = (std::time::Duration::ZERO, std::time::Duration::ZERO);
             if let Some(free) = state.free_since.take() {
                 let (unasked, preparing) = idle_split(free, asked, launched);
                 add_step(Step::IdleUnasked, unasked);
                 add_step(Step::IdlePreparing, preparing);
+                idle = (unasked, preparing);
             }
+            trace_flight(fence_value, landed - asked, launched - landed, idle);
             state.flights.push_back(flight);
             if !state.worker_started {
                 state.worker_started = true;
@@ -1233,6 +1286,14 @@ impl Host {
             std::time::Instant::now()
         };
         let gpu_duration = gpu_done.saturating_duration_since(flight.launched);
+        if flight_trace() {
+            tracing::info!(
+                fence = flight.fence_value,
+                lists = flight.segments.len(),
+                "flight trace: landed after {:.1} ms on the GPU",
+                gpu_duration.as_secs_f64() * 1e3
+            );
+        }
         #[cfg(test)]
         super::tests::native_call_group(flight.waited);
         {
