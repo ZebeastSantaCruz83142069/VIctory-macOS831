@@ -4681,6 +4681,7 @@ fn a_mask_behind_predicated_guards_meets() {
             let io = io::raise(&p, &native).unwrap();
             let r = lower(&Parts {
                 halves_rendezvous: rendezvous,
+                half_loops: false,
                 native: &native,
                 p: &p,
                 st: &st,
