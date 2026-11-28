@@ -6718,7 +6718,7 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
 
 #[cfg(test)]
 mod title_copies {
-    use super::{copy_mapped, write_mapped};
+    use super::{copy_mapped, read, write_mapped};
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
         VirtualAlloc, VirtualFree, VirtualProtect,
@@ -6844,6 +6844,58 @@ mod title_copies {
             assert_eq!(byte, expected, "byte {i:#x}");
         }
         release(base);
+    }
+
+    /// Timing probe, not a test (run by hand in the bottle): how fast this
+    /// process copies and compares memory under Wine and Rosetta, the ways
+    /// preparing does: `memcpy` (Rust's `copy_nonoverlapping`),
+    /// `ReadProcessMemory` whole and in 64 KiB pieces ([`read`], refreshes),
+    /// and 16-byte SSE2 loads and stores. 64 MiB each, best of four. On an
+    /// M1 Max (CrossOver, D3DMetal 4.0b3, 2026-11-28): 26.8, 25.8, 16.7 and
+    /// 27.9 GB/s, so the world's refreshes (46 MB in ~12 ms of moves a
+    /// frame) are slow for their many small runs, not for the copying.
+    #[test]
+    #[ignore = "timing probe; run by hand"]
+    fn memory_copy_speeds_timing() {
+        const N: usize = 64 << 20;
+        let src: Vec<u8> = (0..N).map(|i| (i * 7) as u8).collect();
+        let mut dst = vec![0u8; N];
+        let gbs = |d: std::time::Duration| N as f64 / d.as_secs_f64() / 1e9;
+        let best = |f: &mut dyn FnMut()| {
+            (0..4)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    f();
+                    t.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        // SAFETY: two distinct N-byte buffers.
+        let memcpy = best(&mut || unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr(), N) });
+        let whole = best(&mut || assert!(read(src.as_ptr(), dst.as_mut_ptr(), N)));
+        let pieces = best(&mut || {
+            for at in (0..N).step_by(64 << 10) {
+                assert!(read(src.as_ptr().wrapping_add(at), dst.as_mut_ptr().wrapping_add(at), 64 << 10));
+            }
+        });
+        let sse = best(&mut || {
+            use std::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_storeu_si128};
+            // SAFETY: N is a multiple of 16; both buffers hold N bytes.
+            unsafe {
+                let (s, d) = (src.as_ptr().cast::<__m128i>(), dst.as_mut_ptr().cast::<__m128i>());
+                for i in 0..N / 16 {
+                    _mm_storeu_si128(d.add(i), _mm_loadu_si128(s.add(i)));
+                }
+            }
+        });
+        eprintln!(
+            "GB/s: memcpy {:.1}, ReadProcessMemory whole {:.1}, in 64 KiB pieces {:.1}, SSE2 loop {:.1}",
+            gbs(memcpy),
+            gbs(whole),
+            gbs(pieces),
+            gbs(sse)
+        );
     }
 
     #[test]
