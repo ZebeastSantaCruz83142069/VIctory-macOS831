@@ -1997,6 +1997,11 @@ pub(crate) fn generation() -> u64 {
 /// `BUFFERS`, `ALIASED`, or `LOOSE` (while holding that table's write lock).
 static LOOKUP_EPOCH: AtomicU64 = AtomicU64::new(1);
 
+/// Validate a pre-resolved view against the same topology as the lookup cache.
+pub(crate) fn lookup_epoch() -> u64 {
+    LOOKUP_EPOCH.load(Ordering::Acquire)
+}
+
 fn lookup_changed() {
     LOOKUP_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
@@ -2029,15 +2034,16 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 pub(crate) fn unregister(resource: usize, start: u64) {
     let removed = {
         let mut map = buffers();
-        map.remove(&(start, resource))
-    };
-    if let Some(entry) = removed {
-        if let Some(shadow) = entry.shadow {
-            crate::bindless::forget_shadow(Arc::as_ptr(&shadow) as usize);
-            changed();
-        } else {
-            lookup_changed();
+        let removed = map.remove(&(start, resource));
+        match &removed {
+            Some(Entry { shadow: Some(_), .. }) => changed(),
+            Some(_) => lookup_changed(),
+            None => {}
         }
+        removed
+    };
+    if let Some(shadow) = removed.and_then(|entry| entry.shadow) {
+        crate::bindless::forget_shadow(Arc::as_ptr(&shadow) as usize);
     }
 }
 
@@ -2099,12 +2105,12 @@ pub(crate) fn unregister_aliased(start: u64) -> bool {
         let removed = map.remove(&start);
         if removed.is_some() {
             ALIASED_COUNT.fetch_sub(1, Ordering::Release);
+            changed();
         }
         removed
     };
     if let Some(shadow) = removed {
         crate::bindless::forget_shadow(Arc::as_ptr(&shadow) as usize);
-        changed();
         true
     } else {
         false
@@ -2314,7 +2320,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         shadow.touch();
         return Some(shadow);
     }
-    let epoch = LOOKUP_EPOCH.load(Ordering::Acquire);
+    let epoch = lookup_epoch();
     let hit = LOOKUP_CACHE.with(|cell| {
         let mut guard = cell.borrow_mut();
         guard.as_mut().and_then(|cache| cache.get(epoch, address, end))

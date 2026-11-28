@@ -7426,8 +7426,8 @@ fn advance_retired(done_submission: u64) {
     release_later(Box::new(ready));
 }
 
-/// Batched [`retire`] under one hold of the retired-resources lock.
-pub(crate) fn retire_all(resources: Vec<ID3D12Resource>) {
+/// Batched [`retire_any`] under one hold of the retired-resources lock.
+pub(crate) fn retire_all<T: Send + 'static>(resources: Vec<T>) {
     if resources.is_empty() {
         return;
     }
