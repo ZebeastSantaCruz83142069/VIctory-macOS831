@@ -316,6 +316,9 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     let cap_barriers = victory_shader::emit::cap_barriers_refused();
     let limits = options.thread_limits;
     let half_loops = options.host_wave32 && options.half_loops;
+    // `VICTORY_FIRST_LANE_PER_HALF=1` (measurement only) changes programs
+    // only where they run in halves.
+    let per_half = options.host_wave32 && victory_shader::emit::first_lane_per_half();
     if !locks
         && !bias
         && !narrow
@@ -325,10 +328,11 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         && !cap_barriers
         && !limits
         && !half_loops
+        && !per_half
     {
         return build();
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 4096] = [const { OnceLock::new() }; 4096];
+    static BUILDS: [OnceLock<[u8; 32]>; 8192] = [const { OnceLock::new() }; 8192];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
@@ -340,7 +344,8 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         | usize::from(cap_barriers) << 8
         | usize::from(limits) << 9
         | usize::from(racy) << 10
-        | usize::from(half_loops) << 11;
+        | usize::from(half_loops) << 11
+        | usize::from(per_half) << 12;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
@@ -358,6 +363,10 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         }
         if half_loops {
             h.update(b"half loops");
+        }
+        if per_half {
+            h.update(b"first lane per half");
+            h.update(&[victory_shader::emit::first_lane_mode()]);
         }
         if bias {
             h.update(b"bias as gradients");
@@ -424,8 +433,22 @@ pub(crate) fn host_shader_with(
     let mut options = options;
     // One program at a time, if the switch lists hashes.
     options.uav_size_level0 = uav_size_level0_for(container);
-    let translate =
-        |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| {
+        let _ = victory_shader::emit::take_kept_out_of_halves();
+        let r = victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+        // `VICTORY_FIRST_LANE_PER_HALF` (measurement only): which programs
+        // its `enter` took out of halves, by the hash the logs use.
+        if victory_shader::emit::take_kept_out_of_halves() > 0 {
+            let hash = blake3::hash(c);
+            let hash: String = hash.as_bytes()[..8].iter().map(|b| format!("{b:02x}")).collect();
+            tracing::info!(
+                hash,
+                translated = r.is_ok(),
+                "program kept out of halves for its first-lane reads (VICTORY_FIRST_LANE_PER_HALF)"
+            );
+        }
+        r
+    };
     let build = translation_build(options);
     match CACHE.get() {
         Some(cache) => cached(cache, build, container, translate),
