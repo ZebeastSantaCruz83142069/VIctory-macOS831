@@ -286,6 +286,7 @@ fn wake_submit() {
 
 #[cfg(windows)]
 fn submit_worker() {
+    crate::priority::raise_this_thread();
     loop {
         {
             let mut work = SUBMIT_WORK.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -543,6 +544,8 @@ pub(crate) fn drain_submit(why: Why) {
         return;
     }
     name_drain_thread();
+    // The title thread prepares at VIctory's priority (`VICTORY_PREP_PRIORITY`).
+    let _raised = crate::priority::Raised::now();
     // The calling thread waits here for the submit worker's turn and the
     // flight in the air, then runs what is left: counted as `why`'s.
     let _drain = lock_timed(&SUBMIT_DRAIN, &BLOCKED_US[why as usize][0]);

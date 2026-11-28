@@ -1501,6 +1501,7 @@ fn spawn_flight_worker() {
     let _ = std::thread::Builder::new()
         .name("victory-flight".into())
         .spawn(|| {
+            crate::priority::raise_this_thread();
             let Some(host) = super::host() else {
                 return;
             };

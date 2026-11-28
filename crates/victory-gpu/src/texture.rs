@@ -645,6 +645,7 @@ fn workers() -> Option<&'static rayon::ThreadPool> {
             match rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .thread_name(|i| format!("texture worker {i}"))
+                .start_handler(|_| crate::priority::raise_this_thread())
                 .build()
             {
                 Ok(pool) => Some(pool),
