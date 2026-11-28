@@ -168,7 +168,7 @@ impl Viewed {
             inner.walk = None;
         } else if inner.walk.is_none() {
             let mut walk = Walk::default();
-            for &r in inner.textures.keys() {
+            for r in inner.viewed_textures() {
                 walk.add(r);
             }
             inner.walk = Some(walk);
@@ -530,7 +530,12 @@ struct Inner {
     ranges: RangesMap<Range, (u32, Arc<Shadow>)>,
     /// Per title texture, the slots viewing it: an entry names its slots, so
     /// releasing the texture ([`Inner::forget`]) does not search the heap.
-    textures: BTreeMap<usize, BTreeSet<u32>>,
+    /// A texture whose last slot let go keeps its (empty) entry until it is
+    /// released: the title makes ~21,000 slots a frame null and many of them
+    /// view the same texture again soon after, and each time the entry and
+    /// its set went and were made again. Readers pass empty entries by
+    /// ([`Inner::viewed_textures`]).
+    textures: HashMap<usize, BTreeSet<u32>, Hashing>,
     /// Per `(copy, uav)` disjoint refresh sub-intervals (`CopySpans`), kept
     /// incrementally and coalesced lazily only when read. Stored densely so
     /// `refresh` indexes directly without hashing.
@@ -704,7 +709,7 @@ impl Inner {
         Inner {
             slots: SlotMap::default(),
             ranges: RangesMap::new(quick_maps),
-            textures: BTreeMap::new(),
+            textures: HashMap::with_hasher(Hashing::Fold),
             hulls: Vec::new(),
             hull_pos: HashMap::with_hasher(Hashing::new(quick_maps)),
             active_words: Vec::new(),
@@ -933,9 +938,9 @@ impl Inner {
                     } else {
                         slots.remove(&index);
                     }
+                    // An emptied entry stays (see `textures`).
                     if slots.is_empty() {
-                        self.textures.remove(r);
-                        if let Some(walk) = &mut self.walk {
+                        if !new && let Some(walk) = &mut self.walk {
                             walk.remove(*r);
                         }
                     } else if new && let Some(walk) = &mut self.walk {
@@ -969,6 +974,11 @@ impl Inner {
             }
         }
         (unordered_changed, hulls_changed)
+    }
+
+    /// The textures some slot views (an emptied entry is no longer one).
+    fn viewed_textures(&self) -> impl Iterator<Item = usize> + '_ {
+        self.textures.iter().filter(|(_, slots)| !slots.is_empty()).map(|(&r, _)| r)
     }
 
     /// The title released the texture `resource`: the slots viewing it go.
@@ -1234,23 +1244,14 @@ impl Viewed {
     /// Snapshot of distinct title texture resources currently viewed by this
     /// heap, for the background heap worker.
     pub(crate) fn texture_resources(&self) -> Vec<usize> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .textures
-            .keys()
-            .copied()
-            .collect()
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.viewed_textures().collect()
     }
 
     /// Whether any title-written texture is currently viewed by this heap.
     pub(crate) fn has_textures(&self) -> bool {
-        !self
-            .inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .textures
-            .is_empty()
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.viewed_textures().next().is_some()
     }
 }
 
@@ -1423,7 +1424,7 @@ pub(crate) fn uploads(
                 }
                 continue;
             }
-            for &r in inner.textures.keys() {
+            for r in inner.viewed_textures() {
                 if !done.insert(r) {
                     continue;
                 }
@@ -1913,7 +1914,7 @@ pub(crate) fn log(frames: f64) {
              host copies of title memory: {} ({:.1} MB); hulls {:.1} MB ({span_count} spans, holes {:.1} MB), unordered {:.1} MB",
             inner.ranges.len(),
             bytes as f64 / 1e6,
-            inner.textures.len(),
+            inner.viewed_textures().count(),
             left.join(", "),
             placed.len(),
             all.len(),
@@ -2241,7 +2242,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(inner.slots.len(), 2);
         assert!(matches!(inner.slots.get(&1), Some(Seen::Texture(0x20))));
         assert!(matches!(inner.slots.get(&3), Some(Seen::Left(_))));
-        assert_eq!(inner.textures.keys().copied().collect::<Vec<_>>(), [0x20]);
+        assert_eq!(inner.viewed_textures().collect::<Vec<_>>(), [0x20]);
         inner.forget(0x30);
         assert_eq!(inner.slots.len(), 2);
     }
@@ -2346,7 +2347,13 @@ void main(uint3 id : SV_DispatchThreadID) {
                 assert_eq!(*k, (Arc::as_ptr(&h.shadow) as usize, h.uav), "hull_pos names its hull");
             }
             assert_eq!(i.hull_pos.len(), i.hulls.len(), "every copy's spans are named");
-            let textures = i.textures.iter().map(|(r, s)| (*r, s.iter().copied().collect())).collect();
+            let mut textures: Vec<(usize, Vec<u32>)> = i
+                .textures
+                .iter()
+                .filter(|(_, s)| !s.is_empty())
+                .map(|(r, s)| (*r, s.iter().copied().collect()))
+                .collect();
+            textures.sort_unstable();
             let mut slots: Vec<_> = i
                 .slots
                 .iter()
@@ -3404,7 +3411,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         // The title releases `b`.
         inner.forget(b);
         assert_eq!(walked(&inner), vec![c]);
-        assert_eq!(inner.textures.keys().copied().collect::<Vec<_>>(), vec![c]);
+        assert_eq!(inner.viewed_textures().collect::<Vec<_>>(), vec![c]);
         // Viewed again after it went: walked again.
         inner.count(Some(4), &Seen::Texture(a), true);
         assert_eq!(walked(&inner), vec![a, c]);
