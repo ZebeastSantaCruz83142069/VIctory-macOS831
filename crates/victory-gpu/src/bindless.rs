@@ -1108,7 +1108,7 @@ pub(crate) fn uploads(
     // thread in a new shot, and title threads setting views waited on the
     // lock meanwhile (run evict5).
     let mut work: Vec<(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)> = Vec::new();
-    let mut staged = std::collections::HashSet::new();
+    let mut staged = HashSet::with_hasher(Hashing::Fold);
     for (staging, copy) in textures {
         // A host copy wrote it in a submission made before this one (it
         // was not when the list was recorded).
@@ -1120,7 +1120,7 @@ pub(crate) fn uploads(
         }
     }
     let worker_on = crate::heap_worker::on();
-    let mut done = std::collections::HashSet::new();
+    let mut done = HashSet::with_hasher(Hashing::Fold);
     if !worker_on {
         for viewed in heaps {
             let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -1369,6 +1369,25 @@ pub(crate) fn refresh_slot(
     };
     if !shadow.clean() && !crate::watch::clean_bit(shadow.dirty_bit()) {
         add(shadow, *address as usize, *len as usize);
+    }
+}
+
+/// [`refresh_slot`] for each of `indices`, in their order, under one hold of
+/// the heap's lock: a world frame's lists read ~54,000 table slots, in runs
+/// of one heap.
+pub(crate) fn refresh_slots(
+    viewed: &Viewed,
+    indices: &[u32],
+    mut add: impl FnMut(&Arc<Shadow>, usize, usize),
+) {
+    let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+    for index in indices {
+        let Some(Seen::Buffer(shadow, address, len, _)) = inner.slots.get(index) else {
+            continue;
+        };
+        if !shadow.clean() && !crate::watch::clean_bit(shadow.dirty_bit()) {
+            add(shadow, *address as usize, *len as usize);
+        }
     }
 }
 
