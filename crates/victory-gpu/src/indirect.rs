@@ -255,6 +255,11 @@ pub(crate) fn take_groups() -> [u64; 8] {
 }
 static GROUPS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
+/// The work a host list's indirect executions may do (vertex instances,
+/// threads), as every clamp shader has it (`BUDGET`): past it, records run
+/// empty. One record costs at most half of it.
+pub(crate) const BUDGET: u32 = 1 << 27;
+
 /// The jobs of one group pass: a group of more goes on in another. The
 /// trace's long runs of clamped draws hold ~480 executions each (5 runs,
 /// 2,409 of a frame's 3,258 clamp/draw pairs). [`GROUP_SOURCE`] caps its
@@ -2725,6 +2730,63 @@ void main() {
         assert!(cut.clamp_cut_pays(), "a reset list is no longer a cut one");
         writer.reset();
         crate::shadow::unregister(addr as usize, addr);
+        assert_eq!(host.log_messages(), None);
+    }
+
+    /// Every clamp shader has the budget the frame line's figures are of
+    /// (`crate::host::take_budget_spent`), and caps one record's cost at
+    /// half of it: a draw's instances at 2^26 over its count, a dispatch's
+    /// groups at 2^20 of 64 threads.
+    #[test]
+    fn every_clamp_charges_the_budget_half_a_record_at_most() {
+        let budget = format!(
+            "static const uint BUDGET = 1u << {};",
+            super::BUDGET.trailing_zeros()
+        );
+        for source in [
+            super::SOURCE,
+            super::WORDS_SOURCE,
+            super::WORDS_1_SOURCE,
+            super::GROUP_SOURCE,
+        ] {
+            assert!(source.contains(&budget), "{budget}");
+            assert!(source.contains("(1u << 26) / max(count, 1u)"));
+            assert!(source.contains("GROUPS = 1u << 20"));
+        }
+        // A draw: count times instances; a dispatch: groups of 64 threads.
+        assert_eq!(1u32 << 26, super::BUDGET / 2);
+        assert_eq!((1u32 << 20) * 64, super::BUDGET / 2);
+    }
+
+    /// A host list whose executions spent more than half of its budget is
+    /// counted when it is reset, with the most a list spent: two dispatches
+    /// of 2^20 groups spend all of it.
+    #[test]
+    fn a_list_past_half_of_its_budget_is_counted() {
+        use super::*;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let (record, ptr) = host.shared_buffer(12).unwrap();
+        // SAFETY: our mapped buffer, written before the list runs; live.
+        let gpu = unsafe {
+            ptr.cast::<[u32; 3]>().write_volatile([1024, 1024, 1]);
+            record.GetGPUVirtualAddress()
+        };
+        let list = host.new_list().unwrap();
+        for _ in 0..2 {
+            let (out, _) = bound(&list, gpu, (2, 12, 1), None).unwrap();
+            list.note_inline_clamp();
+            done(&list, &out);
+        }
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(list.budget_used(), Some(BUDGET));
+        list.reset();
+        let [past_half, most] = crate::host::take_budget_spent();
+        assert!(past_half >= 1, "{past_half}");
+        assert_eq!(most, u64::from(BUDGET));
+        assert_eq!(list.budget_used(), Some(0), "cleared at the reset");
         assert_eq!(host.log_messages(), None);
     }
 

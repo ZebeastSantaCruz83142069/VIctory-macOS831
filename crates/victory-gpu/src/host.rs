@@ -279,6 +279,20 @@ pub(crate) fn take_work_switches() -> u64 {
     WORK_SWITCHES.swap(0, Ordering::Relaxed)
 }
 
+/// Host lists whose indirect executions spent more than half of their
+/// budget ([`crate::indirect::BUDGET`]) since the last frame-rate line, and
+/// the most one spent. No record costs more than half, so a list that spent
+/// half or less emptied none for the budget; one past half may have.
+static BUDGET_SPENT: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// [`BUDGET_SPENT`] since the last call: lists past half, the most spent.
+pub(crate) fn take_budget_spent() -> [u64; 2] {
+    BUDGET_SPENT
+        .each_ref()
+        .map(|n| n.swap(0, Ordering::Relaxed))
+}
+
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), then waiting for the GPU.
@@ -4933,6 +4947,20 @@ impl HostList {
     /// Resets hoisted clamp tracking after the list finishes running, keeping
     /// the chunks needed by the last cycle (plus one) for zero-allocation reuse.
     fn reset_hoisted_clamps(&self) {
+        if let Some(Some((_, data))) = self.budget.get() {
+            // SAFETY: the list's own mapped budget word; the list is not
+            // running. Cleared so a list reset unsubmitted counts nothing.
+            let spent = unsafe {
+                let word = *data as *mut u32;
+                let spent = word.read_volatile();
+                word.write_volatile(0);
+                u64::from(spent)
+            };
+            if spent > u64::from(crate::indirect::BUDGET / 2) {
+                BUDGET_SPENT[0].fetch_add(1, Ordering::Relaxed);
+            }
+            BUDGET_SPENT[1].fetch_max(spent, Ordering::Relaxed);
+        }
         let (spent_chunks, spent_oversized) = {
             let mut clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
             clamps.pending.clear();
@@ -6902,6 +6930,9 @@ impl Meter {
             let [barrier_calls, barriers] =
                 crate::indirect::take_barriers().map(|n| n as f64 / report_frames);
             let switches = take_work_switches() as f64 / report_frames;
+            let [past_half, most_spent] = take_budget_spent();
+            let past_half = past_half as f64 / report_frames;
+            let most_spent = most_spent as f64 * 100.0 / f64::from(crate::indirect::BUDGET);
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -6917,7 +6948,9 @@ impl Meter {
                  group passes; out of the prelude {after_clamp:.0} after a clamp of the list \
                  not in it, {after_unknown:.0} after a write anywhere, {over_written:.0} over \
                  written bytes, {in_place:.0} read in place; {barrier_calls:.0} barrier calls \
-                 of {barriers:.0} barriers); {switches:.0} draws after compute/frame",
+                 of {barriers:.0} barriers; {past_half:.1} host lists past half of their \
+                 budget, the most {most_spent:.0}% of it); {switches:.0} draws after \
+                 compute/frame",
                 making = crate::pipeline::making()
             );
             crate::ray_skip::log(report_frames);
