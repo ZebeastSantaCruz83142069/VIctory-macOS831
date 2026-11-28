@@ -435,8 +435,67 @@ struct ActiveWord {
     entries: Vec<(u8, u32)>,
 }
 
+/// A heap's slots that view something, by slot number. Slot numbers are
+/// dense (below the heap's count), so a vector: the heap sync's ~40,000 slot
+/// updates a frame in the world each removed and inserted an entry of a
+/// hash map, and the lists' ~40,000 table slots each looked one up.
+#[derive(Default)]
+struct SlotMap {
+    slots: Vec<Option<Seen>>,
+    len: usize,
+}
+
+impl SlotMap {
+    fn get(&self, index: &u32) -> Option<&Seen> {
+        self.slots.get(*index as usize)?.as_ref()
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, index: &u32) -> bool {
+        self.get(index).is_some()
+    }
+
+    fn remove(&mut self, index: &u32) -> Option<Seen> {
+        let old = self.slots.get_mut(*index as usize)?.take();
+        if old.is_some() {
+            self.len -= 1;
+        }
+        old
+    }
+
+    fn insert(&mut self, index: u32, seen: Seen) -> Option<Seen> {
+        let i = index as usize;
+        if i >= self.slots.len() {
+            self.slots.resize_with(i + 1, || None);
+        }
+        let old = self.slots[i].replace(seen);
+        if old.is_none() {
+            self.len += 1;
+        }
+        old
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    fn values(&self) -> impl Iterator<Item = &Seen> {
+        self.slots.iter().flatten()
+    }
+
+    #[cfg(test)]
+    fn iter(&self) -> impl Iterator<Item = (u32, &Seen)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.as_ref().map(|s| (i as u32, s)))
+    }
+}
+
 struct Inner {
-    slots: HashMap<u32, Seen, Hashing>,
+    slots: SlotMap,
     ranges: RangesMap<Range, (u32, Arc<Shadow>)>,
     /// Per title texture, the slots viewing it: an entry names its slots, so
     /// releasing the texture ([`Inner::forget`]) does not search the heap.
@@ -468,7 +527,7 @@ impl Default for Inner {
 impl Inner {
     fn new(fast: bool, quick_maps: bool, disjoint_spans: bool) -> Self {
         Inner {
-            slots: HashMap::with_hasher(Hashing::new(quick_maps)),
+            slots: SlotMap::default(),
             ranges: RangesMap::new(quick_maps),
             textures: BTreeMap::new(),
             hulls: Vec::new(),
@@ -2089,7 +2148,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                         Seen::Texture(r) => format!("t {r}"),
                         Seen::Left(k) => format!("l {k:?}"),
                     };
-                    (*k, what)
+                    (k, what)
                 })
                 .collect();
             slots.sort_unstable();
